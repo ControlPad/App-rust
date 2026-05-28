@@ -1,10 +1,20 @@
 name: Release
 
-# Build all three artifacts and publish a draft release on tag push (v*).
+# Build all three artifacts and publish a draft release.
+# Triggers:
+#   * pushing a tag matching v*
+#   * manual run (workflow_dispatch) with a `tag` input — the tag is created
+#     from the current commit and then used exactly as a pushed tag would be.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag to create and release (e.g. v0.1.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -14,6 +24,23 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            # Create the tag from the checked-out commit and push it.
+            git tag "$TAG"
+            git push origin "$TAG"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Install system dependencies
         run: |
@@ -55,8 +82,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          name: "Slidr ${{ github.ref_name }}"
-          tag_name: ${{ github.ref_name }}
+          name: "Slidr ${{ steps.tag.outputs.tag }}"
+          tag_name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           files: |
             dist/slidr-linux-x86_64

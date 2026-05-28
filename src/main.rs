@@ -43,6 +43,8 @@ fn main() -> anyhow::Result<()> {
     let popup = args.iter().find_map(|a| a.strip_prefix("--popup=")).unwrap_or("");
     let collapsed = args.iter().any(|a| a == "--collapsed");
     let dark = args.iter().any(|a| a == "--dark");
+    // Autostart-minimized passes --hidden so we start in the tray.
+    let start_hidden = args.iter().any(|a| a == "--hidden");
 
     // Lock the main thread to an STA apartment before *any* COM-using crate
     // (WASAPI, winit's OleInitialize) gets a chance.
@@ -239,29 +241,42 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // System tray + close-to-tray (Windows). Held for the process lifetime.
-    #[cfg(target_os = "windows")]
-    let _tray = {
-        use slint::ComponentHandle;
-        let tray = tray::install(&ui);
-        let weak = ui.as_weak();
-        let shared_close = shared.clone();
-        // Read the setting live each time the window is closed.
-        ui.window().on_close_requested(move || {
-            let minimize = shared_close.lock().settings.minimize_to_tray;
-            if minimize {
-                if let Some(ui) = weak.upgrade() {
-                    let _ = ui.hide();
-                }
-                slint::CloseRequestResponse::KeepWindowShown
-            } else {
-                slint::CloseRequestResponse::HideWindow
-            }
-        });
-        tray
-    };
+    use slint::ComponentHandle;
 
-    ui.run()?;
+    // System tray (Windows). Held for the process lifetime.
+    #[cfg(target_os = "windows")]
+    let _tray = tray::install(&ui);
+
+    // Close handling. On Windows with the tray + minimize-to-tray enabled,
+    // closing hides the window instead of quitting. Otherwise it quits.
+    {
+        let shared_close = shared.clone();
+        #[cfg(target_os = "windows")]
+        let tray_for_close = _tray.clone();
+        ui.window().on_close_requested(move || {
+            #[cfg(target_os = "windows")]
+            {
+                let to_tray = tray_for_close.is_some()
+                    && shared_close.lock().settings.minimize_to_tray;
+                if to_tray {
+                    if let Some(t) = &tray_for_close {
+                        t.set_window_hidden(true); // tray label → "Show Slidr"
+                    }
+                    return slint::CloseRequestResponse::HideWindow;
+                }
+            }
+            let _ = &shared_close;
+            let _ = slint::quit_event_loop();
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+
+    // Use the until-quit loop so hiding the window (to tray) doesn't end the
+    // app; only `quit_event_loop()` (close without tray, or tray → Exit) does.
+    if !start_hidden {
+        ui.show()?;
+    }
+    slint::run_event_loop_until_quit()?;
 
     // Persist on exit.
     let s = shared.lock();

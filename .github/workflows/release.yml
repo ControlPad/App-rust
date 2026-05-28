@@ -66,7 +66,7 @@ jobs:
         if: matrix.target == 'windows'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends mingw-w64 wixl
+          sudo apt-get install -y --no-install-recommends mingw-w64 nsis
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -86,15 +86,17 @@ jobs:
           mkdir -p dist
           cp target/release/slidr dist/Slidr-linux-x86_64
 
-      - name: Build (Windows + MSI)
+      - name: Build (Windows + interactive installer)
         if: matrix.target == 'windows'
         run: |
+          VERSION="${{ needs.prepare.outputs.tag }}"; VERSION="${VERSION#v}"
           cargo build --release --target x86_64-pc-windows-gnu
-          cp target/x86_64-pc-windows-gnu/release/slidr.exe installer/
-          (cd installer && wixl -o Slidr-Setup.msi slidr.wxs)
+          cp target/x86_64-pc-windows-gnu/release/slidr.exe installer/slidr.exe
+          cp assets/logo.ico installer/logo.ico
+          (cd installer && makensis -DVERSION="$VERSION" slidr.nsi)
           mkdir -p dist
           cp target/x86_64-pc-windows-gnu/release/slidr.exe dist/Slidr-windows-portable.exe
-          cp installer/Slidr-Setup.msi                      dist/Slidr-windows-setup.msi
+          cp installer/Slidr-windows-setup.exe              dist/Slidr-windows-setup.exe
 
       - uses: actions/upload-artifact@v4
         with:

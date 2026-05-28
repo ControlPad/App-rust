@@ -73,9 +73,9 @@ jobs:
       - name: Stage artifacts
         run: |
           mkdir -p dist
-          cp target/release/slidr                              dist/slidr-linux-x86_64
-          cp target/x86_64-pc-windows-gnu/release/slidr.exe    dist/slidr-windows-portable.exe
-          cp installer/Slidr-Setup.msi                         dist/Slidr-Setup.msi
+          cp target/release/slidr                              dist/Slidr-linux-x86_64
+          cp target/x86_64-pc-windows-gnu/release/slidr.exe    dist/Slidr-windows-portable.exe
+          cp installer/Slidr-Setup.msi                         dist/Slidr-windows-setup.msi
           ls -lh dist
 
       - name: Create draft release
@@ -86,6 +86,6 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
           files: |
-            dist/slidr-linux-x86_64
-            dist/slidr-windows-portable.exe
-            dist/Slidr-Setup.msi
+            dist/Slidr-linux-x86_64
+            dist/Slidr-windows-portable.exe
+            dist/Slidr-windows-setup.msi

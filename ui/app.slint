@@ -95,17 +95,20 @@ component Select {
         background: Palette.alternate-background;
         border-width: 1px; border-radius: 8px;
         border-color: ta.has-hover ? Theme.accent-bg : Palette.border;
+        // Label
         HorizontalLayout {
-            // Right inset == the icon's vertical inset ((36-16)/2 = 10px) so the
-            // chevron sits the same distance from the right edge as top/bottom.
-            padding-left: 12px; padding-right: 10px; spacing: 6px;
+            padding-left: 12px; padding-right: 30px;
             Text { text: root.model[root.current-index];
                 font-family: "Inter"; font-size: 13px;
                 vertical-alignment: center; horizontal-stretch: 1; }
-            VerticalLayout { alignment: center;
-                Icon { source: @image-url("../assets/icons/chevron-down.svg");
-                    size: 16px; tint: Palette.foreground.with-alpha(0.7); }
-            }
+        }
+        // Chevron pinned to the right edge (absolute, so it always hugs)
+        chev := Image {
+            source: @image-url("../assets/icons/chevron-down.svg");
+            colorize: Palette.foreground.with-alpha(0.7);
+            width: 18px; height: 18px;
+            x: parent.width - self.width - 6px;
+            y: (parent.height - self.height) / 2;
         }
     }
     ta := TouchArea {
@@ -1674,10 +1677,7 @@ export component AppWindow inherits Window {
                         border-width: 1px; border-color: Palette.border;
                     }
                     HorizontalLayout {
-                        // 38px tall row, 14px icon → ~12px vertical inset; match
-                        // it on the right so the chevron hugs the edge evenly.
-                        padding-left: 10px; padding-right: 12px; spacing: 6px;
-                        alignment: stretch;
+                        padding-left: 10px; padding-right: 28px;
                         VerticalLayout {
                             horizontal-stretch: 1; spacing: 0px;
                             Text { text: "Profile"; font-size: 9px; font-family: "Inter";
@@ -1688,10 +1688,14 @@ export component AppWindow inherits Window {
                                 font-size: 12px; font-weight: 600; font-family: "Inter";
                                 vertical-alignment: top; }
                         }
-                        VerticalLayout { alignment: center;
-                            Icon { source: @image-url("../assets/icons/chevron-right.svg");
-                                size: 14px; tint: Palette.foreground.with-alpha(0.6); }
-                        }
+                    }
+                    // Chevron pinned to the right edge.
+                    Image {
+                        source: @image-url("../assets/icons/chevron-right.svg");
+                        colorize: Palette.foreground.with-alpha(0.6);
+                        width: 16px; height: 16px;
+                        x: parent.width - self.width - 8px;
+                        y: (parent.height - self.height) / 2;
                     }
                 }
             }

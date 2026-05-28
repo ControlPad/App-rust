@@ -197,9 +197,9 @@ fn main() -> anyhow::Result<()> {
             ui.set_curve_x1(0.3); ui.set_curve_y1(0.3);
             ui.set_curve_x2(0.6); ui.set_curve_y2(0.6);
         } else {
-            // visualise an ease-in-out preset by default
-            ui.set_curve_x1(0.42); ui.set_curve_y1(0.0);
-            ui.set_curve_x2(0.58); ui.set_curve_y2(1.0);
+            // Linear preset → straight diagonal
+            ui.set_curve_x1(0.0); ui.set_curve_y1(0.0);
+            ui.set_curve_x2(1.0); ui.set_curve_y2(1.0);
         }
 
         match popup {

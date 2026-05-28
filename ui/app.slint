@@ -767,6 +767,7 @@ component CategoriesPage inherits VerticalBox {
     }
 
     ScrollView {
+            mouse-drag-pan-enabled: false;
         vertical-stretch: 1;
         VerticalBox {
             padding: 0; spacing: 8px; alignment: start;
@@ -889,6 +890,7 @@ component SettingsPage inherits VerticalBox {
     }
 
     ScrollView {
+            mouse-drag-pan-enabled: false;
         vertical-stretch: 1;
         VerticalBox {
             spacing: 12px; alignment: start;
@@ -967,15 +969,6 @@ component SettingsPage inherits VerticalBox {
                             changed => { root.curve-changed(); }
                         }
                     }
-                    if root.curve-editable: Text {
-                        text: "Drag the handles to shape the response. P1 ("
-                            + round(root.curve-x1 * 100) / 100 + ", " + round(root.curve-y1 * 100) / 100
-                            + ")  ·  P2 (" + round(root.curve-x2 * 100) / 100 + ", "
-                            + round(root.curve-y2 * 100) / 100 + ")";
-                        font-family: "Inter"; font-size: 11px;
-                        horizontal-alignment: center;
-                        color: Palette.foreground.with-alpha(0.6);
-                    }
                     SettingRow {
                         label: "Unmute on change";
                         description: "Unmute the target automatically when slider moves";
@@ -1047,6 +1040,7 @@ component AssignPopup inherits Rectangle {
                                                : "Assign button to category";
                 font-size: 18px; font-weight: 700; font-family: "Inter"; }
             ScrollView {
+            mouse-drag-pan-enabled: false;
                 vertical-stretch: 1;
                 VerticalBox {
                     spacing: 4px;
@@ -1131,6 +1125,7 @@ component PresetPopup inherits Rectangle {
             }
             Rectangle { height: 1px; background: Palette.border; }
             ScrollView {
+            mouse-drag-pan-enabled: false;
                 vertical-stretch: 1;
                 VerticalBox {
                     spacing: 6px;
@@ -1272,6 +1267,7 @@ component WizardPopup inherits Rectangle {
 
             // step 0 — pick kind
             if root.step == 0: ScrollView {
+            mouse-drag-pan-enabled: false;
                 vertical-stretch: 1;
                 VerticalBox {
                     spacing: 6px; alignment: start;
@@ -1329,6 +1325,7 @@ component WizardPopup inherits Rectangle {
                 }
 
                 if root.picker-is-list && root.needs-property: ScrollView {
+            mouse-drag-pan-enabled: false;
                     vertical-stretch: 1;
                     VerticalBox {
                         spacing: 4px;

@@ -387,9 +387,9 @@ pub fn wire(
             let mut s = shared.lock();
             let preset = index_to_curve_preset(idx);
             s.preset.settings.curve_preset = preset;
-            // Custom starts from a linear curve each time it's freshly selected.
+            // Custom starts from a gentle default each time it's freshly selected.
             if matches!(preset, crate::curve::CurvePreset::Custom) {
-                s.preset.settings.custom_curve = crate::curve::BezierPoints::LINEAR;
+                s.preset.settings.custom_curve = crate::curve::BezierPoints::CUSTOM_DEFAULT;
             }
             let _ = crate::storage::save_preset(&s.preset);
             if let Some(ui) = weak.upgrade() {

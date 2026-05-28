@@ -34,6 +34,8 @@ pub struct BezierPoints {
 
 impl BezierPoints {
     pub const LINEAR: Self = Self { x1: 0.0, y1: 0.0, x2: 1.0, y2: 1.0 };
+    /// Starting points when a fresh Custom curve is selected.
+    pub const CUSTOM_DEFAULT: Self = Self { x1: 0.3, y1: 0.3, x2: 0.6, y2: 0.6 };
 
     pub fn for_preset(preset: CurvePreset, custom: Self) -> Self {
         match preset {

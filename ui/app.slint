@@ -211,6 +211,103 @@ component AccentSlider {
     }
 }
 
+// Interactive cubic-Bézier preview/editor. P0=(0,0) bottom-left, P3=(1,1)
+// top-right; the two control points are draggable when `editable`. Otherwise
+// it just visualises the supplied curve.
+component CurveEditor {
+    in property <bool> editable;
+    in-out property <float> x1;
+    in-out property <float> y1;
+    in-out property <float> x2;
+    in-out property <float> y2;
+    callback changed();
+
+    property <length> box: 220px;
+    width: root.box; height: root.box;
+
+    Rectangle {
+        background: Palette.background;
+        border-width: 1px; border-color: Palette.border; border-radius: 8px;
+        clip: true;
+
+        // horizontal ruler stripes
+        for i in 8: Rectangle {
+            y: parent.height * (i + 1) / 9; width: 100%; height: 1px;
+            background: Palette.foreground.with-alpha(0.06);
+        }
+
+        // diagonal reference line (identity)
+        Path {
+            width: 100%; height: 100%; viewbox-width: 1; viewbox-height: 1;
+            stroke: Palette.foreground.with-alpha(0.12); stroke-width: 6px;
+            MoveTo { x: 0; y: 1; } LineTo { x: 1; y: 0; }
+        }
+
+        // control-point guide lines (edit mode only)
+        if root.editable: Path {
+            width: 100%; height: 100%; viewbox-width: 1; viewbox-height: 1;
+            stroke: Palette.foreground.with-alpha(0.35); stroke-width: 1px;
+            MoveTo { x: 0; y: 1; } LineTo { x: root.x1; y: 1 - root.y1; }
+        }
+        if root.editable: Path {
+            width: 100%; height: 100%; viewbox-width: 1; viewbox-height: 1;
+            stroke: Palette.foreground.with-alpha(0.35); stroke-width: 1px;
+            MoveTo { x: 1; y: 0; } LineTo { x: root.x2; y: 1 - root.y2; }
+        }
+
+        // the curve
+        Path {
+            width: 100%; height: 100%; viewbox-width: 1; viewbox-height: 1;
+            stroke: Theme.accent-bg; stroke-width: 3px;
+            MoveTo { x: 0; y: 1; }
+            CubicTo {
+                control-1-x: root.x1; control-1-y: 1 - root.y1;
+                control-2-x: root.x2; control-2-y: 1 - root.y2;
+                x: 1; y: 0;
+            }
+        }
+
+        // drag surface (edit mode only) — picks the nearest handle on press
+        if root.editable: ta := TouchArea {
+            property <int> active: 1;
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) {
+                    ta.active =
+                        (abs(self.mouse-x / parent.width - root.x1)
+                         + abs((1 - self.mouse-y / parent.height) - root.y1))
+                        <= (abs(self.mouse-x / parent.width - root.x2)
+                         + abs((1 - self.mouse-y / parent.height) - root.y2))
+                        ? 1 : 2;
+                }
+            }
+            moved => {
+                if (self.pressed) {
+                    if (ta.active == 1) {
+                        root.x1 = clamp(self.mouse-x / parent.width, 0, 1);
+                        root.y1 = clamp(1 - self.mouse-y / parent.height, 0, 1);
+                    } else {
+                        root.x2 = clamp(self.mouse-x / parent.width, 0, 1);
+                        root.y2 = clamp(1 - self.mouse-y / parent.height, 0, 1);
+                    }
+                    root.changed();
+                }
+            }
+        }
+
+        // handles
+        if root.editable: Rectangle {
+            x: parent.width * root.x1 - 9px; y: parent.height * (1 - root.y1) - 9px;
+            width: 18px; height: 18px; border-radius: 9px;
+            background: #ec4899; border-width: 2px; border-color: white;
+        }
+        if root.editable: Rectangle {
+            x: parent.width * root.x2 - 9px; y: parent.height * (1 - root.y2) - 9px;
+            width: 18px; height: 18px; border-radius: 9px;
+            background: #06b6d4; border-width: 2px; border-color: white;
+        }
+    }
+}
+
 // Continuous spinner: a static track ring with accent dots orbiting it.
 // Dot positions are computed with trig from animation-tick() — no element
 // rotation needed, so it works on plain Rectangles.
@@ -769,10 +866,17 @@ component SettingsPage inherits VerticalBox {
     in-out property <bool> start-minimized;
     in-out property <bool> minimize-to-tray;
     in-out property <int> curve-preset-index;
+    in property <bool> curve-editable;
+    in-out property <float> curve-x1;
+    in-out property <float> curve-y1;
+    in-out property <float> curve-x2;
+    in-out property <float> curve-y2;
     in property <string> build-stamp;
 
     callback theme-changed(int);
     callback dirty();
+    callback curve-preset-changed(int);
+    callback curve-changed();
 
     spacing: 14px;
 
@@ -851,7 +955,26 @@ component SettingsPage inherits VerticalBox {
                         Select { field-width: root.control-w;
                             model: ["Linear", "Ease", "Ease-in", "Ease-out", "Ease-in-out", "Custom"];
                             current-index <=> root.curve-preset-index;
-                            selected(i) => { root.dirty(); } }
+                            selected(i) => { root.curve-preset-changed(i); } }
+                    }
+                    // Interactive curve preview (editable when Custom is selected)
+                    HorizontalLayout {
+                        alignment: center; padding-top: 4px; padding-bottom: 4px;
+                        CurveEditor {
+                            editable: root.curve-editable;
+                            x1 <=> root.curve-x1; y1 <=> root.curve-y1;
+                            x2 <=> root.curve-x2; y2 <=> root.curve-y2;
+                            changed => { root.curve-changed(); }
+                        }
+                    }
+                    if root.curve-editable: Text {
+                        text: "Drag the handles to shape the response. P1 ("
+                            + round(root.curve-x1 * 100) / 100 + ", " + round(root.curve-y1 * 100) / 100
+                            + ")  ·  P2 (" + round(root.curve-x2 * 100) / 100 + ", "
+                            + round(root.curve-y2 * 100) / 100 + ")";
+                        font-family: "Inter"; font-size: 11px;
+                        horizontal-alignment: center;
+                        color: Palette.foreground.with-alpha(0.6);
                     }
                     SettingRow {
                         label: "Unmute on change";
@@ -1351,6 +1474,11 @@ export component AppWindow inherits Window {
     in-out property <bool> start-minimized;
     in-out property <bool> minimize-to-tray;
     in-out property <int> curve-preset-index;
+    in property <bool> curve-editable;
+    in-out property <float> curve-x1;
+    in-out property <float> curve-y1;
+    in-out property <float> curve-x2;
+    in-out property <float> curve-y2;
 
     in-out property <int> current-page: 0;
     in-out property <bool> edit-mode: false;
@@ -1404,6 +1532,8 @@ export component AppWindow inherits Window {
     callback wizard-finish(WizardResult);
     callback theme-changed(int);
     callback save-settings();
+    callback curve-preset-changed(int);
+    callback curve-changed();
     callback save-preset();
     callback load-preset(string);
     callback delete-preset(string);
@@ -1613,9 +1743,16 @@ export component AppWindow inherits Window {
                     start-minimized <=> root.start-minimized;
                     minimize-to-tray <=> root.minimize-to-tray;
                     curve-preset-index <=> root.curve-preset-index;
+                    curve-editable: root.curve-editable;
+                    curve-x1 <=> root.curve-x1;
+                    curve-y1 <=> root.curve-y1;
+                    curve-x2 <=> root.curve-x2;
+                    curve-y2 <=> root.curve-y2;
                     build-stamp: root.build-stamp;
                     theme-changed(i) => { root.theme-changed(i); }
                     dirty => { root.save-settings(); }
+                    curve-preset-changed(i) => { root.curve-preset-changed(i); }
+                    curve-changed => { root.curve-changed(); }
                 }
             }
         }

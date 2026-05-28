@@ -381,6 +381,37 @@ pub fn wire(
         });
     }
     {
+        let shared = shared.clone();
+        let weak = ui.as_weak();
+        ui.on_curve_preset_changed(move |idx| {
+            let mut s = shared.lock();
+            let preset = index_to_curve_preset(idx);
+            s.preset.settings.curve_preset = preset;
+            // Custom starts from a linear curve each time it's freshly selected.
+            if matches!(preset, crate::curve::CurvePreset::Custom) {
+                s.preset.settings.custom_curve = crate::curve::BezierPoints::LINEAR;
+            }
+            let _ = crate::storage::save_preset(&s.preset);
+            if let Some(ui) = weak.upgrade() {
+                push_curve_to_ui(&ui, &s.preset.settings);
+            }
+        });
+    }
+    {
+        let shared = shared.clone();
+        let weak = ui.as_weak();
+        ui.on_curve_changed(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut s = shared.lock();
+            s.preset.settings.custom_curve = crate::curve::BezierPoints {
+                x1: ui.get_curve_x1(), y1: ui.get_curve_y1(),
+                x2: ui.get_curve_x2(), y2: ui.get_curve_y2(),
+            };
+            s.preset.settings.curve_preset = crate::curve::CurvePreset::Custom;
+            let _ = crate::storage::save_preset(&s.preset);
+        });
+    }
+    {
         ui.on_exit_app(|| slint::quit_event_loop().ok().unwrap_or(()));
     }
     {
@@ -724,6 +755,17 @@ fn push_settings_to_ui(ui: &AppWindow, global: &Settings, profile: &crate::model
     ui.set_dead_zone(profile.slider_dead_zone);
     ui.set_unmute_on_change(profile.unmute_on_change);
     ui.set_curve_preset_index(curve_preset_to_index(profile.curve_preset));
+    push_curve_to_ui(ui, profile);
+}
+
+/// Push the active curve's control points + editability into the UI.
+fn push_curve_to_ui(ui: &AppWindow, profile: &crate::model::ProfileSettings) {
+    let pts = crate::curve::BezierPoints::for_preset(profile.curve_preset, profile.custom_curve);
+    ui.set_curve_x1(pts.x1);
+    ui.set_curve_y1(pts.y1);
+    ui.set_curve_x2(pts.x2);
+    ui.set_curve_y2(pts.y2);
+    ui.set_curve_editable(matches!(profile.curve_preset, crate::curve::CurvePreset::Custom));
 }
 
 fn pull_global_from_ui(ui: &AppWindow, g: &mut Settings) {

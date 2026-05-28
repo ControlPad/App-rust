@@ -42,6 +42,7 @@ snap home-dark          --page=0 --dark
 snap sliders            --page=1
 snap buttons            --page=2
 snap settings           --page=3
+snap settings-curve     --page=3 --curve-custom
 snap settings-dark      --page=3 --dark
 snap assign-popup       --page=0 --popup=assign
 snap preset-popup       --page=0 --popup=preset

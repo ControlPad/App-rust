@@ -191,6 +191,16 @@ fn main() -> anyhow::Result<()> {
         if collapsed { ui.set_sidebar_collapsed(true); }
         if dark { ui.invoke_apply_theme(2); }
         if args.iter().any(|a| a == "--edit") { ui.set_edit_mode(true); }
+        if args.iter().any(|a| a == "--curve-custom") {
+            ui.set_curve_preset_index(5);
+            ui.set_curve_editable(true);
+            ui.set_curve_x1(0.25); ui.set_curve_y1(0.85);
+            ui.set_curve_x2(0.75); ui.set_curve_y2(0.15);
+        } else {
+            // visualise an ease-in-out preset by default
+            ui.set_curve_x1(0.42); ui.set_curve_y1(0.0);
+            ui.set_curve_x2(0.58); ui.set_curve_y2(1.0);
+        }
 
         match popup {
             "preset" => {

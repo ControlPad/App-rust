@@ -1,6 +1,6 @@
 name: Release
 
-# Build all three artifacts and publish a draft release.
+# Build all three artifacts in parallel and publish a draft release.
 # Triggers:
 #   * pushing a tag matching v*
 #   * manual run (workflow_dispatch) with a `tag` input — the tag is created
@@ -20,21 +20,21 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  # ── Resolve (and on manual dispatch, create) the release tag ──────────────
+  prepare:
     runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Resolve release tag
-        id: tag
+      - id: tag
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.tag }}"
             git config user.name  "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            # Create the tag from the checked-out commit and push it.
             git tag "$TAG"
             git push origin "$TAG"
           else
@@ -42,50 +42,81 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Install system dependencies
+  # ── Linux + Windows build concurrently ────────────────────────────────────
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [linux, windows]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only the deps each target actually needs (smaller = faster).
+      - name: Install dependencies (Linux build)
+        if: matrix.target == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            build-essential pkg-config \
-            libpulse-dev libudev-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libwayland-dev libxcb1-dev libssl-dev libfontconfig1-dev libxdo-dev \
-            mingw-w64 wixl
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libpulse-dev libudev-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libxcb1-dev libfontconfig1-dev libxdo-dev
 
-      - name: Install Rust (stable + Windows GNU target)
+      - name: Install dependencies (Windows build)
+        if: matrix.target == 'windows'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64 wixl
+
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu
+          targets: ${{ matrix.target == 'windows' && 'x86_64-pc-windows-gnu' || '' }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-all-crates: true
 
-      - name: Build Linux binary
-        run: cargo build --release
-
-      - name: Build Windows binary (cross)
-        run: cargo build --release --target x86_64-pc-windows-gnu
-
-      - name: Package Windows MSI
+      - name: Build (Linux)
+        if: matrix.target == 'linux'
         run: |
+          cargo build --release
+          mkdir -p dist
+          cp target/release/slidr dist/Slidr-linux-x86_64
+
+      - name: Build (Windows + MSI)
+        if: matrix.target == 'windows'
+        run: |
+          cargo build --release --target x86_64-pc-windows-gnu
           cp target/x86_64-pc-windows-gnu/release/slidr.exe installer/
           (cd installer && wixl -o Slidr-Setup.msi slidr.wxs)
-
-      - name: Stage artifacts
-        run: |
           mkdir -p dist
-          cp target/release/slidr                              dist/Slidr-linux-x86_64
-          cp target/x86_64-pc-windows-gnu/release/slidr.exe    dist/Slidr-windows-portable.exe
-          cp installer/Slidr-Setup.msi                         dist/Slidr-windows-setup.msi
-          ls -lh dist
+          cp target/x86_64-pc-windows-gnu/release/slidr.exe dist/Slidr-windows-portable.exe
+          cp installer/Slidr-Setup.msi                      dist/Slidr-windows-setup.msi
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          retention-days: 1
+
+  # ── Collect artifacts and draft the release ───────────────────────────────
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -lh dist
       - name: Create draft release
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          name: "Slidr ${{ steps.tag.outputs.tag }}"
-          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Slidr ${{ needs.prepare.outputs.tag }}"
+          tag_name: ${{ needs.prepare.outputs.tag }}
           generate_release_notes: true
-          files: |
-            dist/Slidr-linux-x86_64
-            dist/Slidr-windows-portable.exe
-            dist/Slidr-windows-setup.msi
+          files: dist/*

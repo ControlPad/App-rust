@@ -6,9 +6,12 @@ description = "Cross-platform Arduino-based audio/macro pad controller"
 license = "MIT"
 
 [profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
+# Tuned for fast compiles (CI ≈ 2-3 min warm) with negligible runtime cost for
+# this app: no fat LTO, parallel codegen. Bump back to lto="fat"/codegen-units=1
+# only if you need the last few % of runtime perf in shipped binaries.
+opt-level = 2
+lto = false
+codegen-units = 16
 strip = true
 panic = "abort"
 

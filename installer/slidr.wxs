@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Slidr"
+           Language="1033"
+           Version="0.1.0"
+           Manufacturer="Slidr"
+           UpgradeCode="391e5e4a-ee96-4286-b4c1-907b7345bc88">
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="Slidr — Arduino audio mixer / macro pad"
+             Manufacturer="Slidr" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Slidr is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="Slidr">
+          <Component Id="MainExecutable" Guid="c06cbeee-4bc3-41e6-ba5f-e64dbecc9974" Win64="yes">
+            <File Id="SlidrExe"
+                  Source="slidr.exe"
+                  KeyPath="yes"
+                  Checksum="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="SlidrStartMenu" Name="Slidr">
+          <Component Id="StartMenuShortcut" Guid="b5f1600b-4bba-41a0-9702-9f7606d1cb6d" Win64="yes">
+            <Shortcut Id="SlidrShortcut"
+                      Name="Slidr"
+                      Description="Arduino audio mixer / macro pad"
+                      Target="[INSTALLDIR]slidr.exe"
+                      WorkingDirectory="INSTALLDIR" />
+            <RemoveFolder Id="RemoveSlidrStartMenu" On="uninstall" />
+            <RegistryValue Root="HKCU"
+                           Key="Software\Slidr\Install"
+                           Name="installed"
+                           Type="integer"
+                           Value="1"
+                           KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="ProductFeature" Title="Slidr" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Product>
+</Wix>

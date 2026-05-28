@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Build artifacts copied into the installer dir during packaging
+/installer/Slidr-Setup.msi
+/installer/slidr.exe

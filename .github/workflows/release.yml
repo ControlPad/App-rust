@@ -1,0 +1,64 @@
+name: Release
+
+# Build all three artifacts and publish a draft release on tag push (v*).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config \
+            libpulse-dev libudev-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libxcb1-dev libssl-dev libfontconfig1-dev libxdo-dev \
+            mingw-w64 wixl
+
+      - name: Install Rust (stable + Windows GNU target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Linux binary
+        run: cargo build --release
+
+      - name: Build Windows binary (cross)
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Package Windows MSI
+        run: |
+          cp target/x86_64-pc-windows-gnu/release/slidr.exe installer/
+          (cd installer && wixl -o Slidr-Setup.msi slidr.wxs)
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p dist
+          cp target/release/slidr                              dist/slidr-linux-x86_64
+          cp target/x86_64-pc-windows-gnu/release/slidr.exe    dist/slidr-windows-portable.exe
+          cp installer/Slidr-Setup.msi                         dist/Slidr-Setup.msi
+          ls -lh dist
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: "Slidr ${{ github.ref_name }}"
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/slidr-linux-x86_64
+            dist/slidr-windows-portable.exe
+            dist/Slidr-Setup.msi

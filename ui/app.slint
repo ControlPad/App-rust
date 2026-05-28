@@ -1,0 +1,1690 @@
+// Slidr — Slint UI (Material backend, Inter typeface, Tabler icons)
+
+import { LineEdit, ScrollView, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
+
+// Global accent palette — selectable from Settings.
+export global Theme {
+    in-out property <int> accent-preset: 0;  // 0..5
+
+    out property <brush> accent-bg:
+          root.accent-preset == 1 ? #2563eb     // blue
+        : root.accent-preset == 2 ? #16a34a     // green
+        : root.accent-preset == 3 ? #ca8a04     // yellow
+        : root.accent-preset == 4 ? #db2777     // pink/rose
+        : root.accent-preset == 5 ? #ea580c     // orange
+        :                           #6d4cd1;    // default purple
+    out property <brush> accent-fg: white;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Structs
+// ──────────────────────────────────────────────────────────────────────────
+
+export struct SliderCell { value: int, percent: float, category: string, assigned: bool }
+export struct ButtonCell { pressed: bool, category: string, assigned: bool }
+// icon-kind: 0 process · 1 mic · 2 output · 3 website · 4 key · 5 volume/mute
+export struct LineItem { id: int, primary: string, secondary: string, icon-kind: int }
+export struct CategorySummary { id: int, name: string, count: int, lines: [LineItem] }
+export struct AssignPick { id: int, name: string }
+export struct PickerEntry { name: string, icon-kind: int }
+export struct WizardResult {
+    target-kind: int, category-id: int, kind: int,
+    property: string, display: string,
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Atoms
+// ──────────────────────────────────────────────────────────────────────────
+
+component Icon {
+    in property <image> source;
+    in property <length> size: 18px;
+    in property <color> tint: Palette.foreground;
+    min-width: root.size; preferred-width: root.size;
+    min-height: root.size; preferred-height: root.size;
+    // Center the actual bitmap inside whatever cell the layout gives us so it
+    // vertically aligns with sibling Text widgets (which auto-center their baseline).
+    Image {
+        x: (parent.width - root.size) / 2;
+        y: (parent.height - root.size) / 2;
+        width: root.size; height: root.size;
+        source: root.source;
+        colorize: root.tint;
+    }
+}
+
+component Card inherits Rectangle {
+    background: Palette.alternate-background;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Palette.border;
+}
+
+// Maps an icon-kind to the matching Tabler glyph. Real per-app icons would
+// slot in here later; for now each audio/action *type* gets a clear glyph.
+component KindIcon {
+    in property <int> kind;
+    in property <length> size: 18px;
+    in property <color> tint: Palette.foreground.with-alpha(0.7);
+    min-width: root.size; preferred-width: root.size; max-width: root.size;
+    min-height: root.size; preferred-height: root.size; max-height: root.size;
+    horizontal-stretch: 0;
+    Icon {
+        size: root.size; tint: root.tint;
+        source: root.kind == 1 ? @image-url("../assets/icons/microphone-2.svg")
+              : root.kind == 2 ? @image-url("../assets/icons/device-speaker.svg")
+              : root.kind == 3 ? @image-url("../assets/icons/world.svg")
+              : root.kind == 4 ? @image-url("../assets/icons/keyboard.svg")
+              : root.kind == 5 ? @image-url("../assets/icons/volume.svg")
+              :                  @image-url("../assets/icons/app-window.svg");
+    }
+}
+
+// Accent-themed dropdown (replaces Material ComboBox, whose selection colour
+// we can't restyle). Uses a PopupWindow for the option list.
+component Select {
+    in property <[string]> model;
+    in-out property <int> current-index: 0;
+    in property <length> field-width: 260px;
+    callback selected(int);
+
+    min-width: root.field-width; max-width: root.field-width;
+    min-height: 36px; max-height: 36px;
+
+    Rectangle {
+        background: Palette.alternate-background;
+        border-width: 1px; border-radius: 8px;
+        border-color: ta.has-hover ? Theme.accent-bg : Palette.border;
+        HorizontalLayout {
+            // Right inset == the icon's vertical inset ((36-16)/2 = 10px) so the
+            // chevron sits the same distance from the right edge as top/bottom.
+            padding-left: 12px; padding-right: 10px; spacing: 6px;
+            Text { text: root.model[root.current-index];
+                font-family: "Inter"; font-size: 13px;
+                vertical-alignment: center; horizontal-stretch: 1; }
+            VerticalLayout { alignment: center;
+                Icon { source: @image-url("../assets/icons/chevron-down.svg");
+                    size: 16px; tint: Palette.foreground.with-alpha(0.7); }
+            }
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { popup.show(); }
+    }
+    popup := PopupWindow {
+        x: 0; y: root.height + 4px; width: root.field-width;
+        Rectangle {
+            background: Palette.background;
+            border-width: 1px; border-color: Palette.border; border-radius: 8px;
+            drop-shadow-blur: 16px; drop-shadow-color: #00000040;
+            VerticalLayout {
+                padding: 4px; spacing: 2px;
+                for opt[idx] in root.model: Rectangle {
+                    height: 34px; border-radius: 6px;
+                    background: idx == root.current-index ? Theme.accent-bg
+                              : oh.has-hover ? Palette.alternate-background : transparent;
+                    oh := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.current-index = idx; root.selected(idx); popup.close(); }
+                        HorizontalLayout { padding-left: 10px;
+                            Text { text: opt; font-family: "Inter"; font-size: 13px;
+                                vertical-alignment: center;
+                                color: idx == root.current-index ? Theme.accent-fg
+                                                                 : Palette.foreground; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Accent-themed on/off toggle (replaces Material Switch, which rendered odd
+// end dots in light mode).
+component Toggle {
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    callback toggled();
+
+    min-width: 46px; max-width: 46px; min-height: 26px; max-height: 26px;
+    opacity: root.enabled ? 1.0 : 0.4;
+
+    Rectangle {
+        background: root.checked ? Theme.accent-bg : Palette.foreground.with-alpha(0.22);
+        border-radius: 13px;
+        animate background { duration: 120ms; }
+        Rectangle {
+            width: 20px; height: 20px; border-radius: 10px;
+            background: white;
+            y: parent.height / 2 - 10px;
+            x: root.checked ? parent.width - 23px : 3px;
+            animate x { duration: 120ms; easing: ease-in-out; }
+        }
+    }
+    TouchArea {
+        enabled: root.enabled; mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.checked = !root.checked; root.toggled(); }
+    }
+}
+
+// Accent-themed horizontal slider.
+component AccentSlider {
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
+    in-out property <float> value;
+    callback changed(float);
+
+    min-height: 24px;
+    property <float> frac: (root.maximum > root.minimum)
+        ? (root.value - root.minimum) / (root.maximum - root.minimum) : 0;
+
+    Rectangle {  // track
+        y: parent.height / 2 - 2px; height: 4px; border-radius: 2px;
+        background: Palette.foreground.with-alpha(0.18);
+        Rectangle {  // filled
+            x: 0; width: parent.width * root.frac; height: 4px;
+            border-radius: 2px; background: Theme.accent-bg;
+        }
+    }
+    thumb := Rectangle {
+        width: 16px; height: 16px; border-radius: 8px;
+        background: Theme.accent-bg;
+        border-width: 2px; border-color: Palette.background;
+        y: parent.height / 2 - 8px;
+        x: (parent.width - 16px) * root.frac;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        property <float> compute: root.minimum
+            + (self.mouse-x / root.width) * (root.maximum - root.minimum);
+        moved => {
+            if (self.pressed) {
+                root.value = clamp(self.compute, root.minimum, root.maximum);
+                root.changed(root.value);
+            }
+        }
+        clicked => {
+            root.value = clamp(self.compute, root.minimum, root.maximum);
+            root.changed(root.value);
+        }
+    }
+}
+
+// Continuous spinner: a static track ring with accent dots orbiting it.
+// Dot positions are computed with trig from animation-tick() — no element
+// rotation needed, so it works on plain Rectangles.
+component LoadingSpinner inherits Rectangle {
+    width: 44px; height: 44px;
+    property <angle> spin: (animation-tick() / 1ms) * 0.5deg;  // ~1.4 rev/s
+    property <length> radius: 17px;
+
+    // Track ring
+    Rectangle {
+        width: 40px; height: 40px;
+        x: parent.width / 2 - 20px; y: parent.height / 2 - 20px;
+        border-radius: 20px;
+        border-width: 3px;
+        border-color: Palette.foreground.with-alpha(0.12);
+    }
+    // Three trailing dots with decreasing opacity for a comet effect.
+    for d in [
+        { ang: 0deg,   op: 1.0,  sz: 9px },
+        { ang: -28deg, op: 0.55, sz: 8px },
+        { ang: -56deg, op: 0.28, sz: 7px },
+    ]: Rectangle {
+        width: d.sz; height: d.sz; border-radius: d.sz / 2;
+        x: parent.width / 2 - d.sz / 2 + radius * sin(root.spin + d.ang);
+        y: parent.height / 2 - d.sz / 2 - radius * cos(root.spin + d.ang);
+        background: Theme.accent-bg.with-alpha(d.op);
+    }
+}
+
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <image> icon;
+    in property <bool> active;
+    in property <bool> compact: false;
+    callback clicked();
+
+    height: 44px;
+    background: root.active ? Theme.accent-bg
+              : ta.has-hover ? Palette.alternate-background : transparent;
+    border-radius: 8px;
+    // subtle lift on the active item so it reads as selected at a glance
+    drop-shadow-blur: root.active ? 8px : 0px;
+    drop-shadow-color: root.active ? Theme.accent-bg.with-alpha(0.45) : transparent;
+    ta := TouchArea {
+        clicked => { root.clicked(); }
+        HorizontalLayout {
+            padding-left: root.compact ? 0px : 14px;
+            padding-right: root.compact ? 0px : 14px;
+            spacing: 12px;
+            alignment: root.compact ? center : start;
+            Icon { source: root.icon; size: 18px;
+                tint: root.active ? Theme.accent-fg : Palette.foreground; }
+            if !root.compact: Text { text: root.label; vertical-alignment: center;
+                font-family: "Inter";
+                color: root.active ? Theme.accent-fg : Palette.foreground;
+                font-weight: root.active ? 700 : 500; }
+        }
+    }
+    // Tooltip when collapsed
+    if root.compact && ta.has-hover: Rectangle {
+        x: parent.width + 8px; y: parent.height / 2 - self.height / 2;
+        width: tooltip-text.preferred-width + 16px;
+        height: 28px;
+        background: Palette.foreground;
+        border-radius: 6px;
+        tooltip-text := Text {
+            text: root.label;
+            color: Palette.background;
+            font-family: "Inter"; font-size: 12px; font-weight: 500;
+            x: 8px; vertical-alignment: center;
+        }
+    }
+}
+
+// Physical-style fader: vertical track + tick marks + circular thumb at the
+// current value. Mimics the board layout shown in the reference render.
+component FaderTrack {
+    in property <float> percent;
+    in property <bool> live: true;
+
+    min-width: 48px;
+    preferred-width: 48px;
+
+    // Thumb travel is inset by its radius so it never overflows the track
+    // (at 0% it sat below the track and overlapped the percentage label).
+    property <length> inset: 13px;
+    property <length> thumb-cy: root.inset + (root.height - 2 * root.inset) * (1 - root.percent);
+
+    // Track (centered, 4 px wide), inset top & bottom by the thumb radius
+    Rectangle {
+        x: parent.width / 2 - 2px; width: 4px;
+        y: root.inset - 2px; height: root.height - 2 * root.inset + 4px;
+        background: Palette.foreground.with-alpha(0.18);
+        border-radius: 2px;
+    }
+    // Fill from thumb centre down to the track bottom
+    Rectangle {
+        x: parent.width / 2 - 2px; width: 4px;
+        y: root.thumb-cy;
+        height: (root.height - root.inset + 2px) - root.thumb-cy;
+        background: root.live ? Theme.accent-bg
+                              : Theme.accent-bg.with-alpha(0.5);
+        border-radius: 2px;
+        animate y, height { duration: 80ms; easing: ease-out; }
+    }
+    // Tick marks at 0, 25, 50, 75, 100 %
+    for i in 5: Rectangle {
+        y: root.inset + (root.height - 2 * root.inset) * i / 4 - 0.5px;
+        x: parent.width / 2 + 10px; width: 6px; height: 1px;
+        background: Palette.foreground.with-alpha(0.2);
+    }
+    // Thumb
+    Rectangle {
+        x: parent.width / 2 - 12px;
+        y: root.thumb-cy - 12px;
+        width: 24px; height: 24px;
+        background: Theme.accent-bg;
+        border-radius: 12px;
+        border-width: 2px;
+        border-color: Palette.background;
+        animate y { duration: 80ms; easing: ease-out; }
+    }
+}
+
+component PhysicalButton inherits Rectangle {
+    in property <bool> pressed;
+    in property <int> number;
+    in property <bool> assigned;
+    in property <bool> edit-mode: false;
+    callback clicked();
+
+    background: root.pressed ? Theme.accent-bg
+              : ta.has-hover && root.edit-mode ? Theme.accent-bg.with-alpha(0.18)
+              : root.assigned ? Palette.alternate-background.darker(0.04)
+              : Palette.alternate-background;
+    border-radius: 8px;
+    border-width: root.edit-mode ? 2px : 1px;
+    border-color: root.pressed ? Theme.accent-bg
+                : root.edit-mode ? Theme.accent-bg.with-alpha(0.6)
+                : root.assigned ? Palette.border.darker(0.1)
+                : Palette.border;
+    animate background, border-color { duration: 80ms; }
+
+    Text {
+        text: root.number;
+        font-family: "Inter"; font-weight: 600; font-size: 13px;
+        color: root.pressed ? Theme.accent-fg
+             : Palette.foreground.with-alpha(0.7);
+        horizontal-alignment: center; vertical-alignment: center;
+    }
+    if root.assigned && !root.pressed: Rectangle {
+        x: parent.width - 8px; y: 4px;
+        width: 4px; height: 4px; border-radius: 2px;
+        background: Theme.accent-bg;
+    }
+    if root.edit-mode: Icon {
+        x: parent.width - 18px; y: parent.height - 18px;
+        source: @image-url("../assets/icons/edit.svg");
+        size: 12px; tint: Theme.accent-bg;
+    }
+    ta := TouchArea {
+        enabled: root.edit-mode;
+        mouse-cursor: root.edit-mode ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+}
+
+component IconButton {
+    in property <image> icon;
+    in property <string> label;
+    in property <bool> primary;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    min-height: 36px;
+    max-height: 36px;                      // never stretch taller than the control
+    min-width: layout.min-width;
+    preferred-width: layout.preferred-width;
+    max-width: layout.preferred-width;     // prevent stretching to fill row
+    preferred-height: 36px;
+    horizontal-stretch: 0; vertical-stretch: 0;
+
+    Rectangle {
+        background: !root.enabled ? Palette.alternate-background.with-alpha(0.5)
+                  : root.primary ? Theme.accent-bg
+                  : ta.has-hover ? Palette.alternate-background.darker(0.04)
+                  : Palette.alternate-background;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: root.primary ? Theme.accent-bg : Palette.border;
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+    layout := HorizontalLayout {
+        padding-left: 14px; padding-right: 14px; spacing: 8px; alignment: center;
+        if root.icon.width > 0: Icon { source: root.icon; size: 16px;
+            tint: !root.enabled ? Palette.foreground.with-alpha(0.4)
+                : root.primary ? Theme.accent-fg : Palette.foreground; }
+        if root.label != "": Text { text: root.label; vertical-alignment: center;
+            horizontal-alignment: center;
+            font-family: "Inter"; font-weight: 500; font-size: 13px;
+            color: !root.enabled ? Palette.foreground.with-alpha(0.4)
+                 : root.primary ? Theme.accent-fg : Palette.foreground; }
+    }
+}
+
+component SquareIconButton {
+    in property <image> icon;
+    in property <color> tint: Palette.foreground.with-alpha(0.7);
+    in property <bool> enabled: true;
+    callback clicked();
+    min-width: 32px; min-height: 32px;
+    preferred-width: 32px; preferred-height: 32px;
+    max-width: 32px; max-height: 32px;
+    horizontal-stretch: 0; vertical-stretch: 0;
+    opacity: root.enabled ? 1.0 : 0.25;
+
+    Rectangle {
+        background: (ta.has-hover && root.enabled) ? Palette.alternate-background.darker(0.06) : transparent;
+        border-radius: 6px;
+    }
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { if (root.enabled) { root.clicked(); } }
+        Icon { x: parent.width / 2 - self.width / 2; y: parent.height / 2 - self.height / 2;
+            source: root.icon; size: 16px; tint: root.tint; }
+    }
+}
+
+// Row used in settings: label on the far left, control on the far right.
+component SettingRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> description;
+    spacing: 12px;
+    padding-top: 6px; padding-bottom: 6px;
+
+    VerticalLayout {
+        horizontal-stretch: 1; spacing: 2px;
+        Text { text: root.label; vertical-alignment: center;
+            font-family: "Inter"; font-size: 13px; font-weight: 500; }
+        if root.description != "": Text { text: root.description;
+            font-family: "Inter"; font-size: 11px;
+            color: Palette.foreground.with-alpha(0.55); }
+    }
+    @children
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Pages
+// ──────────────────────────────────────────────────────────────────────────
+
+component HomePage inherits VerticalBox {
+    in property <[SliderCell]> sliders;
+    in property <[ButtonCell]> top-buttons;        // buttons 1..6 (indices 0..5)
+    in property <[ButtonCell]> right-buttons;      // buttons 7..11 (indices 6..10)
+    in property <bool> connected;
+    in property <string> connection-msg;
+    in property <float> retry-eta-secs;
+    in-out property <bool> edit-mode;
+
+    callback retry-now();
+    callback request-assign(int, int);
+
+    spacing: 16px;
+    alignment: start;
+
+    HorizontalBox {
+        Text { text: "Home"; font-size: 26px; font-weight: 700;
+            font-family: "Inter"; vertical-alignment: center; }
+        Rectangle { horizontal-stretch: 1; }
+        if root.connected: IconButton {
+            icon: root.edit-mode ? @image-url("../assets/icons/check.svg")
+                                 : @image-url("../assets/icons/edit.svg");
+            label: root.edit-mode ? "Done editing" : "Edit assignments";
+            primary: root.edit-mode;
+            clicked => { root.edit-mode = !root.edit-mode; }
+        }
+    }
+
+    if !root.connected: Card {
+        height: 360px;
+        VerticalBox {
+            alignment: center; spacing: 14px; padding: 24px;
+            HorizontalLayout { alignment: center; LoadingSpinner {} }
+            Text { text: "Searching for Slidr device"; font-size: 18px;
+                font-weight: 600; font-family: "Inter";
+                horizontal-alignment: center; }
+            Text { text: root.connection-msg; horizontal-alignment: center;
+                font-family: "Inter";
+                color: Palette.foreground.with-alpha(0.7); }
+            HorizontalBox {
+                alignment: center;
+                IconButton {
+                    icon: @image-url("../assets/icons/refresh.svg");
+                    label: "Try again now"; primary: true;
+                    clicked => { root.retry-now(); }
+                }
+            }
+        }
+    }
+
+    // ─── Physical-board layout ───────────────────────────────────────────
+    // 6 squares across the top, 6 faders below them, and 5 squares stacked in
+    // a right column — matching the physical board. The cell above button 7
+    // (top-right of the grid) stays empty by design. All buttons stay square;
+    // when vertical space is tight they shrink uniformly.
+    if root.connected: board := Card {
+        vertical-stretch: 1;
+        // Fixed square cell size so all 11 physical buttons are identical.
+        // Card sizes itself to fit: 6 button cells (top + right column) + spacing.
+        property <length> cell-size: 64px;
+        min-height: 6 * cell-size + 5 * 14px + 40px + 22px;  // ≈ 526
+
+        HorizontalLayout {
+            padding: 20px; spacing: 16px;
+
+            // Left side: 6 buttons + faders + assign rows
+            VerticalLayout {
+                horizontal-stretch: 1; spacing: 14px;
+
+                // Top button row — same layout always; the button itself is the
+                // hit target in edit mode (no extra Assign button below).
+                HorizontalLayout {
+                    spacing: 14px; alignment: stretch;
+                    for b[i] in root.top-buttons: VerticalLayout {
+                        horizontal-stretch: 1; spacing: 4px; alignment: start;
+                        HorizontalLayout { alignment: center;
+                            PhysicalButton {
+                                width: cell-size; height: cell-size;
+                                number: i + 1;
+                                pressed: b.pressed; assigned: b.assigned;
+                                edit-mode: root.edit-mode;
+                                clicked => { root.request-assign(1, i); }
+                            }
+                        }
+                        Text {
+                            text: b.assigned ? b.category : "—";
+                            horizontal-alignment: center; font-size: 11px;
+                            font-family: "Inter";
+                            color: b.assigned ? Theme.accent-bg
+                                              : Palette.foreground.with-alpha(0.45);
+                        }
+                    }
+                }
+
+                // Six faders
+                HorizontalLayout {
+                    vertical-stretch: 1; spacing: 14px;
+                    for s[i] in root.sliders: VerticalLayout {
+                        horizontal-stretch: 1; spacing: 6px;
+                        FaderTrack { vertical-stretch: 1; percent: s.percent; }
+                        Text { text: round(s.percent * 100) + "%";
+                            horizontal-alignment: center;
+                            font-family: "Inter"; font-size: 14px; font-weight: 600; }
+                        // Fixed-height row → edit toggle never shifts layout
+                        Rectangle {
+                            height: 22px;
+                            if !root.edit-mode: Text {
+                                text: s.assigned ? s.category : "—";
+                                horizontal-alignment: center; font-size: 11px;
+                                font-family: "Inter";
+                                color: s.assigned ? Theme.accent-bg
+                                                  : Palette.foreground.with-alpha(0.45);
+                                width: parent.width; vertical-alignment: center;
+                            }
+                            if root.edit-mode: ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.request-assign(0, i); }
+                                Rectangle {
+                                    background: ta.has-hover
+                                        ? Theme.accent-bg.with-alpha(0.18)
+                                        : Theme.accent-bg.with-alpha(0.10);
+                                    border-radius: 6px; border-width: 1px;
+                                    border-color: Theme.accent-bg.with-alpha(0.4);
+                                }
+                                Text { text: s.assigned ? s.category : "Assign";
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                    font-family: "Inter"; font-size: 11px;
+                                    font-weight: 600; color: Theme.accent-bg;
+                                    width: parent.width;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Right column: top-right intentionally empty; 5 square buttons stacked
+            VerticalLayout {
+                width: cell-size; spacing: 14px; alignment: start;
+                // Empty top cell aligned with top button row + label height
+                Rectangle { width: cell-size; height: cell-size + 22px; }
+                for b[i] in root.right-buttons: VerticalLayout {
+                    spacing: 4px; alignment: start;
+                    HorizontalLayout { alignment: center;
+                        PhysicalButton {
+                            width: cell-size; height: cell-size;
+                            number: i + 7;
+                            pressed: b.pressed; assigned: b.assigned;
+                            edit-mode: root.edit-mode;
+                            clicked => { root.request-assign(1, i + 6); }
+                        }
+                    }
+                    Text {
+                        text: b.assigned ? b.category : "—";
+                        horizontal-alignment: center; font-size: 11px;
+                        font-family: "Inter";
+                        color: b.assigned ? Theme.accent-bg
+                                          : Palette.foreground.with-alpha(0.45);
+                    }
+                }
+            }
+        }
+    }
+}
+
+component CategoriesPage inherits VerticalBox {
+    in property <int> target-kind;
+    in property <[CategorySummary]> categories;
+
+    callback add-category(string);
+    callback rename(int, string);
+    callback delete(int);
+    callback delete-line(int, int);
+    callback add-line(int);
+    callback edit-line(int, int);
+
+    in-out property <string> draft-name: "";
+    in-out property <int> renaming-id: -1;
+    in-out property <string> rename-draft: "";
+
+    spacing: 10px;
+
+    HorizontalLayout {
+        padding: 0; spacing: 8px;
+        Text { text: root.target-kind == 0 ? "Slider categories" : "Button categories";
+            font-size: 22px; font-weight: 700; font-family: "Inter";
+            vertical-alignment: center; horizontal-stretch: 1; }
+        LineEdit { width: 220px; height: 36px; placeholder-text: "New category…";
+            text <=> root.draft-name;
+            accepted => {
+                if (root.draft-name != "") {
+                    root.add-category(root.draft-name); root.draft-name = "";
+                }
+            } }
+        IconButton {
+            icon: @image-url("../assets/icons/plus.svg");
+            label: "Add"; primary: true;
+            enabled: root.draft-name != "";
+            clicked => { root.add-category(root.draft-name); root.draft-name = ""; }
+        }
+    }
+
+    ScrollView {
+        vertical-stretch: 1;
+        VerticalBox {
+            padding: 0; spacing: 8px; alignment: start;
+            if root.categories.length == 0: Card {
+                VerticalLayout { padding: 24px; spacing: 6px; alignment: center;
+                    Text { text: "No categories yet";
+                        font-family: "Inter"; font-weight: 600;
+                        horizontal-alignment: center; }
+                    Text { text: "Create one above to get started.";
+                        font-family: "Inter"; font-size: 12px;
+                        color: Palette.foreground.with-alpha(0.55);
+                        horizontal-alignment: center; }
+                }
+            }
+            for cat in root.categories: Card {
+                VerticalLayout {
+                    padding: 12px; spacing: 6px;
+                    // Header row
+                    HorizontalLayout { spacing: 8px;
+                        if root.renaming-id != cat.id: Text { text: cat.name;
+                            font-weight: 700; font-size: 14px;
+                            font-family: "Inter"; vertical-alignment: center;
+                            horizontal-stretch: 1; }
+                        if root.renaming-id == cat.id: LineEdit {
+                            text <=> root.rename-draft; height: 32px;
+                            horizontal-stretch: 1;
+                            accepted => {
+                                if (root.rename-draft != "") { root.rename(cat.id, root.rename-draft); }
+                                root.renaming-id = -1;
+                            }
+                        }
+                        if root.renaming-id != cat.id: Text {
+                            text: cat.count + (cat.count == 1 ? " item" : " items");
+                            font-family: "Inter"; font-size: 11px;
+                            color: Palette.foreground.with-alpha(0.55);
+                            vertical-alignment: center; }
+                        SquareIconButton {
+                            icon: root.renaming-id == cat.id
+                                ? @image-url("../assets/icons/check.svg")
+                                : @image-url("../assets/icons/edit.svg");
+                            clicked => {
+                                if (root.renaming-id == cat.id) {
+                                    if (root.rename-draft != "") { root.rename(cat.id, root.rename-draft); }
+                                    root.renaming-id = -1;
+                                } else {
+                                    root.renaming-id = cat.id; root.rename-draft = cat.name;
+                                }
+                            }
+                        }
+                        SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
+                            tint: #d32f2f.with-alpha(0.8);
+                            clicked => { root.delete(cat.id); } }
+                    }
+                    if cat.lines.length > 0: Rectangle { height: 1px;
+                        background: Palette.border.with-alpha(0.5); }
+                    for line[idx] in cat.lines: HorizontalLayout {
+                        spacing: 8px; padding-top: 2px; padding-bottom: 2px;
+                        Rectangle { width: 3px; background: Theme.accent-bg;
+                            border-radius: 1.5px; }
+                        KindIcon { kind: line.icon-kind; size: 20px;
+                            y: parent.height / 2 - 10px; }
+                        VerticalLayout {
+                            horizontal-stretch: 1; spacing: 0px;
+                            alignment: center;
+                            Text { text: line.primary; font-weight: 500;
+                                font-size: 12px; font-family: "Inter"; }
+                            Text { text: line.secondary; font-size: 10px;
+                                font-family: "Inter";
+                                color: Palette.foreground.with-alpha(0.55); }
+                        }
+                        SquareIconButton { icon: @image-url("../assets/icons/edit.svg");
+                            clicked => { root.edit-line(cat.id, idx); } }
+                        SquareIconButton { icon: @image-url("../assets/icons/x.svg");
+                            tint: #d32f2f.with-alpha(0.8);
+                            clicked => { root.delete-line(cat.id, idx); } }
+                    }
+                    HorizontalLayout { padding-top: 2px;
+                        Rectangle { horizontal-stretch: 1; }
+                        IconButton {
+                            icon: @image-url("../assets/icons/plus.svg");
+                            label: root.target-kind == 0 ? "Add stream" : "Add action";
+                            clicked => { root.add-line(cat.id); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component SettingsPage inherits VerticalBox {
+    in-out property <int> theme-index;
+    in-out property <int> accent-preset;
+    in-out property <int> dead-zone;
+    in-out property <bool> unmute-on-change;
+    in-out property <bool> start-with-os;
+    in-out property <bool> start-minimized;
+    in-out property <bool> minimize-to-tray;
+    in-out property <int> curve-preset-index;
+    in property <string> build-stamp;
+
+    callback theme-changed(int);
+    callback dirty();
+
+    spacing: 14px;
+
+    property <length> control-w: 260px;
+
+    HorizontalBox {
+        Text { text: "Settings"; font-size: 26px; font-weight: 700; font-family: "Inter";
+            vertical-alignment: center; }
+        Rectangle { horizontal-stretch: 1; }
+    }
+
+    ScrollView {
+        vertical-stretch: 1;
+        VerticalBox {
+            spacing: 12px; alignment: start;
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
+                    Text { text: "Appearance"; font-weight: 700; font-family: "Inter";
+                        font-size: 14px; }
+                    Rectangle { height: 6px; }
+                    SettingRow {
+                        label: "Theme";
+                        Select {
+                            field-width: root.control-w;
+                            model: ["System", "Light", "Dark"];
+                            current-index <=> root.theme-index;
+                            selected(i) => { root.theme-changed(i); root.dirty(); }
+                        }
+                    }
+                    SettingRow {
+                        label: "Accent color";
+                        description: "Brand colour used across buttons, sliders and highlights";
+                        HorizontalLayout {
+                            width: root.control-w; alignment: space-between;
+                            for c[idx] in [#6d4cd1, #2563eb, #16a34a, #ca8a04, #db2777, #ea580c]:
+                            Rectangle {
+                                width: 28px; height: 28px; border-radius: 14px;
+                                background: c;
+                                border-width: idx == root.accent-preset ? 3px : 1px;
+                                border-color: idx == root.accent-preset
+                                    ? Palette.foreground : Palette.border;
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.accent-preset = idx;
+                                                 Theme.accent-preset = idx;
+                                                 root.dirty(); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
+                    Text { text: "Sliders"; font-weight: 700; font-family: "Inter";
+                        font-size: 14px; }
+                    Rectangle { height: 6px; }
+                    SettingRow {
+                        label: "Dead zone";
+                        description: "Smallest movement that triggers an event";
+                        HorizontalLayout {
+                            width: root.control-w; spacing: 10px;
+                            AccentSlider { minimum: 0; maximum: 50; value: root.dead-zone;
+                                changed(v) => { root.dead-zone = v; root.dirty(); }
+                                horizontal-stretch: 1; }
+                            Text { text: root.dead-zone; min-width: 24px;
+                                horizontal-alignment: right;
+                                font-family: "Inter"; vertical-alignment: center; }
+                        }
+                    }
+                    SettingRow {
+                        label: "Curve";
+                        description: "Shape of slider → volume mapping";
+                        Select { field-width: root.control-w;
+                            model: ["Linear", "Ease", "Ease-in", "Ease-out", "Ease-in-out", "Custom"];
+                            current-index <=> root.curve-preset-index;
+                            selected(i) => { root.dirty(); } }
+                    }
+                    SettingRow {
+                        label: "Unmute on change";
+                        description: "Unmute the target automatically when slider moves";
+                        HorizontalLayout { width: root.control-w; alignment: end;
+                            VerticalLayout { alignment: center;
+                                Toggle { checked <=> root.unmute-on-change;
+                                         toggled => { root.dirty(); } } } }
+                    }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
+                    Text { text: "System"; font-weight: 700; font-family: "Inter";
+                        font-size: 14px; }
+                    Rectangle { height: 6px; }
+                    SettingRow { label: "Start with operating system";
+                        HorizontalLayout { width: root.control-w; alignment: end;
+                            VerticalLayout { alignment: center;
+                                Toggle { checked <=> root.start-with-os;
+                                         toggled => { root.dirty(); } } } } }
+                    SettingRow { label: "Start minimized to tray";
+                        description: root.start-with-os
+                            ? "" : "Enable 'Start with OS' to enable this";
+                        HorizontalLayout { width: root.control-w; alignment: end;
+                            VerticalLayout { alignment: center;
+                                Toggle { checked <=> root.start-minimized;
+                                         enabled: root.start-with-os;
+                                         toggled => { root.dirty(); } } } } }
+                    SettingRow { label: "Minimize to system tray";
+                        HorizontalLayout { width: root.control-w; alignment: end;
+                            VerticalLayout { alignment: center;
+                                Toggle { checked <=> root.minimize-to-tray;
+                                         toggled => { root.dirty(); } } } } }
+                }
+            }
+
+            if root.build-stamp != "": Text {
+                text: "Build: " + root.build-stamp;
+                horizontal-alignment: center; font-size: 11px; font-family: "Inter";
+                color: Palette.foreground.with-alpha(0.4);
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Overlays
+// ──────────────────────────────────────────────────────────────────────────
+
+component AssignPopup inherits Rectangle {
+    in property <int> target-kind;
+    in property <[AssignPick]> options;
+    callback cancel();
+    callback choose(int);
+
+    background: #00000099;
+    TouchArea { clicked => { root.cancel(); } }
+    Rectangle {
+        x: parent.width / 2 - self.width / 2;
+        y: parent.height / 2 - self.height / 2;
+        width: 400px; height: 480px;
+        background: Palette.background;
+        border-radius: 14px; border-width: 1px; border-color: Palette.border;
+        TouchArea {}
+        VerticalBox {
+            padding: 20px; spacing: 12px;
+            Text { text: root.target-kind == 0 ? "Assign slider to category"
+                                               : "Assign button to category";
+                font-size: 18px; font-weight: 700; font-family: "Inter"; }
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 4px;
+                    IconButton { label: "No assignment"; icon: @image-url("../assets/icons/x.svg");
+                        clicked => { root.choose(-1); } }
+                    for opt in root.options: IconButton {
+                        label: opt.name; icon: @image-url("../assets/icons/check.svg");
+                        clicked => { root.choose(opt.id); }
+                    }
+                }
+            }
+            HorizontalBox {
+                Rectangle { horizontal-stretch: 1; }
+                IconButton { label: "Cancel"; clicked => { root.cancel(); } }
+            }
+        }
+    }
+}
+
+component PresetPopup inherits Rectangle {
+    in property <string> active-name;
+    in property <[string]> presets;
+
+    callback cancel();
+    callback load(string);
+    callback set-active(string);
+    callback rename(string, string);
+    callback export(string);
+    callback import();
+    callback delete(string);
+    callback create(string);
+
+    in-out property <int> renaming-idx: -1;
+    in-out property <string> rename-text: "";
+    in-out property <string> new-name: "";
+
+    background: #00000099;
+    TouchArea { clicked => { root.cancel(); } }
+
+    Rectangle {
+        x: parent.width / 2 - self.width / 2;
+        y: parent.height / 2 - self.height / 2;
+        width: 440px; height: 480px;
+        background: Palette.background;
+        border-radius: 14px; border-width: 1px; border-color: Palette.border;
+        TouchArea {}
+        VerticalBox {
+            padding: 20px; spacing: 12px;
+            HorizontalLayout {
+                Text { text: "Profiles"; font-size: 20px; font-weight: 700;
+                    font-family: "Inter"; vertical-alignment: center;
+                    horizontal-stretch: 1; }
+                SquareIconButton { icon: @image-url("../assets/icons/x.svg");
+                    clicked => { root.cancel(); } }
+            }
+            Text { text: "Switch active profile or manage saved profiles.";
+                font-family: "Inter"; font-size: 12px;
+                color: Palette.foreground.with-alpha(0.6); }
+            HorizontalLayout { spacing: 8px;
+                LineEdit { placeholder-text: "New profile name…"; height: 36px;
+                    text <=> root.new-name; horizontal-stretch: 1;
+                    accepted => {
+                        if (root.new-name != "") {
+                            root.create(root.new-name); root.new-name = "";
+                        }
+                    } }
+                IconButton {
+                    icon: @image-url("../assets/icons/file-import.svg");
+                    label: "Import";
+                    clicked => { root.import(); }
+                }
+                IconButton {
+                    icon: @image-url("../assets/icons/plus.svg");
+                    label: "Create"; primary: true;
+                    enabled: root.new-name != "";
+                    clicked => {
+                        if (root.new-name != "") {
+                            root.create(root.new-name); root.new-name = "";
+                        }
+                    }
+                }
+            }
+            Rectangle { height: 1px; background: Palette.border; }
+            ScrollView {
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 6px;
+                    if root.presets.length == 0: Text {
+                        text: "No profiles yet — create one above.";
+                        font-family: "Inter"; font-italic: true;
+                        color: Palette.foreground.with-alpha(0.5);
+                    }
+                    for name[idx] in root.presets: Rectangle {
+                        border-radius: 10px;
+                        background: name == root.active-name
+                            ? Theme.accent-bg.with-alpha(0.12)
+                            : Palette.alternate-background;
+                        border-width: name == root.active-name ? 2px : 1px;
+                        border-color: name == root.active-name
+                            ? Theme.accent-bg : Palette.border;
+                        height: 44px;
+
+                        HorizontalLayout {
+                            padding-left: 12px; padding-right: 8px; spacing: 8px;
+                            // Name / inline rename
+                            VerticalLayout {
+                                horizontal-stretch: 1; spacing: 0px;
+                                alignment: center;
+                                if root.renaming-idx == idx: LineEdit {
+                                    text <=> root.rename-text; height: 30px;
+                                    accepted => {
+                                        if (root.rename-text != "" && root.rename-text != name) {
+                                            root.rename(name, root.rename-text);
+                                        }
+                                        root.renaming-idx = -1;
+                                    }
+                                }
+                                if root.renaming-idx != idx: Text { text: name;
+                                    font-family: "Inter"; font-weight: 600;
+                                    font-size: 14px; vertical-alignment: center; }
+                                if root.renaming-idx != idx && name == root.active-name: Text {
+                                    text: "Active"; font-family: "Inter";
+                                    font-size: 10px; font-weight: 600;
+                                    color: Theme.accent-bg; }
+                            }
+
+                            // Action buttons — uniform 32px squares, vertically centred
+                            VerticalLayout { alignment: center;
+                                HorizontalLayout {
+                                    spacing: 2px;
+                                    // Switch to this preset — disabled when already active.
+                                    SquareIconButton {
+                                        icon: @image-url("../assets/icons/switch-horizontal.svg");
+                                        tint: Theme.accent-bg;
+                                        enabled: name != root.active-name;
+                                        clicked => { root.load(name); root.set-active(name); }
+                                    }
+                                    SquareIconButton {
+                                        icon: root.renaming-idx == idx
+                                            ? @image-url("../assets/icons/check.svg")
+                                            : @image-url("../assets/icons/edit.svg");
+                                        clicked => {
+                                            if (root.renaming-idx == idx) {
+                                                if (root.rename-text != "" && root.rename-text != name) {
+                                                    root.rename(name, root.rename-text);
+                                                }
+                                                root.renaming-idx = -1;
+                                            } else {
+                                                root.renaming-idx = idx; root.rename-text = name;
+                                            }
+                                        }
+                                    }
+                                    SquareIconButton {
+                                        icon: @image-url("../assets/icons/file-export.svg");
+                                        clicked => { root.export(name); }
+                                    }
+                                    SquareIconButton {
+                                        icon: @image-url("../assets/icons/trash.svg");
+                                        tint: #d32f2f.with-alpha(0.8);
+                                        enabled: name != root.active-name;  // can't delete active
+                                        clicked => { root.delete(name); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+component WizardPopup inherits Rectangle {
+    in property <int> target-kind;
+    in-out property <int> step;
+    in-out property <int> kind;
+    in-out property <string> property;
+    in-out property <string> display;
+    in property <[string]> live-processes;
+    in property <[string]> live-mics;
+    in property <[string]> live-outputs;
+
+    in-out property <string> filter: "";
+
+    callback cancel();
+    callback finish();
+    callback refresh();
+    callback state-changed();
+    callback browse();
+
+    background: #00000099;
+    TouchArea { clicked => { root.cancel(); } }
+
+    property <[string]> button-kinds: ["Mute process", "Mute main audio", "Mute microphone",
+                                       "Open application", "Open website", "Simulate key"];
+    property <[string]> slider-kinds: ["Process volume", "Microphone", "Output device"];
+    property <[string]> kinds: root.target-kind == 1 ? root.button-kinds : root.slider-kinds;
+    property <string> kind-label: root.kinds[root.kind];
+    property <bool> needs-property: !(root.target-kind == 1 && root.kind == 1);
+    in property <[PickerEntry]> picker-source;
+    // Key library uses the picker list too (kind 5).
+    property <bool> picker-is-list: !(root.target-kind == 1 && (root.kind == 3 || root.kind == 4));
+
+    Rectangle {
+        x: parent.width / 2 - self.width / 2;
+        y: parent.height / 2 - self.height / 2;
+        width: 560px; height: 600px;
+        background: Palette.background;
+        border-radius: 14px; border-width: 1px; border-color: Palette.border;
+        TouchArea {}
+        VerticalBox {
+            padding: 22px; spacing: 14px;
+
+            HorizontalBox {
+                Text { text: root.target-kind == 0 ? "New audio stream" : "New action";
+                    font-size: 20px; font-weight: 700; font-family: "Inter";
+                    vertical-alignment: center; horizontal-stretch: 1; }
+                for i in 3: Rectangle {
+                    width: 28px; height: 4px; border-radius: 2px;
+                    background: i <= root.step ? Theme.accent-bg : Palette.border;
+                }
+            }
+
+            // step 0 — pick kind
+            if root.step == 0: ScrollView {
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 6px; alignment: start;
+                    Text { text: "What do you want to add?"; font-weight: 600;
+                        font-family: "Inter"; }
+                    for k[idx] in root.kinds: Rectangle {
+                        border-radius: 10px;
+                        background: idx == root.kind ? Theme.accent-bg.with-alpha(0.18)
+                                                     : Palette.alternate-background;
+                        border-width: 1px;
+                        border-color: idx == root.kind ? Theme.accent-bg : Palette.border;
+                        height: 52px;
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.kind = idx; root.property = "";
+                                         root.display = ""; root.filter = "";
+                                         root.state-changed(); }
+                            HorizontalBox {
+                                padding-left: 14px; padding-right: 14px;
+                                Text { text: k; vertical-alignment: center; font-family: "Inter";
+                                    font-weight: idx == root.kind ? 600 : 500;
+                                    horizontal-stretch: 1; }
+                                if idx == root.kind: Icon {
+                                    source: @image-url("../assets/icons/check.svg");
+                                    tint: Theme.accent-bg; size: 18px;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // step 1 — pick target
+            if root.step == 1: VerticalBox {
+                spacing: 10px;
+                HorizontalBox {
+                    Text { text: root.kind-label; font-weight: 600; font-family: "Inter";
+                        font-size: 15px; vertical-alignment: center; horizontal-stretch: 1; }
+                    if root.picker-is-list: IconButton {
+                        icon: @image-url("../assets/icons/refresh.svg");
+                        label: "Refresh";
+                        clicked => { root.refresh(); }
+                    }
+                }
+
+                if !root.needs-property: Text {
+                    text: "No further configuration needed.";
+                    font-family: "Inter"; color: Palette.foreground.with-alpha(0.7);
+                }
+
+                if root.picker-is-list && root.needs-property: LineEdit {
+                    placeholder-text: "Search…";
+                    text <=> root.filter;
+                    edited(t) => { root.state-changed(); }
+                }
+
+                if root.picker-is-list && root.needs-property: ScrollView {
+                    vertical-stretch: 1;
+                    VerticalBox {
+                        spacing: 4px;
+                        if root.picker-source.length == 0: Text {
+                            text: "Nothing detected yet — start your audio (or refresh).";
+                            font-family: "Inter"; font-italic: true;
+                            color: Palette.foreground.with-alpha(0.5); }
+                        for e in root.picker-source: Rectangle {
+                            border-radius: 8px;
+                            background: e.name == root.property
+                                ? Theme.accent-bg.with-alpha(0.22)
+                                : Palette.alternate-background;
+                            border-width: 1px;
+                            border-color: e.name == root.property
+                                ? Theme.accent-bg : Palette.border;
+                            height: 40px;
+                            TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.property = e.name; root.display = e.name; }
+                                HorizontalLayout { padding-left: 12px; padding-right: 12px;
+                                    spacing: 10px;
+                                    VerticalLayout { alignment: center;
+                                        KindIcon { kind: e.icon-kind; size: 18px; } }
+                                    Text { text: e.name; vertical-alignment: center;
+                                        font-family: "Inter"; horizontal-stretch: 1; }
+                                    VerticalLayout { alignment: center;
+                                        if e.name == root.property: Icon {
+                                            source: @image-url("../assets/icons/check.svg");
+                                            tint: Theme.accent-bg; size: 16px;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !root.picker-is-list: VerticalBox {
+                    spacing: 6px; alignment: start;
+                    Text {
+                        text: root.kind == 3 ? "Path or command to launch"
+                            :                  "URL (e.g. https://example.com)";
+                        font-size: 12px; font-family: "Inter";
+                        color: Palette.foreground.with-alpha(0.7);
+                    }
+                    HorizontalLayout { spacing: 6px;
+                        LineEdit { text <=> root.property; horizontal-stretch: 1; height: 36px;
+                            placeholder-text: root.kind == 3
+                                ? "C:\\Path\\To\\app.exe" : "https://"; }
+                        if root.kind == 3: IconButton {
+                            icon: @image-url("../assets/icons/edit.svg");
+                            label: "Browse…";
+                            clicked => { root.browse(); }
+                        }
+                    }
+                    LineEdit { text <=> root.display; height: 36px;
+                        placeholder-text: "Display name (optional)"; }
+                }
+            }
+
+            // step 2 — confirm
+            if root.step == 2: VerticalBox {
+                spacing: 10px;
+                Text { text: "Ready to add"; font-weight: 700; font-family: "Inter";
+                    font-size: 16px; }
+                Card { VerticalBox { padding: 16px; spacing: 8px;
+                    Text { text: root.target-kind == 0 ? "Type: audio stream" : "Type: action";
+                        font-family: "Inter"; }
+                    Text { text: "Kind: " + root.kind-label; font-family: "Inter"; }
+                    if root.needs-property: Text { text: "Target: " + root.property;
+                        font-family: "Inter"; }
+                    if root.display != "" && root.display != root.property: Text {
+                        text: "Label: " + root.display; font-family: "Inter"; }
+                } }
+                Text { text: "You can edit or remove it from the category list afterwards.";
+                    font-size: 12px; font-family: "Inter";
+                    color: Palette.foreground.with-alpha(0.6); }
+            }
+
+            // footer
+            HorizontalBox {
+                IconButton { label: "Cancel"; clicked => { root.cancel(); } }
+                Rectangle { horizontal-stretch: 1; }
+                if root.step > 0: IconButton {
+                    icon: @image-url("../assets/icons/chevron-left.svg");
+                    label: "Back"; clicked => { root.step = root.step - 1; }
+                }
+                if root.step < 2: IconButton {
+                    icon: @image-url("../assets/icons/chevron-right.svg");
+                    label: "Next"; primary: true;
+                    enabled: root.step == 0 || !root.needs-property || root.property != "";
+                    clicked => { root.step = root.step + 1; }
+                }
+                if root.step == 2: IconButton {
+                    icon: @image-url("../assets/icons/check.svg");
+                    label: "Add"; primary: true;
+                    clicked => { root.finish(); }
+                }
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Window
+// ──────────────────────────────────────────────────────────────────────────
+
+export component AppWindow inherits Window {
+    title: "Slidr";
+    icon: @image-url("../assets/logo-128.png");
+    preferred-width: 1200px;
+    preferred-height: 760px;
+    min-width: 1200px;
+    min-height: 760px;
+    background: Palette.background;
+    default-font-family: "Inter";
+    default-font-size: 13px;
+
+
+    in property <[SliderCell]> sliders;
+    in property <[ButtonCell]> top-buttons;
+    in property <[ButtonCell]> right-buttons;
+    in property <bool> connected;
+    in property <string> connection-msg;
+    in property <float> retry-eta-secs;
+    in property <string> badge-text;
+    in property <string> active-preset-name;
+    in property <string> build-stamp;
+
+    in property <[CategorySummary]> slider-categories;
+    in property <[CategorySummary]> button-categories;
+    in property <[string]> preset-names;
+    in property <[string]> live-processes;
+    in property <[string]> live-mics;
+    in property <[string]> live-outputs;
+    in property <[AssignPick]> assign-options;
+
+    in-out property <int> theme-index;
+    in-out property <int> accent-preset: 0;
+    in-out property <int> dead-zone;
+    in-out property <bool> unmute-on-change;
+    in-out property <bool> start-with-os;
+    in-out property <bool> start-minimized;
+    in-out property <bool> minimize-to-tray;
+    in-out property <int> curve-preset-index;
+
+    in-out property <int> current-page: 0;
+    in-out property <bool> edit-mode: false;
+
+    in-out property <bool> assign-popup-open: false;
+    in-out property <int> assign-target-kind: 0;
+    in-out property <int> assign-target-index: 0;
+
+    in-out property <bool> preset-popup-open: false;
+    in-out property <bool> sidebar-collapsed: false;
+
+    callback browse-file();
+
+    in-out property <bool> wizard-open: false;
+    in-out property <int> wizard-target-kind: 0;
+    in-out property <int> wizard-category-id: -1;
+    in-out property <int> wizard-step: 0;
+    in-out property <int> wizard-kind: 0;
+    in-out property <string> wizard-property: "";
+    in-out property <string> wizard-display: "";
+    in-out property <string> wizard-filter: "";
+    in property <[PickerEntry]> wizard-picker-source;
+
+    in-out property <string> toast-text: "";
+
+    public function apply-theme(idx: int) {
+        if (idx == 1) {
+            Palette.color-scheme = ColorScheme.light;
+        } else if (idx == 2) {
+            Palette.color-scheme = ColorScheme.dark;
+        } else {
+            Palette.color-scheme = ColorScheme.unknown;
+        }
+    }
+    public function apply-accent(idx: int) {
+        Theme.accent-preset = idx;
+    }
+
+    init => { root.apply-theme(root.theme-index); root.apply-accent(root.accent-preset); }
+
+    callback retry-now();
+    callback page-changed(int);
+    callback open-assign(int, int);
+    callback apply-assign(int);
+    callback add-category(int, string);
+    callback rename-category(int, int, string);
+    callback delete-category(int, int);
+    callback delete-line(int, int, int);
+    callback open-wizard(int, int);
+    callback edit-line(int, int, int);
+    callback wizard-finish(WizardResult);
+    callback theme-changed(int);
+    callback save-settings();
+    callback save-preset();
+    callback load-preset(string);
+    callback delete-preset(string);
+    callback set-active-preset(string);
+    callback refresh-live-lists();
+    callback wizard-state-changed();
+    callback exit-app();
+    callback rename-preset(string, string);
+    callback export-preset(string);
+    callback import-preset();
+    callback create-preset(string);
+
+    HorizontalBox {
+        padding: 0; spacing: 0;
+
+        // ── Sidebar ──
+        Rectangle {
+            width: root.sidebar-collapsed ? 64px : 220px;
+            background: Palette.alternate-background.darker(0.04);
+            animate width { duration: 200ms; easing: ease-in-out; }
+
+            VerticalBox {
+                padding: root.sidebar-collapsed ? 8px : 16px;
+                spacing: 4px;
+
+                // Header: expanded shows logo+name+badge+collapse toggle.
+                // Collapsed shows only the logo, swaps to expand icon on hover.
+                if !root.sidebar-collapsed: HorizontalLayout {
+                    spacing: 8px; alignment: space-between;
+                    HorizontalLayout {
+                        spacing: 8px; alignment: start;
+                        Image { source: @image-url("../assets/logo-48.png");
+                            width: 30px; height: 30px; }
+                        Text { text: "Slidr"; font-size: 20px; font-weight: 700;
+                            font-family: "Inter"; vertical-alignment: center; }
+                        if root.badge-text == "Supporter": Image {
+                            source: @image-url("../assets/Supporter.png");
+                            height: 18px; width: 56px; image-fit: contain;
+                            y: parent.height / 2 - self.height / 2;
+                        }
+                        if root.badge-text == "Premium": Image {
+                            source: @image-url("../assets/Premium.png");
+                            height: 18px; width: 56px; image-fit: contain;
+                            y: parent.height / 2 - self.height / 2;
+                        }
+                    }
+                    SquareIconButton {
+                        icon: @image-url("../assets/icons/chevron-left.svg");
+                        clicked => { root.sidebar-collapsed = true; }
+                    }
+                }
+                if root.sidebar-collapsed: collapsed-header := TouchArea {
+                    height: 40px; mouse-cursor: pointer;
+                    clicked => { root.sidebar-collapsed = false; }
+                    if !collapsed-header.has-hover: Image {
+                        source: @image-url("../assets/logo-48.png");
+                        width: 30px; height: 30px;
+                        x: parent.width / 2 - self.width / 2;
+                        y: parent.height / 2 - self.height / 2;
+                    }
+                    if collapsed-header.has-hover: Icon {
+                        source: @image-url("../assets/icons/chevron-right.svg");
+                        size: 22px; tint: Theme.accent-bg;
+                    }
+                }
+                Rectangle { height: 8px; }
+                NavItem { label: "Home"; compact: root.sidebar-collapsed;
+                    icon: @image-url("../assets/icons/home.svg");
+                    active: root.current-page == 0;
+                    clicked => { root.current-page = 0; root.page-changed(0); } }
+                NavItem { label: "Sliders"; compact: root.sidebar-collapsed;
+                    icon: @image-url("../assets/icons/adjustments-horizontal.svg");
+                    active: root.current-page == 1;
+                    clicked => { root.current-page = 1; root.edit-mode = false; root.page-changed(1); } }
+                NavItem { label: "Buttons"; compact: root.sidebar-collapsed;
+                    icon: @image-url("../assets/icons/grid-dots.svg");
+                    active: root.current-page == 2;
+                    clicked => { root.current-page = 2; root.edit-mode = false; root.page-changed(2); } }
+                NavItem { label: "Settings"; compact: root.sidebar-collapsed;
+                    icon: @image-url("../assets/icons/settings.svg");
+                    active: root.current-page == 3;
+                    clicked => { root.current-page = 3; root.edit-mode = false; root.page-changed(3); } }
+
+                Rectangle { vertical-stretch: 1; }
+
+                // Status pill — same vertical padding in both modes
+                Rectangle {
+                    height: 36px;
+                    if !root.sidebar-collapsed: HorizontalLayout {
+                        padding-left: 4px; spacing: 8px; alignment: start;
+                        Rectangle { width: 10px; height: 10px; border-radius: 5px;
+                            y: parent.height / 2 - 5px;
+                            background: root.connected ? #4CAF50 : #F44336; }
+                        Text { text: root.connected ? "Connected" : "Searching…";
+                            font-family: "Inter";
+                            color: Palette.foreground.with-alpha(0.8); font-size: 12px;
+                            vertical-alignment: center; }
+                    }
+                    if root.sidebar-collapsed: Rectangle {
+                        width: 12px; height: 12px; border-radius: 6px;
+                        x: parent.width / 2 - 6px;
+                        y: parent.height / 2 - 6px;
+                        background: root.connected ? #4CAF50 : #F44336;
+                    }
+                }
+
+                // exit button
+                exit-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.exit-app(); }
+                    height: 32px;
+                    Rectangle {
+                        background: exit-ta.has-hover
+                            ? #d32f2f.with-alpha(0.15) : transparent;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: exit-ta.has-hover ? #d32f2f.with-alpha(0.4) : Palette.border;
+                    }
+                    HorizontalLayout {
+                        padding-left: root.sidebar-collapsed ? 0px : 10px;
+                        padding-right: root.sidebar-collapsed ? 0px : 10px;
+                        spacing: 6px; alignment: center;
+                        Icon { source: @image-url("../assets/icons/x.svg"); size: 14px;
+                            tint: exit-ta.has-hover ? #d32f2f : Palette.foreground.with-alpha(0.7); }
+                        if !root.sidebar-collapsed: Text { text: "Exit"; font-size: 12px;
+                            font-family: "Inter"; font-weight: 500; vertical-alignment: center;
+                            color: exit-ta.has-hover ? #d32f2f : Palette.foreground.with-alpha(0.8); }
+                    }
+                }
+
+                // preset selector — hidden when collapsed
+                if !root.sidebar-collapsed: preset-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.preset-popup-open = true; }
+                    height: 38px;
+                    Rectangle {
+                        background: preset-ta.has-hover
+                            ? Palette.alternate-background.darker(0.06)
+                            : Palette.alternate-background;
+                        border-radius: 8px;
+                        border-width: 1px; border-color: Palette.border;
+                    }
+                    HorizontalLayout {
+                        // 38px tall row, 14px icon → ~12px vertical inset; match
+                        // it on the right so the chevron hugs the edge evenly.
+                        padding-left: 10px; padding-right: 12px; spacing: 6px;
+                        alignment: stretch;
+                        VerticalLayout {
+                            horizontal-stretch: 1; spacing: 0px;
+                            Text { text: "Profile"; font-size: 9px; font-family: "Inter";
+                                color: Palette.foreground.with-alpha(0.55);
+                                vertical-alignment: bottom; }
+                            Text { text: root.active-preset-name != ""
+                                ? root.active-preset-name : "Default";
+                                font-size: 12px; font-weight: 600; font-family: "Inter";
+                                vertical-alignment: top; }
+                        }
+                        VerticalLayout { alignment: center;
+                            Icon { source: @image-url("../assets/icons/chevron-right.svg");
+                                size: 14px; tint: Palette.foreground.with-alpha(0.6); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Content ──
+        Rectangle {
+            background: Palette.background;
+            VerticalBox {
+                padding: 24px;
+                if root.current-page == 0: HomePage {
+                    sliders: root.sliders;
+                    top-buttons: root.top-buttons;
+                    right-buttons: root.right-buttons;
+                    connected: root.connected;
+                    connection-msg: root.connection-msg;
+                    retry-eta-secs: root.retry-eta-secs;
+                    edit-mode <=> root.edit-mode;
+                    retry-now => { root.retry-now(); }
+                    request-assign(k, i) => { root.open-assign(k, i); }
+                }
+                if root.current-page == 1: CategoriesPage {
+                    target-kind: 0; categories: root.slider-categories;
+                    add-category(n) => { root.add-category(0, n); }
+                    rename(id, n) => { root.rename-category(0, id, n); }
+                    delete(id) => { root.delete-category(0, id); }
+                    delete-line(id, idx) => { root.delete-line(0, id, idx); }
+                    add-line(id) => { root.open-wizard(0, id); }
+                    edit-line(id, idx) => { root.edit-line(0, id, idx); }
+                }
+                if root.current-page == 2: CategoriesPage {
+                    target-kind: 1; categories: root.button-categories;
+                    add-category(n) => { root.add-category(1, n); }
+                    rename(id, n) => { root.rename-category(1, id, n); }
+                    delete(id) => { root.delete-category(1, id); }
+                    delete-line(id, idx) => { root.delete-line(1, id, idx); }
+                    add-line(id) => { root.open-wizard(1, id); }
+                    edit-line(id, idx) => { root.edit-line(1, id, idx); }
+                }
+                if root.current-page == 3: SettingsPage {
+                    theme-index <=> root.theme-index;
+                    accent-preset <=> root.accent-preset;
+                    dead-zone <=> root.dead-zone;
+                    unmute-on-change <=> root.unmute-on-change;
+                    start-with-os <=> root.start-with-os;
+                    start-minimized <=> root.start-minimized;
+                    minimize-to-tray <=> root.minimize-to-tray;
+                    curve-preset-index <=> root.curve-preset-index;
+                    build-stamp: root.build-stamp;
+                    theme-changed(i) => { root.theme-changed(i); }
+                    dirty => { root.save-settings(); }
+                }
+            }
+        }
+    }
+
+    if root.assign-popup-open: AssignPopup {
+        target-kind: root.assign-target-kind;
+        options: root.assign-options;
+        cancel => { root.assign-popup-open = false; }
+        choose(id) => {
+            root.apply-assign(id);
+            root.assign-popup-open = false;
+        }
+    }
+
+    if root.wizard-open: WizardPopup {
+        target-kind: root.wizard-target-kind;
+        step <=> root.wizard-step;
+        kind <=> root.wizard-kind;
+        property <=> root.wizard-property;
+        display <=> root.wizard-display;
+        filter <=> root.wizard-filter;
+        picker-source: root.wizard-picker-source;
+        live-processes: root.live-processes;
+        live-mics: root.live-mics;
+        live-outputs: root.live-outputs;
+        state-changed => { root.wizard-state-changed(); }
+        browse => { root.browse-file(); }
+        cancel => { root.wizard-open = false; root.wizard-step = 0;
+                    root.wizard-property = ""; root.wizard-display = "";
+                    root.wizard-filter = ""; }
+        refresh => { root.refresh-live-lists(); root.wizard-state-changed(); }
+        finish => {
+            root.wizard-finish({
+                target-kind: root.wizard-target-kind,
+                category-id: root.wizard-category-id,
+                kind: root.wizard-kind,
+                property: root.wizard-property,
+                display: root.wizard-display,
+            });
+            root.wizard-open = false;
+            root.wizard-step = 0;
+            root.wizard-property = "";
+            root.wizard-display = "";
+            root.wizard-filter = "";
+        }
+    }
+
+    if root.preset-popup-open: PresetPopup {
+        active-name: root.active-preset-name;
+        presets: root.preset-names;
+        cancel => { root.preset-popup-open = false; }
+        load(name) => { root.load-preset(name); root.preset-popup-open = false; }
+        set-active(name) => { root.set-active-preset(name); }
+        rename(old-name, new-name) => { root.rename-preset(old-name, new-name); }
+        export(name) => { root.export-preset(name); }
+        import() => { root.import-preset(); }
+        delete(name) => { root.delete-preset(name); }
+        create(name) => { root.create-preset(name); }
+    }
+
+    if root.toast-text != "": Rectangle {
+        x: parent.width / 2 - self.width / 2; y: parent.height - 60px;
+        width: 300px; height: 40px;
+        background: Palette.foreground; border-radius: 20px;
+        Text {
+            text: root.toast-text; color: Palette.background;
+            font-family: "Inter"; font-weight: 500;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+    }
+}

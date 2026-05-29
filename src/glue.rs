@@ -315,6 +315,30 @@ pub fn wire(
         });
     }
     {
+        let shared = shared.clone();
+        let weak = ui.as_weak();
+        // Multi-select picker (Cycle output): toggle a device in/out of the
+        // newline-separated set held in the wizard property.
+        ui.on_wizard_toggle_pick(move |name| {
+            let Some(ui) = weak.upgrade() else { return };
+            let name = name.to_string();
+            let mut list: Vec<String> = ui
+                .get_wizard_property()
+                .to_string()
+                .lines()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            if let Some(pos) = list.iter().position(|n| n == &name) {
+                list.remove(pos);
+            } else {
+                list.push(name);
+            }
+            ui.set_wizard_property(list.join("\n").into());
+            push_wizard_picker(&ui, shared.clone());
+        });
+    }
+    {
         let weak = ui.as_weak();
         let shared = shared.clone();
         ui.on_wizard_finish(move |result| {
@@ -344,6 +368,17 @@ pub fn wire(
                         .or_else(|| name.parse::<u32>().ok())
                         .unwrap_or(0);
                     (Some(vk.to_string()), Some(name))
+                } else if kind == ActionKind::CycleOutput {
+                    // Property is the newline-separated device list (empty = all).
+                    let list = result.property.to_string();
+                    let names: Vec<&str> = list.lines().filter(|s| !s.is_empty()).collect();
+                    let disp = if names.is_empty() {
+                        "All output devices".to_string()
+                    } else {
+                        names.join("  ⇄  ")
+                    };
+                    let prop = if names.is_empty() { None } else { Some(list.clone()) };
+                    (prop, Some(disp))
                 } else {
                     let prop = if result.property.is_empty() { None } else { Some(result.property.to_string()) };
                     let disp = if result.display.is_empty() { None } else { Some(result.display.to_string()) };
@@ -724,7 +759,7 @@ fn action_icon_kind(k: ActionKind) -> i32 {
     use ActionKind::*;
     match k {
         MuteProcess => 0, MuteMic => 1, MuteMainAudio => 5,
-        OpenProcess => 0, OpenWebsite => 3, KeyPress => 4,
+        OpenProcess => 0, OpenWebsite => 3, KeyPress => 4, CycleOutput => 2,
     }
 }
 
@@ -802,7 +837,7 @@ fn action_kind_index(k: ActionKind) -> i32 {
     use ActionKind::*;
     match k {
         MuteProcess => 0, MuteMainAudio => 1, MuteMic => 2,
-        OpenProcess => 3, OpenWebsite => 4, KeyPress => 5,
+        OpenProcess => 3, OpenWebsite => 4, KeyPress => 5, CycleOutput => 6,
     }
 }
 
@@ -810,7 +845,7 @@ fn button_kind_from_index(i: i32) -> ActionKind {
     use ActionKind::*;
     match i {
         0 => MuteProcess, 1 => MuteMainAudio, 2 => MuteMic,
-        3 => OpenProcess, 4 => OpenWebsite, _ => KeyPress,
+        3 => OpenProcess, 4 => OpenWebsite, 6 => CycleOutput, _ => KeyPress,
     }
 }
 
@@ -841,9 +876,20 @@ fn push_wizard_picker(ui: &AppWindow, shared: Arc<Mutex<Shared>>) {
         (1, 2) => s.audio.list_mics(),
         // Simulate key — full library
         (1, 5) => crate::keys_library::KEYS.iter().map(|k| k.name.to_string()).collect(),
+        // Cycle output device — multi-select list of outputs
+        (1, 6) => s.audio.list_outputs(),
         _ => Vec::new(),
     };
     drop(s);
+
+    // Multi-select kinds (currently Cycle output) keep their chosen set in the
+    // wizard property as a newline-separated list; flag matching rows as selected.
+    let multi_select = target_kind == 1 && kind == 6;
+    let chosen: Vec<String> = if multi_select {
+        ui.get_wizard_property().to_string().lines().map(str::to_string).collect()
+    } else {
+        Vec::new()
+    };
 
     let filter_norm = filter.trim();
     let mut filtered: Vec<String> = if filter_norm.is_empty() {
@@ -862,11 +908,16 @@ fn push_wizard_picker(ui: &AppWindow, shared: Arc<Mutex<Shared>>) {
         (1, 2) => 1,                        // button mic
         (1, 1) => 2,                        // button output (main audio)
         (1, 5) => 4,                        // key
+        (1, 6) => 2,                        // cycle output
         _ => 0,                             // process
     };
     ui.set_wizard_picker_source(ModelRc::new(VecModel::from(
         filtered.into_iter()
-            .map(|n| crate::PickerEntry { name: n.into(), icon_kind })
+            .map(|n| crate::PickerEntry {
+                selected: chosen.iter().any(|c| c == &n),
+                name: n.into(),
+                icon_kind,
+            })
             .collect::<Vec<_>>(),
     )));
 }

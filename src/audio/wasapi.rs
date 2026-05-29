@@ -9,17 +9,19 @@
 
 use std::sync::Mutex;
 
-use windows::core::Interface;
+use windows::core::{interface, Interface, GUID, HRESULT, IUnknown, IUnknown_Vtbl, PCWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::BOOL;
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
-    eCapture, eMultimedia, eRender, IAudioSessionControl, IAudioSessionControl2,
-    IAudioSessionEnumerator, IAudioSessionManager2, IMMDevice, IMMDeviceCollection,
-    IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    eCapture, eCommunications, eConsole, eMultimedia, eRender, ERole, IAudioSessionControl,
+    IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2, IMMDevice,
+    IMMDeviceCollection, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
+    DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
+    COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
@@ -79,40 +81,17 @@ impl WasapiBackend {
 
     fn find_device(&self, flow: u32, name: &str) -> windows::core::Result<IMMDevice> {
         let data_flow = if flow == 0 { eRender } else { eCapture };
-        let needle = name.to_lowercase();
         unsafe {
             let coll: IMMDeviceCollection = self
                 .enumerator
                 .EnumAudioEndpoints(data_flow, DEVICE_STATE_ACTIVE)?;
             let count = coll.GetCount()?;
-            // First pass: exact friendly-name match. Handles unique names, the
-            // 1st of a duplicated name (stored bare), and any real device whose
-            // name happens to end in " (N)".
-            for i in 0..count {
-                let dev = coll.Item(i)?;
-                if let Ok(friendly) = device_friendly_name(&dev) {
-                    if friendly.to_lowercase() == needle {
-                        return Ok(dev);
-                    }
-                }
+            // Exact / disambiguated-duplicate match.
+            if let Some(dev) = resolve_in(&coll, count, name) {
+                return Ok(dev);
             }
-            // Disambiguated duplicate: "<base> (N)" → Nth endpoint named <base>.
-            if let Some((base, n)) = parse_dup_suffix(name) {
-                let base = base.to_lowercase();
-                let mut seen = 0u32;
-                for i in 0..count {
-                    let dev = coll.Item(i)?;
-                    if let Ok(friendly) = device_friendly_name(&dev) {
-                        if friendly.to_lowercase() == base {
-                            seen += 1;
-                            if seen == n {
-                                return Ok(dev);
-                            }
-                        }
-                    }
-                }
-            }
-            // Second pass: substring match.
+            // Fallback: substring match.
+            let needle = name.to_lowercase();
             for i in 0..count {
                 let dev = coll.Item(i)?;
                 if let Ok(friendly) = device_friendly_name(&dev) {
@@ -293,6 +272,48 @@ impl AudioBackend for WasapiBackend {
     fn list_mics(&self) -> Vec<String> {
         list_devices(&self.enumerator, 1)
     }
+
+    fn cycle_output(&self, devices: &[String]) {
+        let _g = self.lock.lock().unwrap();
+        unsafe {
+            let Ok(coll) = self.enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else {
+                return;
+            };
+            let Ok(count) = coll.GetCount() else { return };
+
+            // Build the cycle order. An empty list means "all active outputs";
+            // otherwise resolve each configured name (skipping any now missing).
+            let candidates: Vec<IMMDevice> = if devices.is_empty() {
+                (0..count).filter_map(|i| coll.Item(i).ok()).collect()
+            } else {
+                devices.iter().filter_map(|n| resolve_in(&coll, count, n)).collect()
+            };
+            if candidates.is_empty() {
+                return;
+            }
+
+            // Locate the current default within the list by stable device id, then
+            // step to the next (wrapping). If the current default isn't in the
+            // list, start at the first entry.
+            let cur_id = self.default_device(0).ok().and_then(|d| device_id(&d));
+            let cur_idx = cur_id
+                .as_ref()
+                .and_then(|cur| candidates.iter().position(|d| device_id(d).as_deref() == Some(cur)));
+            let next = cur_idx.map_or(0, |i| (i + 1) % candidates.len());
+
+            let policy: IPolicyConfig = match CoCreateInstance(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    log::warn!("cycle_output: PolicyConfig unavailable: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = set_default_endpoint(&policy, &candidates[next]) {
+                log::warn!("cycle_output: SetDefaultEndpoint failed: {e}");
+            }
+        }
+    }
 }
 
 fn list_devices(enumerator: &IMMDeviceEnumerator, flow: u32) -> Vec<String> {
@@ -351,6 +372,86 @@ fn device_friendly_name(dev: &IMMDevice) -> windows::core::Result<String> {
         let var = store.GetValue(&PKEY_Device_FriendlyName)?;
         Ok(format!("{var}"))
     }
+}
+
+/// Match `name` against the endpoints in `coll`: exact friendly name first, then
+/// the disambiguated "<base> (N)" form. Returns the matching device, or `None`.
+/// Caller must hold the COM apartment (this only reads).
+unsafe fn resolve_in(coll: &IMMDeviceCollection, count: u32, name: &str) -> Option<IMMDevice> {
+    let needle = name.to_lowercase();
+    for i in 0..count {
+        if let Ok(dev) = coll.Item(i) {
+            if let Ok(friendly) = device_friendly_name(&dev) {
+                if friendly.to_lowercase() == needle {
+                    return Some(dev);
+                }
+            }
+        }
+    }
+    // Disambiguated duplicate: "<base> (N)" → Nth endpoint named <base>.
+    if let Some((base, n)) = parse_dup_suffix(name) {
+        let base = base.to_lowercase();
+        let mut seen = 0u32;
+        for i in 0..count {
+            if let Ok(dev) = coll.Item(i) {
+                if let Ok(friendly) = device_friendly_name(&dev) {
+                    if friendly.to_lowercase() == base {
+                        seen += 1;
+                        if seen == n {
+                            return Some(dev);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Stable, unique endpoint id (e.g. `{0.0.0.00000000}.{guid}`). Used to compare
+/// devices when friendly names collide.
+fn device_id(dev: &IMMDevice) -> Option<String> {
+    unsafe {
+        let id = dev.GetId().ok()?;
+        let s = id.to_string().ok();
+        CoTaskMemFree(Some(id.0 as _));
+        s
+    }
+}
+
+/// Make `dev` the default output for every role (regular + communications).
+fn set_default_endpoint(policy: &IPolicyConfig, dev: &IMMDevice) -> windows::core::Result<()> {
+    unsafe {
+        let id = dev.GetId()?;
+        for role in [eConsole, eMultimedia, eCommunications] {
+            let _ = policy.SetDefaultEndpoint(PCWSTR(id.0 as *const u16), role);
+        }
+        CoTaskMemFree(Some(id.0 as _));
+    }
+    Ok(())
+}
+
+// `IPolicyConfig` is the undocumented COM interface the Sound control panel uses
+// to change the default audio device — there is no public API for this. The
+// CLSID and vtable layout have been stable from Vista through Win11. We only ever
+// invoke SetDefaultEndpoint; the methods before it are opaque placeholders that
+// exist solely to position it correctly within the vtable.
+const CLSID_POLICY_CONFIG: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+
+#[interface("f8679f50-850a-41cf-9c72-430f290290c8")]
+unsafe trait IPolicyConfig: IUnknown {
+    fn GetMixFormat(&self) -> HRESULT;
+    fn GetDeviceFormat(&self) -> HRESULT;
+    fn ResetDeviceFormat(&self) -> HRESULT;
+    fn SetDeviceFormat(&self) -> HRESULT;
+    fn GetProcessingPeriod(&self) -> HRESULT;
+    fn SetProcessingPeriod(&self) -> HRESULT;
+    fn GetShareMode(&self) -> HRESULT;
+    fn SetShareMode(&self) -> HRESULT;
+    fn GetPropertyValue(&self) -> HRESULT;
+    fn SetPropertyValue(&self) -> HRESULT;
+    fn SetDefaultEndpoint(&self, device_id: PCWSTR, role: ERole) -> HRESULT;
+    fn SetEndpointVisibility(&self) -> HRESULT;
 }
 
 fn process_name(pid: u32) -> Option<String> {

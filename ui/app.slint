@@ -26,7 +26,7 @@ export struct ButtonCell { pressed: bool, category: string, assigned: bool }
 export struct LineItem { id: int, primary: string, secondary: string, icon-kind: int }
 export struct CategorySummary { id: int, name: string, count: int, lines: [LineItem] }
 export struct AssignPick { id: int, name: string }
-export struct PickerEntry { name: string, icon-kind: int }
+export struct PickerEntry { name: string, icon-kind: int, selected: bool }
 export struct WizardResult {
     target-kind: int, category-id: int, kind: int,
     property: string, display: string,
@@ -1238,19 +1238,23 @@ component WizardPopup inherits Rectangle {
     callback refresh();
     callback state-changed();
     callback browse();
+    callback toggle-pick(string);
 
     background: #00000099;
     TouchArea { clicked => { root.cancel(); } }
 
     property <[string]> button-kinds: ["Mute process", "Mute main audio", "Mute microphone",
-                                       "Open application", "Open website", "Simulate key"];
+                                       "Open application", "Open website", "Simulate key",
+                                       "Cycle output device"];
     property <[string]> slider-kinds: ["Process volume", "Microphone", "Output device"];
     property <[string]> kinds: root.target-kind == 1 ? root.button-kinds : root.slider-kinds;
     property <string> kind-label: root.kinds[root.kind];
     property <bool> needs-property: !(root.target-kind == 1 && root.kind == 1);
     in property <[PickerEntry]> picker-source;
-    // Key library uses the picker list too (kind 5).
+    // Key library uses the picker list too (kind 5); cycle-output (kind 6) is a
+    // multi-select list, so its rows toggle membership instead of single-picking.
     property <bool> picker-is-list: !(root.target-kind == 1 && (root.kind == 3 || root.kind == 4));
+    property <bool> multi-select: root.target-kind == 1 && root.kind == 6;
 
     Rectangle {
         x: parent.width / 2 - self.width / 2;
@@ -1325,6 +1329,12 @@ component WizardPopup inherits Rectangle {
                     font-family: "Inter"; color: Palette.foreground.with-alpha(0.7);
                 }
 
+                if root.multi-select: Text {
+                    text: "Pick the devices to cycle through, in order. Leave empty to cycle all.";
+                    font-family: "Inter"; font-size: 12px;
+                    color: Palette.foreground.with-alpha(0.7); wrap: word-wrap;
+                }
+
                 if root.picker-is-list && root.needs-property: LineEdit {
                     placeholder-text: "Search…";
                     text <=> root.filter;
@@ -1340,18 +1350,28 @@ component WizardPopup inherits Rectangle {
                             text: "Nothing detected yet — start your audio (or refresh).";
                             font-family: "Inter"; font-italic: true;
                             color: Palette.foreground.with-alpha(0.5); }
-                        for e in root.picker-source: Rectangle {
+                        for e in root.picker-source: row := Rectangle {
+                            // Single-select kinds highlight the chosen name; multi-select
+                            // (cycle output) tracks each row's `selected` flag instead.
+                            property <bool> row-selected:
+                                root.multi-select ? e.selected : e.name == root.property;
                             border-radius: 8px;
-                            background: e.name == root.property
+                            background: row.row-selected
                                 ? Theme.accent-bg.with-alpha(0.22)
                                 : Palette.alternate-background;
                             border-width: 1px;
-                            border-color: e.name == root.property
+                            border-color: row.row-selected
                                 ? Theme.accent-bg : Palette.border;
                             height: 40px;
                             TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => { root.property = e.name; root.display = e.name; }
+                                clicked => {
+                                    if (root.multi-select) {
+                                        root.toggle-pick(e.name);
+                                    } else {
+                                        root.property = e.name; root.display = e.name;
+                                    }
+                                }
                                 HorizontalLayout { padding-left: 12px; padding-right: 12px;
                                     spacing: 10px;
                                     VerticalLayout { alignment: center;
@@ -1359,7 +1379,7 @@ component WizardPopup inherits Rectangle {
                                     Text { text: e.name; vertical-alignment: center;
                                         font-family: "Inter"; horizontal-stretch: 1; }
                                     VerticalLayout { alignment: center;
-                                        if e.name == root.property: Icon {
+                                        if row.row-selected: Icon {
                                             source: @image-url("../assets/icons/check.svg");
                                             tint: Theme.accent-bg; size: 16px;
                                         }
@@ -1423,7 +1443,10 @@ component WizardPopup inherits Rectangle {
                 if root.step < 2: IconButton {
                     icon: @image-url("../assets/icons/chevron-right.svg");
                     label: "Next"; primary: true;
-                    enabled: root.step == 0 || !root.needs-property || root.property != "";
+                    // Multi-select (cycle output) may proceed with an empty set
+                    // (= cycle all devices); other kinds need a chosen target.
+                    enabled: root.step == 0 || !root.needs-property || root.multi-select
+                             || root.property != "";
                     clicked => { root.step = root.step + 1; }
                 }
                 if root.step == 2: IconButton {
@@ -1544,6 +1567,7 @@ export component AppWindow inherits Window {
     callback set-active-preset(string);
     callback refresh-live-lists();
     callback wizard-state-changed();
+    callback wizard-toggle-pick(string);
     callback exit-app();
     callback rename-preset(string, string);
     callback export-preset(string);
@@ -1785,6 +1809,7 @@ export component AppWindow inherits Window {
         live-mics: root.live-mics;
         live-outputs: root.live-outputs;
         state-changed => { root.wizard-state-changed(); }
+        toggle-pick(name) => { root.wizard-toggle-pick(name); }
         browse => { root.browse-file(); }
         cancel => { root.wizard-open = false; root.wizard-step = 0;
                     root.wizard-property = ""; root.wizard-display = "";

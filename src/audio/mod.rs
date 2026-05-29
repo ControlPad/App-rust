@@ -43,6 +43,13 @@ pub trait AudioBackend: Send + Sync {
     fn list_outputs(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Advance the default output endpoint to the next device in `devices`
+    /// (wrapping). An empty list cycles through *all* active output endpoints.
+    /// No-op on backends that don't support switching the default device.
+    fn cycle_output(&self, devices: &[String]) {
+        let _ = devices;
+    }
 }
 
 pub fn default_backend() -> Box<dyn AudioBackend> {

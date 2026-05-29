@@ -41,6 +41,7 @@ pub enum ActionKind {
     OpenProcess,
     OpenWebsite,
     KeyPress,
+    CycleOutput,
 }
 
 impl ActionKind {
@@ -52,6 +53,7 @@ impl ActionKind {
             Self::OpenProcess => "Open application",
             Self::OpenWebsite => "Open website",
             Self::KeyPress => "Simulate key",
+            Self::CycleOutput => "Cycle output device",
         }
     }
 }
@@ -65,6 +67,7 @@ pub struct ButtonAction {
     /// * `MuteMic` → mic friendly name
     /// * `OpenWebsite` → URL
     /// * `KeyPress` → virtual key code (decimal u32)
+    /// * `CycleOutput` → newline-separated output device names (empty = all)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub property: Option<String>,
     /// Optional pretty display string.

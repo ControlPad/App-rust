@@ -103,6 +103,7 @@ fn apply(audio: &dyn AudioBackend, keys: Option<&mut KeyController>, cmd: Cmd) {
                 k.hold_stop(vk);
             }
         }
+        Cmd::CycleOutput(devices) => audio.cycle_output(&devices),
     }
 }
 

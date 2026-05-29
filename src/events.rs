@@ -26,6 +26,9 @@ pub enum Cmd {
     Open(String),
     KeyDown(u32),
     KeyUp(u32),
+    /// Switch the default output to the next device in the list (wrapping).
+    /// Empty list = cycle through all active output endpoints.
+    CycleOutput(Vec<String>),
 }
 
 /// Snapshot pushed to the UI on every dispatch tick.
@@ -196,6 +199,17 @@ fn push_button_cmds(
                 out.push(Cmd::KeyDown(vk));
             } else if just_released {
                 out.push(Cmd::KeyUp(vk));
+            }
+        }
+        ActionKind::CycleOutput => {
+            if just_pressed {
+                // Property is a newline-separated device list; empty = all.
+                let devices = action
+                    .property
+                    .as_deref()
+                    .map(|p| p.lines().map(str::to_string).filter(|s| !s.is_empty()).collect())
+                    .unwrap_or_default();
+                out.push(Cmd::CycleOutput(devices));
             }
         }
     }

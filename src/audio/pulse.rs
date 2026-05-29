@@ -229,6 +229,37 @@ impl AudioBackend for PulseBackend {
         self.refresh();
         self.cache.lock().unwrap().sinks.iter().map(|e| e.description.clone()).collect()
     }
+
+    fn cycle_output(&self, devices: &[String]) {
+        self.refresh();
+        let sinks = self.cache.lock().unwrap().sinks.clone();
+        // Cycle order as pactl sink names. Empty list = every sink; otherwise map
+        // each configured description (or name) to its sink, skipping any missing.
+        let order: Vec<String> = if devices.is_empty() {
+            sinks.iter().map(|s| s.name.clone()).collect()
+        } else {
+            devices
+                .iter()
+                .filter_map(|d| {
+                    let dl = d.to_lowercase();
+                    sinks
+                        .iter()
+                        .find(|s| {
+                            s.description.to_lowercase().contains(&dl)
+                                || s.name.to_lowercase().contains(&dl)
+                        })
+                        .map(|s| s.name.clone())
+                })
+                .collect()
+        };
+        if order.is_empty() {
+            return;
+        }
+        let cur = capture("get-default-sink", &[]).map(|s| s.trim().to_string());
+        let cur_idx = cur.as_ref().and_then(|c| order.iter().position(|n| n == c));
+        let next = cur_idx.map_or(0, |i| (i + 1) % order.len());
+        run("set-default-sink", &[&order[next]]);
+    }
 }
 
 fn run(subcmd: &str, args: &[&str]) {

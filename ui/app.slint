@@ -40,8 +40,12 @@ component Icon {
     in property <image> source;
     in property <length> size: 18px;
     in property <color> tint: Palette.foreground;
-    min-width: root.size; preferred-width: root.size;
-    min-height: root.size; preferred-height: root.size;
+    // Fixed-size box. Without a max, a layout gives the Icon an implicit stretch
+    // factor of 1 (min != max), so it eats free space and the centered bitmap
+    // drifts toward the middle instead of hugging the row edge.
+    min-width: root.size; preferred-width: root.size; max-width: root.size;
+    min-height: root.size; preferred-height: root.size; max-height: root.size;
+    horizontal-stretch: 0; vertical-stretch: 0;
     // Center the actual bitmap inside whatever cell the layout gives us so it
     // vertically aligns with sibling Text widgets (which auto-center their baseline).
     Image {

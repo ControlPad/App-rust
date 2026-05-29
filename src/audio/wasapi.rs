@@ -85,12 +85,30 @@ impl WasapiBackend {
                 .enumerator
                 .EnumAudioEndpoints(data_flow, DEVICE_STATE_ACTIVE)?;
             let count = coll.GetCount()?;
-            // First pass: exact friendly-name match.
+            // First pass: exact friendly-name match. Handles unique names, the
+            // 1st of a duplicated name (stored bare), and any real device whose
+            // name happens to end in " (N)".
             for i in 0..count {
                 let dev = coll.Item(i)?;
                 if let Ok(friendly) = device_friendly_name(&dev) {
                     if friendly.to_lowercase() == needle {
                         return Ok(dev);
+                    }
+                }
+            }
+            // Disambiguated duplicate: "<base> (N)" → Nth endpoint named <base>.
+            if let Some((base, n)) = parse_dup_suffix(name) {
+                let base = base.to_lowercase();
+                let mut seen = 0u32;
+                for i in 0..count {
+                    let dev = coll.Item(i)?;
+                    if let Ok(friendly) = device_friendly_name(&dev) {
+                        if friendly.to_lowercase() == base {
+                            seen += 1;
+                            if seen == n {
+                                return Ok(dev);
+                            }
+                        }
                     }
                 }
             }
@@ -293,7 +311,38 @@ fn list_devices(enumerator: &IMMDeviceEnumerator, flow: u32) -> Vec<String> {
             }
         }
     }
+    // Two endpoints can report the identical friendly name (e.g. two monitors on
+    // one GPU's "NVIDIA High Definition Audio"). Disambiguate by appending
+    // " (2)", " (3)", … to the 2nd+ occurrence so each is shown and selectable.
+    // The 1st stays bare for backward compatibility with already-saved configs.
+    // `find_device` parses the suffix back to the Nth same-named endpoint.
+    disambiguate(&mut out);
     out
+}
+
+/// Append " (N)" to repeated names (N = 2 for the 2nd occurrence, etc.).
+fn disambiguate(names: &mut [String]) {
+    use std::collections::HashMap;
+    let mut seen: HashMap<String, u32> = HashMap::new();
+    for n in names.iter_mut() {
+        let count = seen.entry(n.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            *n = format!("{n} ({count})");
+        }
+    }
+}
+
+/// Split a disambiguated name "<base> (N)" (N >= 2) into (base, N).
+fn parse_dup_suffix(name: &str) -> Option<(&str, u32)> {
+    let stripped = name.strip_suffix(')')?;
+    let open = stripped.rfind(" (")?;
+    let n: u32 = stripped[open + 2..].parse().ok()?;
+    if n >= 2 {
+        Some((&stripped[..open], n))
+    } else {
+        None
+    }
 }
 
 fn device_friendly_name(dev: &IMMDevice) -> windows::core::Result<String> {

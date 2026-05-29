@@ -370,15 +370,11 @@ pub fn wire(
                     (Some(vk.to_string()), Some(name))
                 } else if kind == ActionKind::CycleOutput {
                     // Property is the newline-separated device list (empty = all).
+                    // The human-readable label is derived at render time
+                    // (`action_secondary`), so no display is stored here.
                     let list = result.property.to_string();
-                    let names: Vec<&str> = list.lines().filter(|s| !s.is_empty()).collect();
-                    let disp = if names.is_empty() {
-                        "All output devices".to_string()
-                    } else {
-                        names.join("  ⇄  ")
-                    };
-                    let prop = if names.is_empty() { None } else { Some(list.clone()) };
-                    (prop, Some(disp))
+                    let has_any = list.lines().any(|s| !s.is_empty());
+                    (has_any.then_some(list), None)
                 } else {
                     let prop = if result.property.is_empty() { None } else { Some(result.property.to_string()) };
                     let disp = if result.display.is_empty() { None } else { Some(result.display.to_string()) };
@@ -735,7 +731,7 @@ fn push_preset_to_ui(ui: &AppWindow, preset: &Preset) {
                 c.actions.iter().enumerate().map(|(i, a)| LineItem {
                     id: i as i32,
                     primary: SharedString::from(a.kind.label()),
-                    secondary: a.display.clone().or(a.property.clone()).unwrap_or_default().into(),
+                    secondary: action_secondary(a).into(),
                     icon_kind: action_icon_kind(a.kind),
                 }).collect::<Vec<_>>(),
             )),
@@ -753,6 +749,22 @@ fn stream_icon_kind(s: &AudioStream) -> i32 {
     if s.process.is_some() { 0 }
     else if s.mic_name.is_some() { 1 }
     else { 2 }
+}
+
+/// Secondary line for a button action. Cycle-output derives its label from the
+/// device list (so it stays correct without a stored display); others fall back
+/// to the display, then the raw property.
+fn action_secondary(a: &crate::model::ButtonAction) -> String {
+    if a.kind == ActionKind::CycleOutput {
+        let names: Vec<&str> =
+            a.property.as_deref().unwrap_or("").lines().filter(|s| !s.is_empty()).collect();
+        return if names.is_empty() {
+            "All output devices".into()
+        } else {
+            names.join(" → ")
+        };
+    }
+    a.display.clone().or_else(|| a.property.clone()).unwrap_or_default()
 }
 
 fn action_icon_kind(k: ActionKind) -> i32 {

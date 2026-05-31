@@ -81,6 +81,9 @@ pub struct ButtonCategory {
     pub name: String,
     #[serde(default)]
     pub actions: Vec<ButtonAction>,
+    /// UI-only: whether the card is collapsed in the categories view.
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +92,9 @@ pub struct SliderCategory {
     pub name: String,
     #[serde(default)]
     pub streams: Vec<AudioStream>,
+    /// UI-only: whether the card is collapsed in the categories view.
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,8 +235,8 @@ mod tests {
     #[test]
     fn next_id_grows() {
         let v: Vec<SliderCategory> = vec![
-            SliderCategory { id: 1, name: "a".into(), streams: vec![] },
-            SliderCategory { id: 5, name: "b".into(), streams: vec![] },
+            SliderCategory { id: 1, name: "a".into(), streams: vec![], collapsed: false },
+            SliderCategory { id: 5, name: "b".into(), streams: vec![], collapsed: false },
         ];
         assert_eq!(next_id(&v, |c| c.id), 6);
     }

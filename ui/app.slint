@@ -24,7 +24,7 @@ export struct SliderCell { value: int, percent: float, category: string, assigne
 export struct ButtonCell { pressed: bool, category: string, assigned: bool }
 // icon-kind: 0 process · 1 mic · 2 output · 3 website · 4 key · 5 volume/mute
 export struct LineItem { id: int, primary: string, secondary: string, icon-kind: int }
-export struct CategorySummary { id: int, name: string, count: int, lines: [LineItem] }
+export struct CategorySummary { id: int, name: string, count: int, collapsed: bool, lines: [LineItem] }
 export struct AssignPick { id: int, name: string }
 export struct PickerEntry { name: string, icon-kind: int, selected: bool }
 export struct WizardResult {
@@ -736,6 +736,13 @@ component HomePage inherits VerticalBox {
     }
 }
 
+// Thin accent line shown as a drop position indicator between rows / cards.
+component DropMark inherits Rectangle {
+    in property <bool> active;
+    height: 3px; border-radius: 1.5px;
+    background: root.active ? Theme.accent-bg : transparent;
+}
+
 component CategoriesPage inherits VerticalBox {
     in property <int> target-kind;
     in property <[CategorySummary]> categories;
@@ -746,10 +753,29 @@ component CategoriesPage inherits VerticalBox {
     callback delete-line(int, int);
     callback add-line(int);
     callback edit-line(int, int);
+    callback toggle-collapse(int);            // cat id
+    callback reorder-category(int, int);      // from-id, to-insertion-index
+    callback move-line(int, int, int, int);   // from-cat, from-idx, to-cat, to-idx
 
     in-out property <string> draft-name: "";
     in-out property <int> renaming-id: -1;
     in-out property <string> rename-draft: "";
+
+    // ── drag state ──────────────────────────────────────────────────────────
+    // Global pointer position (window coords) while a drag is active.
+    property <length> ptr-x;
+    property <length> ptr-y;
+    property <length> row-h: 46px;
+    // Line (action/stream) drag.
+    property <bool> line-drag: false;
+    property <int> drag-from-cat: -1;
+    property <int> drag-from-idx: -1;
+    property <int> drop-cat: -1;
+    property <int> drop-idx: -1;
+    // Category card drag.
+    property <bool> cat-drag: false;
+    property <int> drag-cat-id: -1;
+    property <int> drop-cat-pos: -1;
 
     spacing: 10px;
 
@@ -789,76 +815,207 @@ component CategoriesPage inherits VerticalBox {
                         horizontal-alignment: center; }
                 }
             }
-            for cat in root.categories: Card {
-                VerticalLayout {
-                    padding: 12px; spacing: 6px;
-                    // Header row
-                    HorizontalLayout { spacing: 8px;
-                        if root.renaming-id != cat.id: Text { text: cat.name;
-                            font-weight: 700; font-size: 14px;
-                            font-family: "Inter"; vertical-alignment: center;
-                            horizontal-stretch: 1; }
-                        if root.renaming-id == cat.id: LineEdit {
-                            text <=> root.rename-draft; height: 32px;
-                            horizontal-stretch: 1;
-                            accepted => {
-                                if (root.rename-draft != "") { root.rename(cat.id, root.rename-draft); }
-                                root.renaming-id = -1;
-                            }
+            for cat[ci] in root.categories: VerticalLayout {
+                spacing: 8px;
+                // Drop indicator above this card (category reorder).
+                DropMark { active: root.cat-drag && root.drop-cat-pos == ci; }
+                card := Card {
+                    // Coarse hit-test: is the drag pointer over this card? The ternary
+                    // guard is load-bearing — `absolute-position` must only be read
+                    // during an active drag. Reading it at init (Slint's `&&` does NOT
+                    // short-circuit the operand away) recurses through text layout.
+                    property <bool> ptr-over:
+                        (root.line-drag || root.cat-drag)
+                        ? (root.ptr-x >= card.absolute-position.x
+                            && root.ptr-x < card.absolute-position.x + card.width
+                            && root.ptr-y >= card.absolute-position.y
+                            && root.ptr-y < card.absolute-position.y + card.height)
+                        : false;
+                    // Category-reorder target: which insertion slot this card maps to.
+                    property <int> cat-slot:
+                        (root.cat-drag && card.ptr-over)
+                            ? (root.ptr-y < card.absolute-position.y + card.height / 2 ? ci : ci + 1)
+                            : -999;
+                    changed cat-slot => {
+                        if (card.cat-slot != -999) { root.drop-cat-pos = card.cat-slot; }
+                    }
+                    // Line-drop fallback for collapsed / empty cards (no rows to claim).
+                    property <bool> line-over: root.line-drag && card.ptr-over;
+                    changed line-over => {
+                        if (card.line-over && (cat.collapsed || cat.lines.length == 0)) {
+                            root.drop-cat = cat.id; root.drop-idx = cat.lines.length;
                         }
-                        if root.renaming-id != cat.id: Text {
-                            text: cat.count + (cat.count == 1 ? " item" : " items");
-                            font-family: "Inter"; font-size: 11px;
-                            color: Palette.foreground.with-alpha(0.55);
-                            vertical-alignment: center; }
-                        SquareIconButton {
-                            icon: root.renaming-id == cat.id
-                                ? @image-url("../assets/icons/check.svg")
-                                : @image-url("../assets/icons/edit.svg");
-                            clicked => {
-                                if (root.renaming-id == cat.id) {
+                    }
+                    opacity: (root.cat-drag && root.drag-cat-id == cat.id) ? 0.4 : 1.0;
+
+                    VerticalLayout {
+                        padding: 12px; spacing: 6px;
+                        // Header row
+                        HorizontalLayout { spacing: 8px;
+                            // Drag handle — reorder category cards.
+                            catgrip := TouchArea {
+                                width: 22px; mouse-cursor: grab;
+                                pointer-event(ev) => {
+                                    if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
+                                        root.cat-drag = true; root.drag-cat-id = cat.id; root.drop-cat-pos = ci;
+                                        root.ptr-x = catgrip.absolute-position.x + catgrip.mouse-x;
+                                        root.ptr-y = catgrip.absolute-position.y + catgrip.mouse-y;
+                                    } else if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.up) {
+                                        if (root.cat-drag && root.drop-cat-pos != -1) {
+                                            root.reorder-category(root.drag-cat-id, root.drop-cat-pos);
+                                        }
+                                        root.cat-drag = false; root.drop-cat-pos = -1;
+                                    }
+                                }
+                                moved => {
+                                    root.ptr-x = catgrip.absolute-position.x + catgrip.mouse-x;
+                                    root.ptr-y = catgrip.absolute-position.y + catgrip.mouse-y;
+                                }
+                                Image { source: @image-url("../assets/icons/grid-dots.svg");
+                                    width: 16px; height: 16px;
+                                    colorize: Palette.foreground.with-alpha(0.45);
+                                    x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
+                            }
+                            SquareIconButton {
+                                icon: cat.collapsed
+                                    ? @image-url("../assets/icons/chevron-right.svg")
+                                    : @image-url("../assets/icons/chevron-down.svg");
+                                clicked => { root.toggle-collapse(cat.id); }
+                            }
+                            if root.renaming-id != cat.id: Text { text: cat.name;
+                                font-weight: 700; font-size: 14px;
+                                font-family: "Inter"; vertical-alignment: center;
+                                horizontal-stretch: 1; }
+                            if root.renaming-id == cat.id: LineEdit {
+                                text <=> root.rename-draft; height: 32px;
+                                horizontal-stretch: 1;
+                                accepted => {
                                     if (root.rename-draft != "") { root.rename(cat.id, root.rename-draft); }
                                     root.renaming-id = -1;
-                                } else {
-                                    root.renaming-id = cat.id; root.rename-draft = cat.name;
+                                }
+                            }
+                            if root.renaming-id != cat.id: Text {
+                                text: cat.count + (cat.count == 1 ? " item" : " items");
+                                font-family: "Inter"; font-size: 11px;
+                                color: Palette.foreground.with-alpha(0.55);
+                                vertical-alignment: center; }
+                            SquareIconButton {
+                                icon: root.renaming-id == cat.id
+                                    ? @image-url("../assets/icons/check.svg")
+                                    : @image-url("../assets/icons/edit.svg");
+                                clicked => {
+                                    if (root.renaming-id == cat.id) {
+                                        if (root.rename-draft != "") { root.rename(cat.id, root.rename-draft); }
+                                        root.renaming-id = -1;
+                                    } else {
+                                        root.renaming-id = cat.id; root.rename-draft = cat.name;
+                                    }
+                                }
+                            }
+                            SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
+                                tint: #d32f2f.with-alpha(0.8);
+                                clicked => { root.delete(cat.id); } }
+                        }
+
+                        if !cat.collapsed: VerticalLayout {
+                            spacing: 0px;
+                            if cat.lines.length > 0: Rectangle { height: 1px;
+                                background: Palette.border.with-alpha(0.5); }
+                            for line[idx] in cat.lines: VerticalLayout {
+                                spacing: 0px;
+                                // Drop indicator above this row.
+                                DropMark { active: root.line-drag && root.drop-cat == cat.id && root.drop-idx == idx; }
+                                therow := Rectangle {
+                                    height: root.row-h;
+                                    // Insertion slot this row maps to while a line drag is
+                                    // active. Ternary-guarded so `absolute-position` is only
+                                    // read mid-drag (see the card hit-test note above).
+                                    property <int> ptr-slot:
+                                        root.line-drag
+                                        ? ((root.ptr-x >= therow.absolute-position.x
+                                            && root.ptr-x < therow.absolute-position.x + therow.width
+                                            && root.ptr-y >= therow.absolute-position.y
+                                            && root.ptr-y < therow.absolute-position.y + therow.height)
+                                          ? (root.ptr-y < therow.absolute-position.y + therow.height / 2 ? idx : idx + 1)
+                                          : -999)
+                                        : -999;
+                                    changed ptr-slot => {
+                                        if (therow.ptr-slot != -999) {
+                                            root.drop-cat = cat.id; root.drop-idx = therow.ptr-slot;
+                                        }
+                                    }
+                                    opacity: (root.line-drag && root.drag-from-cat == cat.id
+                                              && root.drag-from-idx == idx) ? 0.4 : 1.0;
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        // Drag handle — reorder / move this line.
+                                        linegrip := TouchArea {
+                                            width: 22px; mouse-cursor: grab;
+                                            pointer-event(ev) => {
+                                                if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
+                                                    root.line-drag = true; root.drag-from-cat = cat.id;
+                                                    root.drag-from-idx = idx;
+                                                    root.drop-cat = cat.id; root.drop-idx = idx;
+                                                    root.ptr-x = linegrip.absolute-position.x + linegrip.mouse-x;
+                                                    root.ptr-y = linegrip.absolute-position.y + linegrip.mouse-y;
+                                                } else if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.up) {
+                                                    if (root.line-drag && root.drop-cat != -1) {
+                                                        root.move-line(root.drag-from-cat, root.drag-from-idx,
+                                                                       root.drop-cat, root.drop-idx);
+                                                    }
+                                                    root.line-drag = false; root.drop-cat = -1; root.drop-idx = -1;
+                                                }
+                                            }
+                                            moved => {
+                                                root.ptr-x = linegrip.absolute-position.x + linegrip.mouse-x;
+                                                root.ptr-y = linegrip.absolute-position.y + linegrip.mouse-y;
+                                            }
+                                            Image { source: @image-url("../assets/icons/grid-dots.svg");
+                                                width: 15px; height: 15px;
+                                                colorize: Palette.foreground.with-alpha(0.4);
+                                                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
+                                        }
+                                        Rectangle { width: 3px; background: Theme.accent-bg;
+                                            border-radius: 1.5px; }
+                                        VerticalLayout { alignment: center;
+                                            KindIcon { kind: line.icon-kind; size: 20px; } }
+                                        VerticalLayout {
+                                            horizontal-stretch: 1; spacing: 0px;
+                                            alignment: center;
+                                            Text { text: line.primary; font-weight: 500;
+                                                font-size: 12px; font-family: "Inter"; }
+                                            Text { text: line.secondary; font-size: 10px;
+                                                font-family: "Inter";
+                                                color: Palette.foreground.with-alpha(0.55); }
+                                        }
+                                        VerticalLayout { alignment: center;
+                                            SquareIconButton { icon: @image-url("../assets/icons/edit.svg");
+                                                clicked => { root.edit-line(cat.id, idx); } } }
+                                        VerticalLayout { alignment: center;
+                                            SquareIconButton { icon: @image-url("../assets/icons/x.svg");
+                                                tint: #d32f2f.with-alpha(0.8);
+                                                clicked => { root.delete-line(cat.id, idx); } } }
+                                    }
+                                }
+                            }
+                            // Trailing drop indicator (append position).
+                            DropMark { active: root.line-drag && root.drop-cat == cat.id
+                                               && root.drop-idx == cat.lines.length; }
+
+                            HorizontalLayout { padding-top: 2px;
+                                Rectangle { horizontal-stretch: 1; }
+                                IconButton {
+                                    icon: @image-url("../assets/icons/plus.svg");
+                                    label: root.target-kind == 0 ? "Add stream" : "Add action";
+                                    clicked => { root.add-line(cat.id); }
                                 }
                             }
                         }
-                        SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
-                            tint: #d32f2f.with-alpha(0.8);
-                            clicked => { root.delete(cat.id); } }
                     }
-                    if cat.lines.length > 0: Rectangle { height: 1px;
-                        background: Palette.border.with-alpha(0.5); }
-                    for line[idx] in cat.lines: HorizontalLayout {
-                        spacing: 8px; padding-top: 2px; padding-bottom: 2px;
-                        Rectangle { width: 3px; background: Theme.accent-bg;
-                            border-radius: 1.5px; }
-                        KindIcon { kind: line.icon-kind; size: 20px;
-                            y: parent.height / 2 - 10px; }
-                        VerticalLayout {
-                            horizontal-stretch: 1; spacing: 0px;
-                            alignment: center;
-                            Text { text: line.primary; font-weight: 500;
-                                font-size: 12px; font-family: "Inter"; }
-                            Text { text: line.secondary; font-size: 10px;
-                                font-family: "Inter";
-                                color: Palette.foreground.with-alpha(0.55); }
-                        }
-                        SquareIconButton { icon: @image-url("../assets/icons/edit.svg");
-                            clicked => { root.edit-line(cat.id, idx); } }
-                        SquareIconButton { icon: @image-url("../assets/icons/x.svg");
-                            tint: #d32f2f.with-alpha(0.8);
-                            clicked => { root.delete-line(cat.id, idx); } }
-                    }
-                    HorizontalLayout { padding-top: 2px;
-                        Rectangle { horizontal-stretch: 1; }
-                        IconButton {
-                            icon: @image-url("../assets/icons/plus.svg");
-                            label: root.target-kind == 0 ? "Add stream" : "Add action";
-                            clicked => { root.add-line(cat.id); }
-                        }
-                    }
+                }
+                // Trailing drop indicator after the last card (reorder to end).
+                if ci == root.categories.length - 1: DropMark {
+                    active: root.cat-drag && root.drop-cat-pos == root.categories.length;
                 }
             }
         }
@@ -1568,6 +1725,9 @@ export component AppWindow inherits Window {
     callback refresh-live-lists();
     callback wizard-state-changed();
     callback wizard-toggle-pick(string);
+    callback toggle-category-collapse(int, int);   // kind, cat-id
+    callback reorder-category(int, int, int);       // kind, from-id, to-index
+    callback move-line(int, int, int, int, int);    // kind, from-cat, from-idx, to-cat, to-idx
     callback exit-app();
     callback rename-preset(string, string);
     callback export-preset(string);
@@ -1753,6 +1913,9 @@ export component AppWindow inherits Window {
                     delete-line(id, idx) => { root.delete-line(0, id, idx); }
                     add-line(id) => { root.open-wizard(0, id); }
                     edit-line(id, idx) => { root.edit-line(0, id, idx); }
+                    toggle-collapse(id) => { root.toggle-category-collapse(0, id); }
+                    reorder-category(fid, to) => { root.reorder-category(0, fid, to); }
+                    move-line(fc, fi, tc, ti) => { root.move-line(0, fc, fi, tc, ti); }
                 }
                 if root.current-page == 2: CategoriesPage {
                     target-kind: 1; categories: root.button-categories;
@@ -1762,6 +1925,9 @@ export component AppWindow inherits Window {
                     delete-line(id, idx) => { root.delete-line(1, id, idx); }
                     add-line(id) => { root.open-wizard(1, id); }
                     edit-line(id, idx) => { root.edit-line(1, id, idx); }
+                    toggle-collapse(id) => { root.toggle-category-collapse(1, id); }
+                    reorder-category(fid, to) => { root.reorder-category(1, fid, to); }
+                    move-line(fc, fi, tc, ti) => { root.move-line(1, fc, fi, tc, ti); }
                 }
                 if root.current-page == 3: SettingsPage {
                     theme-index <=> root.theme-index;

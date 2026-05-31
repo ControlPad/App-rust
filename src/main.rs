@@ -145,11 +145,11 @@ fn main() -> anyhow::Result<()> {
 
         // seed two slider categories
         let scats = vec![
-            CategorySummary { id: 1, name: "Music".into(), count: 1,
+            CategorySummary { id: 1, name: "Music".into(), count: 1, collapsed: false,
                 lines: ModelRc::new(VecModel::from(vec![
                     LineItem { id: 0, primary: "spotify".into(), secondary: "process".into(), icon_kind: 0 },
                 ])) },
-            CategorySummary { id: 2, name: "Chat".into(), count: 2,
+            CategorySummary { id: 2, name: "Chat".into(), count: 2, collapsed: false,
                 lines: ModelRc::new(VecModel::from(vec![
                     LineItem { id: 0, primary: "discord".into(), secondary: "process".into(), icon_kind: 0 },
                     LineItem { id: 1, primary: "default mic".into(), secondary: "microphone".into(), icon_kind: 1 },
@@ -157,11 +157,11 @@ fn main() -> anyhow::Result<()> {
         ];
         ui.set_slider_categories(ModelRc::new(VecModel::from(scats)));
         let bcats = vec![
-            CategorySummary { id: 1, name: "Toggle mute".into(), count: 1,
+            CategorySummary { id: 1, name: "Toggle mute".into(), count: 1, collapsed: false,
                 lines: ModelRc::new(VecModel::from(vec![
                     LineItem { id: 0, primary: "Mute microphone".into(), secondary: "default mic".into(), icon_kind: 1 },
                 ])) },
-            CategorySummary { id: 2, name: "Media keys".into(), count: 2,
+            CategorySummary { id: 2, name: "Media keys".into(), count: 2, collapsed: false,
                 lines: ModelRc::new(VecModel::from(vec![
                     LineItem { id: 0, primary: "Simulate key".into(), secondary: "Play/Pause (179)".into(), icon_kind: 4 },
                     LineItem { id: 1, primary: "Open website".into(), secondary: "https://example.com".into(), icon_kind: 3 },

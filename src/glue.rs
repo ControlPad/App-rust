@@ -116,10 +116,10 @@ pub fn wire(
             let mut s = shared.lock();
             if kind == 0 {
                 let id = next_id(&s.preset.slider_categories, |c| c.id);
-                s.preset.slider_categories.push(SliderCategory { id, name: name.to_string(), streams: vec![] });
+                s.preset.slider_categories.push(SliderCategory { id, name: name.to_string(), streams: vec![], collapsed: false });
             } else {
                 let id = next_id(&s.preset.button_categories, |c| c.id);
-                s.preset.button_categories.push(ButtonCategory { id, name: name.to_string(), actions: vec![] });
+                s.preset.button_categories.push(ButtonCategory { id, name: name.to_string(), actions: vec![], collapsed: false });
             }
             let _ = crate::storage::save_preset(&s.preset);
             let Some(ui) = weak.upgrade() else { return };
@@ -205,6 +205,64 @@ pub fn wire(
                 }
             } else if let Some(c) = s.preset.button_categories.iter_mut().find(|c| c.id == cat_id) {
                 if idx < c.actions.len() { c.actions.remove(idx); }
+            }
+            let _ = crate::storage::save_preset(&s.preset);
+            let Some(ui) = weak.upgrade() else { return };
+            push_preset_to_ui(&ui, &s.preset);
+        });
+    }
+
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_toggle_category_collapse(move |kind, id| {
+            let mut s = shared.lock();
+            let id = id as u32;
+            if kind == 0 {
+                if let Some(c) = s.preset.slider_categories.iter_mut().find(|c| c.id == id) {
+                    c.collapsed = !c.collapsed;
+                }
+            } else if let Some(c) = s.preset.button_categories.iter_mut().find(|c| c.id == id) {
+                c.collapsed = !c.collapsed;
+            }
+            let _ = crate::storage::save_preset(&s.preset);
+            let Some(ui) = weak.upgrade() else { return };
+            push_preset_to_ui(&ui, &s.preset);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        // Reorder category cards (cosmetic, but persisted via Vec order).
+        ui.on_reorder_category(move |kind, from_id, to_index| {
+            let mut s = shared.lock();
+            let from_id = from_id as u32;
+            let to = to_index.max(0) as usize;
+            if kind == 0 {
+                reorder_by_id(&mut s.preset.slider_categories, from_id, to, |c| c.id);
+            } else {
+                reorder_by_id(&mut s.preset.button_categories, from_id, to, |c| c.id);
+            }
+            let _ = crate::storage::save_preset(&s.preset);
+            let Some(ui) = weak.upgrade() else { return };
+            push_preset_to_ui(&ui, &s.preset);
+            refresh_home(&ui, &s);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        // Move an action/stream within or between categories (same target-kind).
+        ui.on_move_line(move |kind, from_cat, from_idx, to_cat, to_idx| {
+            let mut s = shared.lock();
+            let (from_cat, to_cat) = (from_cat as u32, to_cat as u32);
+            let (from_idx, to_idx) = (from_idx.max(0) as usize, to_idx.max(0) as usize);
+            if kind == 0 {
+                move_line(&mut s.preset.slider_categories, from_cat, from_idx, to_cat, to_idx,
+                    |c| c.id, |c| &mut c.streams);
+            } else {
+                move_line(&mut s.preset.button_categories, from_cat, from_idx, to_cat, to_idx,
+                    |c| c.id, |c| &mut c.actions);
             }
             let _ = crate::storage::save_preset(&s.preset);
             let Some(ui) = weak.upgrade() else { return };
@@ -702,6 +760,43 @@ fn preset_curve(_preset: &Preset) -> (crate::curve::CurvePreset, crate::curve::B
     (crate::curve::CurvePreset::Linear, crate::curve::BezierPoints::LINEAR)
 }
 
+/// Move the category with `from_id` to insertion index `to_index` (0..=len).
+fn reorder_by_id<C>(cats: &mut Vec<C>, from_id: u32, to_index: usize, id: impl Fn(&C) -> u32) {
+    let Some(from) = cats.iter().position(|c| id(c) == from_id) else { return };
+    let item = cats.remove(from);
+    // `to_index` was computed against the original list; removing the item
+    // shifts everything after it down by one.
+    let to = if from < to_index { to_index - 1 } else { to_index };
+    cats.insert(to.min(cats.len()), item);
+}
+
+/// Move element `from_idx` of category `from_cat` to insertion index `to_idx` of
+/// category `to_cat` (may be the same category). `to_idx` is in the destination's
+/// original ordering.
+fn move_line<C, E>(
+    cats: &mut [C],
+    from_cat: u32,
+    from_idx: usize,
+    to_cat: u32,
+    to_idx: usize,
+    id: impl Fn(&C) -> u32,
+    lines: impl Fn(&mut C) -> &mut Vec<E>,
+) {
+    let Some(from_pos) = cats.iter().position(|c| id(c) == from_cat) else { return };
+    let Some(to_pos) = cats.iter().position(|c| id(c) == to_cat) else { return };
+    let item = {
+        let v = lines(&mut cats[from_pos]);
+        if from_idx >= v.len() {
+            return;
+        }
+        v.remove(from_idx)
+    };
+    // Within the same category, a removal before the target shifts it down.
+    let to = if from_cat == to_cat && from_idx < to_idx { to_idx - 1 } else { to_idx };
+    let v = lines(&mut cats[to_pos]);
+    v.insert(to.min(v.len()), item);
+}
+
 fn push_preset_to_ui(ui: &AppWindow, preset: &Preset) {
     let sliders: Vec<CategorySummary> = preset
         .slider_categories
@@ -710,6 +805,7 @@ fn push_preset_to_ui(ui: &AppWindow, preset: &Preset) {
             id: c.id as i32,
             name: c.name.clone().into(),
             count: c.streams.len() as i32,
+            collapsed: c.collapsed,
             lines: ModelRc::new(VecModel::from(
                 c.streams.iter().enumerate().map(|(i, s)| LineItem {
                     id: i as i32,
@@ -727,6 +823,7 @@ fn push_preset_to_ui(ui: &AppWindow, preset: &Preset) {
             id: c.id as i32,
             name: c.name.clone().into(),
             count: c.actions.len() as i32,
+            collapsed: c.collapsed,
             lines: ModelRc::new(VecModel::from(
                 c.actions.iter().enumerate().map(|(i, a)| LineItem {
                     id: i as i32,

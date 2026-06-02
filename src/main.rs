@@ -2,7 +2,12 @@
 //!
 //! Slint (Material style) UI, Rust event/audio/serial backend.
 
-#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+// GUI subsystem on Windows for *all* builds so launching the .exe (Explorer,
+// autostart, a shortcut) never spawns a console window. Without this, debug
+// builds default to the console subsystem: a terminal opens on startup and
+// closing it kills the app. In debug we re-attach to the parent console below
+// (see `main`) so `cargo run` from a terminal still shows logs.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod actuator;
 mod audio;
@@ -28,6 +33,15 @@ slint::include_modules!();
 const BUILD_STAMP: &str = env!("SLIDR_BUILD_DATE");
 
 fn main() -> anyhow::Result<()> {
+    // GUI-subsystem builds have no console of their own. In debug, if we were
+    // launched from an existing terminal, attach to it so log output is visible
+    // during `cargo run`. No-op (and harmless) when there's no parent console.
+    #[cfg(all(target_os = "windows", debug_assertions))]
+    unsafe {
+        use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Preview / design-iteration mode: spawn a window pre-populated with mock state

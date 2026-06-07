@@ -41,12 +41,24 @@ pub struct LiveState {
     pub connected: bool,
 }
 
+/// How long after a (re)connect we ignore incoming frames. Opening the serial
+/// port toggles DTR, which resets the Arduino; while it boots, its slider/button
+/// pins float to garbage (analog pins often read max → 100%, button pins can
+/// read HIGH). Swallowing this window stops phantom volume spikes and spurious
+/// button actions (e.g. a random "Open Spotify").
+const SETTLE_WINDOW: Duration = Duration::from_millis(1000);
+
 pub struct EventEngine {
     prev_sliders: [i32; NUM_SLIDERS],
     prev_buttons: [u8; NUM_BUTTONS],
     last_emit: Instant,
     emit_interval: Duration,
     state: LiveState,
+    /// Frames received before this instant are treated as boot noise and dropped.
+    settle_deadline: Instant,
+    /// Set on (re)connect: the first frame past the settle window re-establishes
+    /// the edge-detection baseline instead of firing actions.
+    resync: bool,
 }
 
 impl Default for EventEngine {
@@ -57,6 +69,8 @@ impl Default for EventEngine {
             last_emit: Instant::now() - Duration::from_secs(1),
             emit_interval: Duration::from_millis(16),
             state: LiveState::default(),
+            settle_deadline: Instant::now(),
+            resync: false,
         }
     }
 }
@@ -67,6 +81,13 @@ impl EventEngine {
     }
 
     pub fn set_connected(&mut self, connected: bool) {
+        // Rising edge: the port just (re)opened, which resets the board. Arm the
+        // settle window + force a baseline resync so the boot-time pin garbage
+        // can't fire actions or slam volumes to 100%.
+        if connected && !self.state.connected {
+            self.settle_deadline = Instant::now() + SETTLE_WINDOW;
+            self.resync = true;
+        }
         self.state.connected = connected;
     }
 
@@ -81,6 +102,7 @@ impl EventEngine {
         let settings = &preset.settings;
         let mut changed = false;
         let mut cmds = Vec::new();
+        let now = Instant::now();
 
         // Always keep raw state mirror up to date.
         self.state.sliders = frame.sliders;
@@ -94,12 +116,29 @@ impl EventEngine {
             changed = true;
         }
 
+        // Settle window: drop boot-time pin garbage after a (re)connect. We still
+        // mirror the values to the UI above, but emit no commands and don't let
+        // them poison the edge-detection baseline. This is what prevents the
+        // phantom "Open Spotify" and the brief all-volumes-to-100% flash.
+        if now < self.settle_deadline {
+            return (changed, cmds);
+        }
+
         // Throttle action dispatch (matches reference 16ms cadence).
-        let now = Instant::now();
         if now.duration_since(self.last_emit) < self.emit_interval {
             return (changed, cmds);
         }
         self.last_emit = now;
+
+        // First good frame after the settle window: adopt the current button
+        // state as the baseline (so a pin that settled HIGH isn't read as a fresh
+        // press) and invalidate the slider baseline so volumes re-sync once to the
+        // real physical positions.
+        if self.resync {
+            self.resync = false;
+            self.prev_buttons = frame.buttons;
+            self.prev_sliders = [-1; NUM_SLIDERS];
+        }
 
         // Button edges → fire actions.
         for i in 0..NUM_BUTTONS {

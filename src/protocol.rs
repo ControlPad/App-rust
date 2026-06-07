@@ -63,6 +63,8 @@ pub enum ParseError {
     Short(usize),
     #[error("invalid int in field {0}: {1:?}")]
     BadInt(usize, String),
+    #[error("too many fields (got more than {})", FRAME_FIELDS)]
+    Extra(usize),
 }
 
 pub fn parse_line(line: &str) -> Result<Frame, ParseError> {
@@ -86,6 +88,13 @@ pub fn parse_line(line: &str) -> Result<Frame, ParseError> {
     for (i, b) in buttons.iter_mut().enumerate() {
         let v = parse_i32(next()?, 2 + NUM_SLIDERS + i)?;
         *b = if v != 0 { 1 } else { 0 };
+    }
+
+    // Reject trailing junk: a corrupted line (e.g. a dropped newline merging two
+    // frames) can otherwise satisfy the field reads above and be processed as a
+    // misaligned frame. The firmware emits exactly FRAME_FIELDS fields per line.
+    if it.next().is_some() {
+        return Err(ParseError::Extra(idx));
     }
 
     Ok(Frame {
@@ -162,5 +171,14 @@ mod tests {
     #[test]
     fn rejects_short_frame() {
         assert!(parse_line("0,0,1,2,3\n").is_err());
+    }
+
+    #[test]
+    fn rejects_extra_fields() {
+        // A valid 19-field frame with one extra trailing field (e.g. a dropped
+        // newline merging the next frame's leading byte) must be rejected, not
+        // silently parsed as a misaligned frame.
+        let line = "0,1,1,512,1024,256,128,64,0,1,0,1,0,0,0,0,0,0,0,7\n";
+        assert!(parse_line(line).is_err());
     }
 }

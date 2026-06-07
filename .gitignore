@@ -2,6 +2,9 @@
 **/*.rs.bk
 *.pdb
 
+# JetBrains IDE
+/.idea/
+
 # Build artifacts staged into the installer dir during packaging
 /installer/slidr.exe
 /installer/logo.ico

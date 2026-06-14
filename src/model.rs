@@ -16,11 +16,17 @@ pub struct AudioStream {
     /// Output device friendly name. `None` = default endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
+    /// When set, this slider entry fires an HTTP request (with the slider
+    /// percent substituted for `{value}`) instead of controlling audio volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ApiCall>,
 }
 
 impl AudioStream {
     pub fn label(&self) -> String {
-        if let Some(p) = &self.process {
+        if let Some(api) = &self.api {
+            api.label()
+        } else if let Some(p) = &self.process {
             p.clone()
         } else if let Some(m) = &self.mic_name {
             format!("mic: {m}")
@@ -28,6 +34,92 @@ impl AudioStream {
             format!("device: {d}")
         } else {
             "default output".into()
+        }
+    }
+}
+
+/// HTTP method for an [`ApiCall`] action.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HttpMethod {
+    Get,
+    #[default]
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+impl HttpMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+        }
+    }
+    /// Dropdown index used by the wizard UI (must match the slint method list).
+    pub fn from_index(i: i32) -> Self {
+        match i {
+            0 => Self::Get,
+            2 => Self::Put,
+            3 => Self::Patch,
+            4 => Self::Delete,
+            _ => Self::Post,
+        }
+    }
+    pub fn to_index(self) -> i32 {
+        match self {
+            Self::Get => 0,
+            Self::Post => 1,
+            Self::Put => 2,
+            Self::Patch => 3,
+            Self::Delete => 4,
+        }
+    }
+}
+
+/// An HTTP request fired by a button press or slider movement. For sliders, the
+/// literal `{value}` placeholder in `url` / `payload` is replaced with the
+/// current slider position as a percent (0–100) before the request is sent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiCall {
+    #[serde(default)]
+    pub method: HttpMethod,
+    pub url: String,
+    /// Request body (typically JSON). Sent as `application/json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<String>,
+    /// Optional bearer token, sent as `Authorization: Bearer <token>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer: Option<String>,
+    /// Minimum spacing (ms) between requests when fired by a moving slider.
+    /// Clamped to [`API_THROTTLE_MIN_MS`, `API_THROTTLE_MAX_MS`]. Ignored for
+    /// button actions (they fire once per press).
+    #[serde(default = "default_api_throttle_ms")]
+    pub throttle_ms: i32,
+}
+
+impl Default for ApiCall {
+    fn default() -> Self {
+        Self {
+            method: HttpMethod::default(),
+            url: String::new(),
+            payload: None,
+            bearer: None,
+            throttle_ms: default_api_throttle_ms(),
+        }
+    }
+}
+
+impl ApiCall {
+    pub fn label(&self) -> String {
+        if self.url.is_empty() {
+            "API call".into()
+        } else {
+            format!("{} {}", self.method.as_str(), self.url)
         }
     }
 }
@@ -42,6 +134,7 @@ pub enum ActionKind {
     OpenWebsite,
     KeyPress,
     CycleOutput,
+    ApiCall,
 }
 
 impl ActionKind {
@@ -54,6 +147,7 @@ impl ActionKind {
             Self::OpenWebsite => "Open website",
             Self::KeyPress => "Simulate key",
             Self::CycleOutput => "Cycle output device",
+            Self::ApiCall => "API call",
         }
     }
 }
@@ -73,6 +167,9 @@ pub struct ButtonAction {
     /// Optional pretty display string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<String>,
+    /// HTTP request config, used when `kind == ApiCall`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<ApiCall>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,6 +273,13 @@ fn default_true() -> bool {
 fn default_dead_zone() -> i32 {
     4
 }
+pub fn default_api_throttle_ms() -> i32 {
+    500
+}
+
+/// Allowed range for [`ApiCall::throttle_ms`].
+pub const API_THROTTLE_MIN_MS: i32 = 50;
+pub const API_THROTTLE_MAX_MS: i32 = 1000;
 
 /// Slider/button → category assignments (indices 0-based).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -239,6 +343,25 @@ mod tests {
             SliderCategory { id: 5, name: "b".into(), streams: vec![], collapsed: false },
         ];
         assert_eq!(next_id(&v, |c| c.id), 6);
+    }
+
+    #[test]
+    fn http_method_index_round_trip() {
+        for m in [HttpMethod::Get, HttpMethod::Post, HttpMethod::Put, HttpMethod::Patch, HttpMethod::Delete] {
+            assert_eq!(HttpMethod::from_index(m.to_index()), m);
+        }
+        // Out-of-range index falls back to the default (POST).
+        assert_eq!(HttpMethod::from_index(99), HttpMethod::Post);
+    }
+
+    #[test]
+    fn api_call_label_and_stream() {
+        let api = ApiCall { method: HttpMethod::Post, url: "https://x/y".into(), ..Default::default() };
+        assert_eq!(api.label(), "POST https://x/y");
+        assert_eq!(ApiCall::default().label(), "API call");
+        // An API stream's label comes from the API config, not audio fields.
+        let s = AudioStream { api: Some(api), ..Default::default() };
+        assert_eq!(s.label(), "POST https://x/y");
     }
 
     #[test]

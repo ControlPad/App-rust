@@ -13,8 +13,8 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use crate::audio::AudioBackend;
 use crate::events::EventEngine;
 use crate::model::{
-    next_id, ActionKind, AudioStream, ButtonAction, ButtonCategory, Preset, Settings,
-    SliderCategory, ThemeMode,
+    next_id, ActionKind, ApiCall, AudioStream, ButtonAction, ButtonCategory, HttpMethod, Preset,
+    Settings, SliderCategory, ThemeMode,
 };
 use crate::protocol::{Frame, NUM_BUTTONS, NUM_SLIDERS};
 use crate::serial::{RetryKicker, SerialEvent};
@@ -287,6 +287,7 @@ pub fn wire(
             ui.set_wizard_kind(0);
             ui.set_wizard_property("".into());
             ui.set_wizard_display("".into());
+            reset_wizard_api(&ui);
             populate_live_lists(&ui, shared.clone());
             ui.set_wizard_filter("".into());
             push_wizard_picker(&ui, shared.clone());
@@ -300,16 +301,17 @@ pub fn wire(
             let Some(ui) = weak.upgrade() else { return };
             let idx = idx as usize;
             let cat_id = cat_id as u32;
-            // Resolve existing entry → wizard kind/property/display.
-            let (wkind, prop, disp) = {
+            // Resolve existing entry → wizard kind/property/display (+ optional API).
+            let (wkind, prop, disp, api) = {
                 let s = shared.lock();
                 if target_kind == 0 {
                     let Some(c) = s.preset.slider_categories.iter().find(|c| c.id == cat_id) else { return };
                     let Some(stream) = c.streams.get(idx) else { return };
-                    if let Some(p) = &stream.process { (0, p.clone(), p.clone()) }
-                    else if let Some(m) = &stream.mic_name { (1, m.clone(), m.clone()) }
+                    if let Some(api) = &stream.api { (3, String::new(), String::new(), Some(api.clone())) }
+                    else if let Some(p) = &stream.process { (0, p.clone(), p.clone(), None) }
+                    else if let Some(m) = &stream.mic_name { (1, m.clone(), m.clone(), None) }
                     else { (2, stream.device_name.clone().unwrap_or_default(),
-                            stream.device_name.clone().unwrap_or_default()) }
+                            stream.device_name.clone().unwrap_or_default(), None) }
                 } else {
                     let Some(c) = s.preset.button_categories.iter().find(|c| c.id == cat_id) else { return };
                     let Some(a) = c.actions.get(idx) else { return };
@@ -324,7 +326,7 @@ pub fn wire(
                     } else {
                         prop.clone()
                     };
-                    (k, shown, a.display.clone().unwrap_or_default())
+                    (k, shown, a.display.clone().unwrap_or_default(), a.api.clone())
                 }
             };
             shared.lock().editing_idx = Some(idx);
@@ -334,6 +336,7 @@ pub fn wire(
             ui.set_wizard_step(1);  // jump straight to the target step
             ui.set_wizard_property(prop.into());
             ui.set_wizard_display(disp.into());
+            push_wizard_api(&ui, api.as_ref());
             populate_live_lists(&ui, shared.clone());
             ui.set_wizard_filter("".into());
             push_wizard_picker(&ui, shared.clone());
@@ -408,7 +411,8 @@ pub fn wire(
                     let stream = match result.kind {
                         0 => AudioStream { process: Some(result.property.into()), ..Default::default() },
                         1 => AudioStream { mic_name: Some(result.property.into()), ..Default::default() },
-                        _ => AudioStream { device_name: Some(result.property.into()), ..Default::default() },
+                        2 => AudioStream { device_name: Some(result.property.into()), ..Default::default() },
+                        _ => AudioStream { api: Some(api_from_result(&result)), ..Default::default() },
                     };
                     match editing {
                         Some(i) if i < c.streams.len() => c.streams[i] = stream,
@@ -417,6 +421,21 @@ pub fn wire(
                 }
             } else if let Some(c) = s.preset.button_categories.iter_mut().find(|c| c.id == cat_id) {
                 let kind = button_kind_from_index(result.kind);
+                if kind == ActionKind::ApiCall {
+                    let action = ButtonAction {
+                        kind, property: None, display: None,
+                        api: Some(api_from_result(&result)),
+                    };
+                    match editing {
+                        Some(i) if i < c.actions.len() => c.actions[i] = action,
+                        _ => c.actions.push(action),
+                    }
+                    let _ = crate::storage::save_preset(&s.preset);
+                    let Some(ui) = weak.upgrade() else { return };
+                    push_preset_to_ui(&ui, &s.preset);
+                    toast(&ui, if editing.is_some() { "Updated." } else { "Added." });
+                    return;
+                }
                 // For KeyPress, picker stores the friendly name; resolve to VK code.
                 let (prop, disp) = if kind == ActionKind::KeyPress {
                     let name = result.property.to_string();
@@ -438,7 +457,7 @@ pub fn wire(
                     let disp = if result.display.is_empty() { None } else { Some(result.display.to_string()) };
                     (prop, disp)
                 };
-                let action = ButtonAction { kind, property: prop, display: disp };
+                let action = ButtonAction { kind, property: prop, display: disp, api: None };
                 match editing {
                     Some(i) if i < c.actions.len() => c.actions[i] = action,
                     _ => c.actions.push(action),
@@ -843,7 +862,8 @@ fn push_preset_to_ui(ui: &AppWindow, preset: &Preset) {
 }
 
 fn stream_icon_kind(s: &AudioStream) -> i32 {
-    if s.process.is_some() { 0 }
+    if s.api.is_some() { 3 }
+    else if s.process.is_some() { 0 }
     else if s.mic_name.is_some() { 1 }
     else { 2 }
 }
@@ -861,6 +881,9 @@ fn action_secondary(a: &crate::model::ButtonAction) -> String {
             names.join(" → ")
         };
     }
+    if a.kind == ActionKind::ApiCall {
+        return a.api.as_ref().map(|api| api.label()).unwrap_or_else(|| "API call".into());
+    }
     a.display.clone().or_else(|| a.property.clone()).unwrap_or_default()
 }
 
@@ -868,12 +891,14 @@ fn action_icon_kind(k: ActionKind) -> i32 {
     use ActionKind::*;
     match k {
         MuteProcess => 0, MuteMic => 1, MuteMainAudio => 5,
-        OpenProcess => 0, OpenWebsite => 3, KeyPress => 4, CycleOutput => 2,
+        OpenProcess => 0, OpenWebsite => 3, KeyPress => 4, CycleOutput => 2, ApiCall => 3,
     }
 }
 
 fn stream_secondary(s: &AudioStream) -> String {
-    if s.process.is_some() {
+    if s.api.is_some() {
+        "API call".into()
+    } else if s.process.is_some() {
         "process".into()
     } else if s.mic_name.is_some() {
         "microphone".into()
@@ -942,11 +967,48 @@ fn index_to_curve_preset(i: i32) -> crate::curve::CurvePreset {
     match i { 1 => Ease, 2 => EaseIn, 3 => EaseOut, 4 => EaseInOut, 5 => Custom, _ => Linear }
 }
 
+/// Build an [`ApiCall`] from the wizard result's API fields.
+fn api_from_result(r: &WizardResult) -> ApiCall {
+    let opt = |s: String| if s.is_empty() { None } else { Some(s) };
+    ApiCall {
+        method: HttpMethod::from_index(r.method),
+        url: r.url.trim().to_string(),
+        payload: opt(r.payload.to_string()),
+        bearer: opt(r.bearer.trim().to_string()),
+        throttle_ms: r.throttle.clamp(
+            crate::model::API_THROTTLE_MIN_MS,
+            crate::model::API_THROTTLE_MAX_MS,
+        ),
+    }
+}
+
+/// Push an existing [`ApiCall`] (or defaults) into the wizard API fields.
+fn push_wizard_api(ui: &AppWindow, api: Option<&ApiCall>) {
+    match api {
+        Some(api) => {
+            ui.set_wizard_method(api.method.to_index());
+            ui.set_wizard_url(api.url.clone().into());
+            ui.set_wizard_payload(api.payload.clone().unwrap_or_default().into());
+            ui.set_wizard_bearer(api.bearer.clone().unwrap_or_default().into());
+            ui.set_wizard_throttle(api.throttle_ms);
+        }
+        None => reset_wizard_api(ui),
+    }
+}
+
+fn reset_wizard_api(ui: &AppWindow) {
+    ui.set_wizard_method(HttpMethod::default().to_index());
+    ui.set_wizard_url("".into());
+    ui.set_wizard_payload("".into());
+    ui.set_wizard_bearer("".into());
+    ui.set_wizard_throttle(crate::model::default_api_throttle_ms());
+}
+
 fn action_kind_index(k: ActionKind) -> i32 {
     use ActionKind::*;
     match k {
         MuteProcess => 0, MuteMainAudio => 1, MuteMic => 2,
-        OpenProcess => 3, OpenWebsite => 4, KeyPress => 5, CycleOutput => 6,
+        OpenProcess => 3, OpenWebsite => 4, KeyPress => 5, CycleOutput => 6, ApiCall => 7,
     }
 }
 
@@ -954,7 +1016,7 @@ fn button_kind_from_index(i: i32) -> ActionKind {
     use ActionKind::*;
     match i {
         0 => MuteProcess, 1 => MuteMainAudio, 2 => MuteMic,
-        3 => OpenProcess, 4 => OpenWebsite, 6 => CycleOutput, _ => KeyPress,
+        3 => OpenProcess, 4 => OpenWebsite, 6 => CycleOutput, 7 => ApiCall, _ => KeyPress,
     }
 }
 

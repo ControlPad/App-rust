@@ -1,6 +1,6 @@
 // Slidr — Slint UI (Material backend, Inter typeface, Tabler icons)
 
-import { LineEdit, ScrollView, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
+import { LineEdit, TextEdit, ScrollView, VerticalBox, HorizontalBox, Palette } from "std-widgets.slint";
 
 // Global accent palette — selectable from Settings.
 export global Theme {
@@ -30,6 +30,8 @@ export struct PickerEntry { name: string, icon-kind: int, selected: bool }
 export struct WizardResult {
     target-kind: int, category-id: int, kind: int,
     property: string, display: string,
+    // API-call fields (used when kind is the "API call" entry).
+    method: int, url: string, payload: string, bearer: string, throttle: int,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1384,6 +1386,11 @@ component WizardPopup inherits Rectangle {
     in-out property <int> kind;
     in-out property <string> property;
     in-out property <string> display;
+    in-out property <int> method;
+    in-out property <string> url;
+    in-out property <string> payload;
+    in-out property <string> bearer;
+    in-out property <int> throttle;
     in property <[string]> live-processes;
     in property <[string]> live-mics;
     in property <[string]> live-outputs;
@@ -1402,15 +1409,25 @@ component WizardPopup inherits Rectangle {
 
     property <[string]> button-kinds: ["Mute process", "Mute main audio", "Mute microphone",
                                        "Open application", "Open website", "Simulate key",
-                                       "Cycle output device"];
-    property <[string]> slider-kinds: ["Process volume", "Microphone", "Output device"];
+                                       "Cycle output device", "API call"];
+    property <[string]> slider-kinds: ["Process volume", "Microphone", "Output device", "API call"];
     property <[string]> kinds: root.target-kind == 1 ? root.button-kinds : root.slider-kinds;
     property <string> kind-label: root.kinds[root.kind];
+    property <[string]> method-names: ["GET", "POST", "PUT", "PATCH", "DELETE"];
+    // The "API call" entry is the last kind in each list (button 7, slider 3).
+    property <bool> is-api: (root.target-kind == 1 && root.kind == 7)
+                         || (root.target-kind == 0 && root.kind == 3);
+    // The slider-only interval must be in range; buttons don't use it.
+    property <bool> throttle-valid: root.throttle >= 50 && root.throttle <= 1000;
+    property <bool> api-valid: root.url != ""
+                            && (root.target-kind != 0 || root.throttle-valid);
     property <bool> needs-property: !(root.target-kind == 1 && root.kind == 1);
     in property <[PickerEntry]> picker-source;
     // Key library uses the picker list too (kind 5); cycle-output (kind 6) is a
-    // multi-select list, so its rows toggle membership instead of single-picking.
-    property <bool> picker-is-list: !(root.target-kind == 1 && (root.kind == 3 || root.kind == 4));
+    // multi-select list, so its rows toggle membership. App/website (3/4) and the
+    // API call use a form instead of a picker list.
+    property <bool> picker-is-list: !(root.target-kind == 1 && (root.kind == 3 || root.kind == 4))
+                                    && !root.is-api;
     property <bool> multi-select: root.target-kind == 1 && root.kind == 6;
 
     Rectangle {
@@ -1452,6 +1469,9 @@ component WizardPopup inherits Rectangle {
                             mouse-cursor: pointer;
                             clicked => { root.kind = idx; root.property = "";
                                          root.display = ""; root.filter = "";
+                                         root.method = 1; root.url = "";
+                                         root.payload = ""; root.bearer = "";
+                                         root.throttle = 500;
                                          root.state-changed(); }
                             HorizontalBox {
                                 padding-left: 14px; padding-right: 14px;
@@ -1547,7 +1567,7 @@ component WizardPopup inherits Rectangle {
                     }
                 }
 
-                if !root.picker-is-list: VerticalBox {
+                if !root.picker-is-list && !root.is-api: VerticalBox {
                     spacing: 6px; alignment: start;
                     Text {
                         text: root.kind == 3 ? "Path or command to launch"
@@ -1568,6 +1588,73 @@ component WizardPopup inherits Rectangle {
                     LineEdit { text <=> root.display; height: 36px;
                         placeholder-text: "Display name (optional)"; }
                 }
+
+                // API call form (button kind 7 / slider kind 3).
+                if root.is-api: ScrollView {
+                    mouse-drag-pan-enabled: false;
+                    vertical-stretch: 1;
+                    VerticalBox {
+                        spacing: 8px; alignment: start;
+                        HorizontalLayout { spacing: 8px;
+                            VerticalLayout { spacing: 4px;
+                                Text { text: "Method"; font-size: 12px; font-family: "Inter";
+                                    color: Palette.foreground.with-alpha(0.7); }
+                                Select {
+                                    field-width: 120px;
+                                    model: root.method-names;
+                                    current-index <=> root.method;
+                                }
+                            }
+                            VerticalLayout { spacing: 4px; horizontal-stretch: 1;
+                                Text { text: "Endpoint URL"; font-size: 12px; font-family: "Inter";
+                                    color: Palette.foreground.with-alpha(0.7); }
+                                LineEdit { text <=> root.url; height: 36px;
+                                    placeholder-text: "https://api.example.com/hook"; }
+                            }
+                        }
+                        Text { text: "Payload (optional, sent as JSON)";
+                            font-size: 12px; font-family: "Inter";
+                            color: Palette.foreground.with-alpha(0.7); }
+                        TextEdit { text <=> root.payload; height: 120px;
+                            placeholder-text: "{\"value\":\"{value}\"}"; wrap: word-wrap; }
+                        Text { text: root.target-kind == 0
+                                ? "Tip: {value} is replaced with the slider percent (0–100)."
+                                : "Tip: {value} placeholders are sent literally for buttons.";
+                            font-size: 11px; font-family: "Inter";
+                            color: Palette.foreground.with-alpha(0.55); wrap: word-wrap; }
+                        Text { text: "Bearer token (optional)"; font-size: 12px; font-family: "Inter";
+                            color: Palette.foreground.with-alpha(0.7); }
+                        LineEdit { text <=> root.bearer; height: 36px;
+                            placeholder-text: "Authorization: Bearer …"; }
+
+                        // Slider-only: how often the request fires while moving.
+                        if root.target-kind == 0: Text {
+                            text: "Update interval while sliding (ms, 50–1000)";
+                            font-size: 12px; font-family: "Inter";
+                            color: Palette.foreground.with-alpha(0.7); }
+                        if root.target-kind == 0: HorizontalLayout {
+                            spacing: 8px;
+                            VerticalLayout {
+                                width: 110px;
+                                LineEdit {
+                                    height: 36px;
+                                    input-type: number;
+                                    text: root.throttle;
+                                    edited(t) => { root.throttle = t.to-float(); }
+                                }
+                                // Out-of-range warning (also gates the Next button).
+                                if !root.throttle-valid: Text {
+                                    text: "must be 50–1000";
+                                    font-size: 11px; font-family: "Inter";
+                                    color: #e5484d; }
+                            }
+                            Text { text: "Lower = more frequent. The final value is always sent.";
+                                font-size: 11px; font-family: "Inter"; vertical-alignment: center;
+                                color: Palette.foreground.with-alpha(0.55); wrap: word-wrap;
+                                horizontal-stretch: 1; }
+                        }
+                    }
+                }
             }
 
             // step 2 — confirm
@@ -1579,9 +1666,18 @@ component WizardPopup inherits Rectangle {
                     Text { text: root.target-kind == 0 ? "Type: audio stream" : "Type: action";
                         font-family: "Inter"; }
                     Text { text: "Kind: " + root.kind-label; font-family: "Inter"; }
-                    if root.needs-property: Text { text: "Target: " + root.property;
+                    if root.is-api: Text {
+                        text: "Request: " + root.method-names[root.method] + " " + root.url;
+                        font-family: "Inter"; wrap: word-wrap; }
+                    if root.is-api && root.payload != "": Text {
+                        text: "Payload: " + root.payload; font-family: "Inter"; wrap: word-wrap; }
+                    if root.is-api && root.bearer != "": Text {
+                        text: "Auth: Bearer token set"; font-family: "Inter"; }
+                    if root.is-api && root.target-kind == 0: Text {
+                        text: "Interval: " + root.throttle + " ms"; font-family: "Inter"; }
+                    if !root.is-api && root.needs-property: Text { text: "Target: " + root.property;
                         font-family: "Inter"; }
-                    if root.display != "" && root.display != root.property: Text {
+                    if !root.is-api && root.display != "" && root.display != root.property: Text {
                         text: "Label: " + root.display; font-family: "Inter"; }
                 } }
                 Text { text: "You can edit or remove it from the category list afterwards.";
@@ -1601,9 +1697,12 @@ component WizardPopup inherits Rectangle {
                     icon: @image-url("../assets/icons/chevron-right.svg");
                     label: "Next"; primary: true;
                     // Multi-select (cycle output) may proceed with an empty set
-                    // (= cycle all devices); other kinds need a chosen target.
-                    enabled: root.step == 0 || !root.needs-property || root.multi-select
-                             || root.property != "";
+                    // (= cycle all devices); the API call needs a URL; other kinds
+                    // need a chosen target.
+                    enabled: root.step == 0
+                             || (root.is-api ? root.api-valid
+                                  : (!root.needs-property || root.multi-select
+                                     || root.property != ""));
                     clicked => { root.step = root.step + 1; }
                 }
                 if root.step == 2: IconButton {
@@ -1684,6 +1783,11 @@ export component AppWindow inherits Window {
     in-out property <string> wizard-property: "";
     in-out property <string> wizard-display: "";
     in-out property <string> wizard-filter: "";
+    in-out property <int> wizard-method: 1;       // default POST
+    in-out property <string> wizard-url: "";
+    in-out property <string> wizard-payload: "";
+    in-out property <string> wizard-bearer: "";
+    in-out property <int> wizard-throttle: 500;
     in property <[PickerEntry]> wizard-picker-source;
 
     in-out property <string> toast-text: "";
@@ -1969,6 +2073,11 @@ export component AppWindow inherits Window {
         kind <=> root.wizard-kind;
         property <=> root.wizard-property;
         display <=> root.wizard-display;
+        method <=> root.wizard-method;
+        url <=> root.wizard-url;
+        payload <=> root.wizard-payload;
+        bearer <=> root.wizard-bearer;
+        throttle <=> root.wizard-throttle;
         filter <=> root.wizard-filter;
         picker-source: root.wizard-picker-source;
         live-processes: root.live-processes;
@@ -1979,7 +2088,8 @@ export component AppWindow inherits Window {
         browse => { root.browse-file(); }
         cancel => { root.wizard-open = false; root.wizard-step = 0;
                     root.wizard-property = ""; root.wizard-display = "";
-                    root.wizard-filter = ""; }
+                    root.wizard-url = ""; root.wizard-payload = ""; root.wizard-bearer = "";
+                    root.wizard-throttle = 500; root.wizard-filter = ""; }
         refresh => { root.refresh-live-lists(); root.wizard-state-changed(); }
         finish => {
             root.wizard-finish({
@@ -1988,11 +2098,20 @@ export component AppWindow inherits Window {
                 kind: root.wizard-kind,
                 property: root.wizard-property,
                 display: root.wizard-display,
+                method: root.wizard-method,
+                url: root.wizard-url,
+                payload: root.wizard-payload,
+                bearer: root.wizard-bearer,
+                throttle: root.wizard-throttle,
             });
             root.wizard-open = false;
             root.wizard-step = 0;
             root.wizard-property = "";
             root.wizard-display = "";
+            root.wizard-url = "";
+            root.wizard-payload = "";
+            root.wizard-bearer = "";
+            root.wizard-throttle = 500;
             root.wizard-filter = "";
         }
     }

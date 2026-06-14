@@ -29,6 +29,13 @@ pub enum Cmd {
     /// Switch the default output to the next device in the list (wrapping).
     /// Empty list = cycle through all active output endpoints.
     CycleOutput(Vec<String>),
+    /// Fire an HTTP request. `{value}` placeholders are already substituted.
+    ApiCall {
+        method: crate::model::HttpMethod,
+        url: String,
+        payload: Option<String>,
+        bearer: Option<String>,
+    },
 }
 
 /// Snapshot pushed to the UI on every dispatch tick.
@@ -59,6 +66,10 @@ pub struct EventEngine {
     /// Set on (re)connect: the first frame past the settle window re-establishes
     /// the edge-detection baseline instead of firing actions.
     resync: bool,
+    /// Per-slider throttle bookkeeping for API actions: the last raw value seen
+    /// but not yet sent, and when we last sent one.
+    pending_api: [Option<i32>; NUM_SLIDERS],
+    last_api_emit: [Instant; NUM_SLIDERS],
 }
 
 impl Default for EventEngine {
@@ -71,6 +82,8 @@ impl Default for EventEngine {
             state: LiveState::default(),
             settle_deadline: Instant::now(),
             resync: false,
+            pending_api: [None; NUM_SLIDERS],
+            last_api_emit: [Instant::now() - Duration::from_secs(2); NUM_SLIDERS],
         }
     }
 }
@@ -173,15 +186,75 @@ impl EventEngine {
             let volume = crate::curve::raw_to_volume(cur, pts);
 
             for stream in &cat.streams {
-                cmds.push(Cmd::SetVolume {
-                    target: stream_target(stream),
-                    value: volume,
-                    unmute: settings.unmute_on_change,
-                });
+                if stream.api.is_some() {
+                    // API streams are throttled + flushed below; just record the
+                    // latest position here.
+                    self.pending_api[i] = Some(cur);
+                } else {
+                    cmds.push(Cmd::SetVolume {
+                        target: stream_target(stream),
+                        value: volume,
+                        unmute: settings.unmute_on_change,
+                    });
+                }
+            }
+        }
+
+        // Flush throttled slider API calls. Runs every tick (not just on change),
+        // so the trailing value lands within one throttle window after the slider
+        // stops moving. Each API action carries its own interval (configured in
+        // the wizard); a slider with several uses the smallest, clamped to a sane
+        // range.
+        for i in 0..NUM_SLIDERS {
+            let Some(raw) = self.pending_api[i] else { continue };
+            let Some(cat) = preset.slider_category(i) else {
+                self.pending_api[i] = None;
+                continue;
+            };
+            let Some(throttle_ms) = cat
+                .streams
+                .iter()
+                .filter_map(|s| s.api.as_ref())
+                .map(|a| {
+                    a.throttle_ms
+                        .clamp(crate::model::API_THROTTLE_MIN_MS, crate::model::API_THROTTLE_MAX_MS)
+                })
+                .min()
+            else {
+                self.pending_api[i] = None;
+                continue;
+            };
+            if now.duration_since(self.last_api_emit[i]) < Duration::from_millis(throttle_ms as u64) {
+                continue;
+            }
+            self.last_api_emit[i] = now;
+            self.pending_api[i] = None;
+            let percent = (crate::curve::normalize_raw(raw) * 100.0).round() as i32;
+            for stream in &cat.streams {
+                if let Some(api) = &stream.api {
+                    cmds.push(api_cmd(api, Some(percent)));
+                }
             }
         }
 
         (changed, cmds)
+    }
+}
+
+/// Build an [`Cmd::ApiCall`], substituting the `{value}` placeholder with the
+/// slider percent (for slider actions). Buttons pass `None` (no substitution).
+fn api_cmd(api: &crate::model::ApiCall, percent: Option<i32>) -> Cmd {
+    let sub = |s: &str| -> String {
+        match percent {
+            Some(p) => s.replace("{value}", &p.to_string()),
+            None => s.to_string(),
+        }
+    };
+    Cmd::ApiCall {
+        method: api.method,
+        url: sub(&api.url),
+        payload: api.payload.as_deref().map(sub),
+        bearer: api.bearer.clone(),
     }
 }
 
@@ -192,6 +265,37 @@ fn stream_target(s: &crate::model::AudioStream) -> Target {
         Target::Mic(m.clone())
     } else {
         Target::System(s.device_name.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ApiCall, HttpMethod};
+
+    #[test]
+    fn slider_api_substitutes_value_placeholder() {
+        let api = ApiCall {
+            method: HttpMethod::Post,
+            url: "https://x/set?v={value}".into(),
+            payload: Some("{\"pct\": {value}}".into()),
+            bearer: Some("tok".into()),
+            ..Default::default()
+        };
+        let Cmd::ApiCall { method, url, payload, bearer } = api_cmd(&api, Some(73)) else {
+            panic!("expected ApiCall");
+        };
+        assert_eq!(method, HttpMethod::Post);
+        assert_eq!(url, "https://x/set?v=73");
+        assert_eq!(payload.as_deref(), Some("{\"pct\": 73}"));
+        assert_eq!(bearer.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn button_api_leaves_placeholder_untouched() {
+        let api = ApiCall { url: "https://x/{value}".into(), ..Default::default() };
+        let Cmd::ApiCall { url, .. } = api_cmd(&api, None) else { panic!("expected ApiCall") };
+        assert_eq!(url, "https://x/{value}");
     }
 }
 
@@ -249,6 +353,13 @@ fn push_button_cmds(
                     .map(|p| p.lines().map(str::to_string).filter(|s| !s.is_empty()).collect())
                     .unwrap_or_default();
                 out.push(Cmd::CycleOutput(devices));
+            }
+        }
+        ActionKind::ApiCall => {
+            if just_pressed {
+                if let Some(api) = &action.api {
+                    out.push(api_cmd(api, None));
+                }
             }
         }
     }

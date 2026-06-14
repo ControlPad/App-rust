@@ -8,6 +8,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::audio::{self, AudioBackend, MuteTarget, VolumeTarget};
 use crate::events::{Cmd, Target};
 use crate::keys::KeyController;
+use crate::model::HttpMethod;
 
 pub fn spawn() -> Sender<Cmd> {
     let (tx, rx) = crossbeam_channel::unbounded::<Cmd>();
@@ -104,7 +105,33 @@ fn apply(audio: &dyn AudioBackend, keys: Option<&mut KeyController>, cmd: Cmd) {
             }
         }
         Cmd::CycleOutput(devices) => audio.cycle_output(&devices),
+        Cmd::ApiCall { method, url, payload, bearer } => {
+            spawn_api_call(method, url, payload, bearer);
+        }
     }
+}
+
+/// Fire the HTTP request on a short-lived detached thread so a slow endpoint can
+/// never stall the actuator loop (which also drives audio).
+fn spawn_api_call(method: HttpMethod, url: String, payload: Option<String>, bearer: Option<String>) {
+    let _ = std::thread::Builder::new()
+        .name("slidr-api".into())
+        .spawn(move || {
+            let mut req = ureq::request(method.as_str(), &url);
+            if let Some(token) = &bearer {
+                req = req.set("Authorization", &format!("Bearer {token}"));
+            }
+            let result = match &payload {
+                Some(body) if !body.is_empty() => {
+                    req.set("Content-Type", "application/json").send_string(body)
+                }
+                _ => req.call(),
+            };
+            match result {
+                Ok(resp) => log::info!("api {} {url} -> {}", method.as_str(), resp.status()),
+                Err(e) => log::warn!("api {} {url} failed: {e}", method.as_str()),
+            }
+        });
 }
 
 fn vol_target(t: &Target) -> VolumeTarget<'_> {

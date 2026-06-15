@@ -152,6 +152,12 @@ impl EventEngine {
             self.resync = false;
             self.prev_buttons = frame.buttons;
             self.prev_sliders = [-1; NUM_SLIDERS];
+            // The board has now finished booting — this is the first frame past
+            // the post-reset settle window, so it can finally receive serial
+            // commands. The LED push on `SerialEvent::Connected` fired while the
+            // board was still in its DTR-reset bootloader and was lost; this is
+            // the resend that actually lands, giving the board its initial setup.
+            cmds.push(Cmd::SerialConnected);
         }
 
         // Button edges → fire actions.

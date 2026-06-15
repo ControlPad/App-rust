@@ -99,7 +99,7 @@ fn apply(audio: &dyn AudioBackend, keys: Option<&mut KeyController>, led: &mut L
         Cmd::SetLeds(cfgs) => led.set_configs(*cfgs),
         Cmd::SetLedExperimental(on) => led.set_experimental(on),
         Cmd::LedManualToggle(i) => led.manual_toggle(i as usize),
-        Cmd::SerialConnected => led.force_resend(),
+        Cmd::SerialConnected => led.on_connected(),
         Cmd::LedSaveState => led.save_state(),
         Cmd::LedClearSaved => led.clear_and_save(),
         Cmd::SetVolume { target, value, unmute } => {

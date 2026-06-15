@@ -32,6 +32,12 @@ pub struct LedLive {
 
 pub type LedStateHandle = Arc<Mutex<[LedLive; NUM_LEDS]>>;
 
+/// After the board (re)connects it resets (the port open toggles DTR) and spends
+/// ~1s in its bootloader/`setup()` before it can accept serial commands. A single
+/// LED push in that window is lost. So we re-push the full state every tick for
+/// this long after each connect — once the board is ready, one of these lands.
+const CONNECT_WARMUP: Duration = Duration::from_millis(2500);
+
 pub fn new_state() -> LedStateHandle {
     Arc::new(Mutex::new([LedLive::default(); NUM_LEDS]))
 }
@@ -51,6 +57,11 @@ pub struct LedEngine {
     last_mode: [Option<LedMode>; NUM_LEDS],
     last_brightness: [Option<u8>; NUM_LEDS],
     api: HashMap<(usize, usize), ApiSlot>,
+    /// Tracks the link's connected state so `tick` can spot the connect edge.
+    was_connected: bool,
+    /// While set and not yet elapsed, every tick re-pushes the full LED state
+    /// (the post-connect warmup — see [`CONNECT_WARMUP`]).
+    resend_until: Option<Instant>,
 }
 
 impl LedEngine {
@@ -63,7 +74,17 @@ impl LedEngine {
             last_mode: Default::default(),
             last_brightness: Default::default(),
             api: HashMap::new(),
+            was_connected: false,
+            resend_until: None,
         }
+    }
+
+    /// The board (re)connected. Begin a warmup window during which every tick
+    /// re-pushes the full LED state, so the board's initial setup lands once it
+    /// finishes booting. Also called from the serial-event path (precise
+    /// board-ready signal); `tick` arms the same window on the connect edge.
+    pub fn on_connected(&mut self) {
+        self.resend_until = Some(Instant::now() + CONNECT_WARMUP);
     }
 
     /// Persist the current live LED state to the board's EEPROM (`S`).
@@ -138,9 +159,29 @@ impl LedEngine {
     }
 
     pub fn tick(&mut self, audio: &dyn AudioBackend) {
-        if !self.experimental || !self.link.is_connected() {
+        // Watch the connection edge regardless of the experimental flag so we
+        // don't miss a connect that happens while it's momentarily off.
+        let connected = self.link.is_connected();
+        if connected && !self.was_connected {
+            self.on_connected();
+        } else if !connected {
+            self.resend_until = None;
+        }
+        self.was_connected = connected;
+
+        if !self.experimental || !connected {
             return;
         }
+
+        // During the post-connect warmup, clear the dedup state every tick so the
+        // full mode + brightness is re-sent until the freshly-booted board has
+        // had a chance to receive it.
+        match self.resend_until {
+            Some(until) if Instant::now() < until => self.force_resend(),
+            Some(_) => self.resend_until = None,
+            None => {}
+        }
+
         for led in 0..NUM_LEDS {
             let Some(cfg) = self.configs[led].clone() else {
                 self.state.lock()[led] = LedLive::default();

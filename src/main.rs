@@ -17,6 +17,7 @@ mod events;
 mod glue;
 mod keys;
 mod keys_library;
+mod led;
 mod model;
 mod protocol;
 mod serial;
@@ -70,9 +71,9 @@ fn main() -> anyhow::Result<()> {
 
     // Spawn the serial worker (skipped in --demo so mocked state isn't overwritten).
     let (tx, rx) = crossbeam_channel::bounded(256);
-    let kicker = if demo {
+    let (kicker, serial_link) = if demo {
         drop(tx);
-        serial::RetryKicker::default()
+        (serial::RetryKicker::default(), serial::SerialLink::default())
     } else {
         serial::spawn(tx)
     };
@@ -81,7 +82,10 @@ fn main() -> anyhow::Result<()> {
     // (occasional, on wizard open). Volume/mute application happens on the
     // actuator thread with its own backend so the UI never blocks.
     let audio: Arc<dyn audio::AudioBackend> = Arc::from(audio::default_backend());
-    let cmd_tx = actuator::spawn();
+    // Experimental LED control: the actuator owns the LED engine + serial writer
+    // and exposes live state for the configure popup.
+    let led_state = led::new_state();
+    let cmd_tx = actuator::spawn(serial_link, led_state.clone());
 
     // Load persisted state.
     let mut settings = storage::load_settings();
@@ -104,10 +108,12 @@ fn main() -> anyhow::Result<()> {
         audio,
         cmd_tx,
         kicker,
+        led_state,
         pending_assign: None,
         pending_wizard: None,
         pending_retry_deadline: None,
         editing_idx: None,
+        editing_led: None,
     }));
 
     let ui = AppWindow::new()?;

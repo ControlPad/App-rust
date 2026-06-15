@@ -34,6 +34,13 @@ pub trait AudioBackend: Send + Sync {
     fn toggle_mute(&self, target: MuteTarget<'_>);
     fn is_muted(&self, target: MuteTarget<'_>) -> bool;
 
+    /// Current volume in [0.0, 1.0], or `None` if the target can't be resolved /
+    /// the backend doesn't support reading it. Used by LED volume conditions.
+    fn get_volume(&self, target: VolumeTarget<'_>) -> Option<f32> {
+        let _ = target;
+        None
+    }
+
     fn list_processes(&self) -> Vec<String> {
         Vec::new()
     }

@@ -4,11 +4,13 @@
 //! changes through a [`crossbeam_channel::Sender`]. The thread loops forever:
 //! find a port → open → read until error → wait & rescan.
 
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
+use parking_lot::Mutex;
 use serialport::SerialPortType;
 
 use crate::protocol::{Frame, FrameReader, BAUD};
@@ -18,6 +20,47 @@ pub enum SerialEvent {
     Connected(String),
     Disconnected { reason: String, retrying_in: Duration },
     Frame(Frame),
+}
+
+/// Writable handle to the current serial session. Cloned cheaply; holds `None`
+/// while disconnected. Used to push LED commands (`L`/`B`/`H`) back to the board
+/// (see LED-Steuerung.md). The read loop owns one clone of the port; this owns
+/// another (via `try_clone`) so writes don't contend with the blocking read.
+#[derive(Clone, Default)]
+pub struct SerialLink {
+    port: Arc<Mutex<Option<Box<dyn serialport::SerialPort>>>>,
+}
+
+impl SerialLink {
+    /// Write one newline-terminated command line. Returns false (and drops the
+    /// handle) if disconnected or the write fails.
+    pub fn write_line(&self, line: &str) -> bool {
+        let mut guard = self.port.lock();
+        let Some(port) = guard.as_mut() else { return false };
+        let mut buf = Vec::with_capacity(line.len() + 1);
+        buf.extend_from_slice(line.as_bytes());
+        buf.push(b'\n');
+        match port.write_all(&buf).and_then(|_| port.flush()) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("serial write failed: {e}");
+                *guard = None;
+                false
+            }
+        }
+    }
+
+    /// True while a board is connected and writable.
+    pub fn is_connected(&self) -> bool {
+        self.port.lock().is_some()
+    }
+
+    fn set(&self, port: Box<dyn serialport::SerialPort>) {
+        *self.port.lock() = Some(port);
+    }
+    fn clear(&self) {
+        *self.port.lock() = None;
+    }
 }
 
 /// Handle for the UI to nudge the serial worker — pressing "Retry now"
@@ -61,9 +104,11 @@ pub fn find_arduino_port() -> Option<String> {
     None
 }
 
-pub fn spawn(tx: Sender<SerialEvent>) -> RetryKicker {
+pub fn spawn(tx: Sender<SerialEvent>) -> (RetryKicker, SerialLink) {
     let kicker = RetryKicker::default();
+    let link = SerialLink::default();
     let thread_kicker = kicker.clone();
+    let thread_link = link.clone();
     std::thread::Builder::new()
         .name("slidr-serial".into())
         .spawn(move || {
@@ -72,7 +117,9 @@ pub fn spawn(tx: Sender<SerialEvent>) -> RetryKicker {
                 let attempted = match find_arduino_port() {
                     Some(port) => {
                         backoff = Duration::from_millis(750); // reset on success-of-find
-                        match run_session(&port, &tx) {
+                        let res = run_session(&port, &tx, &thread_link);
+                        thread_link.clear(); // session over: writes are no-ops again
+                        match res {
                             Ok(()) => {
                                 let _ = tx.send(SerialEvent::Disconnected {
                                     reason: "Device unplugged".into(),
@@ -119,7 +166,7 @@ pub fn spawn(tx: Sender<SerialEvent>) -> RetryKicker {
             }
         })
         .expect("spawn serial thread");
-    kicker
+    (kicker, link)
 }
 
 fn friendly(err: &str) -> String {
@@ -134,7 +181,7 @@ fn friendly(err: &str) -> String {
     }
 }
 
-fn run_session(port_name: &str, tx: &Sender<SerialEvent>) -> anyhow::Result<()> {
+fn run_session(port_name: &str, tx: &Sender<SerialEvent>, link: &SerialLink) -> anyhow::Result<()> {
     let mut sp = serialport::new(port_name, BAUD)
         .timeout(Duration::from_millis(100))
         .data_bits(serialport::DataBits::Eight)
@@ -146,6 +193,13 @@ fn run_session(port_name: &str, tx: &Sender<SerialEvent>) -> anyhow::Result<()> 
     // Toggle DTR to reset Arduino's bootloader path consistently.
     let _ = sp.write_data_terminal_ready(true);
     let _ = sp.write_request_to_send(false);
+
+    // A second handle on the same port for outbound LED commands. The read loop
+    // below keeps `sp`; the clone goes to the shared link for the actuator.
+    match sp.try_clone() {
+        Ok(writer) => link.set(writer),
+        Err(e) => log::warn!("serial: cannot clone port for writes ({e}); LED output disabled"),
+    }
 
     let _ = tx.send(SerialEvent::Connected(port_name.to_string()));
 

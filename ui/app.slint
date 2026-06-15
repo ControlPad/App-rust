@@ -31,6 +31,16 @@ export struct WizardResult {
     target-kind: int, category-id: int, kind: int,
     property: string, display: string,
 }
+// One LED toggle condition. Fields are interpreted by `kind`:
+//   kind 0 = device muted · 1 = volume compare · 2 = API call
+//   audio-kind 0 = process · 1 = microphone · 2 = output
+//   cmp 0 = below · 1 = above · 2 = exactly · method 0 GET..4 DELETE
+export struct LedConditionUI {
+    kind: int, audio-kind: int, target: string, target-index: int,
+    cmp: int, value: int,
+    method: int, url: string, payload: string, bearer: string,
+    interval: string, expect-body: string,
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // Atoms
@@ -99,11 +109,13 @@ component Select {
         background: Palette.alternate-background;
         border-width: 1px; border-radius: 8px;
         border-color: ta.has-hover ? Theme.accent-bg : Palette.border;
+        clip: true;
         // Label
         HorizontalLayout {
             padding-left: 12px; padding-right: 30px;
             Text { text: root.model[root.current-index];
                 font-family: "Inter"; font-size: 13px;
+                overflow: elide;
                 vertical-alignment: center; horizontal-stretch: 1; }
         }
         // Chevron pinned to the right edge (absolute, so it always hugs)
@@ -120,25 +132,36 @@ component Select {
         clicked => { popup.show(); }
     }
     popup := PopupWindow {
-        x: 0; y: root.height + 4px; width: root.field-width;
+        x: 0; y: root.height + 4px;
+        width: root.field-width;
+        // Explicit height so the background fills and long lists scroll (capped).
+        height: min(root.model.length * 36px + 8px, 320px);
         Rectangle {
+            width: root.field-width;
+            height: popup.height;
             background: Palette.background;
             border-width: 1px; border-color: Palette.border; border-radius: 8px;
             drop-shadow-blur: 16px; drop-shadow-color: #00000040;
-            VerticalLayout {
-                padding: 4px; spacing: 2px;
-                for opt[idx] in root.model: Rectangle {
-                    height: 34px; border-radius: 6px;
-                    background: idx == root.current-index ? Theme.accent-bg
-                              : oh.has-hover ? Palette.alternate-background : transparent;
-                    oh := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.current-index = idx; root.selected(idx); popup.close(); }
-                        HorizontalLayout { padding-left: 10px;
-                            Text { text: opt; font-family: "Inter"; font-size: 13px;
-                                vertical-alignment: center;
-                                color: idx == root.current-index ? Theme.accent-fg
-                                                                 : Palette.foreground; }
+            clip: true;
+            ScrollView {
+                width: parent.width;
+                height: parent.height;
+                VerticalLayout {
+                    padding: 4px; spacing: 2px;
+                    for opt[idx] in root.model: Rectangle {
+                        height: 34px; border-radius: 6px;
+                        background: idx == root.current-index ? Theme.accent-bg
+                                  : oh.has-hover ? Palette.alternate-background : transparent;
+                        oh := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.current-index = idx; root.selected(idx); popup.close(); }
+                            HorizontalLayout { padding-left: 10px; padding-right: 10px;
+                                Text { text: opt; font-family: "Inter"; font-size: 13px;
+                                    vertical-alignment: center; overflow: elide;
+                                    horizontal-stretch: 1;
+                                    color: idx == root.current-index ? Theme.accent-fg
+                                                                     : Palette.foreground; }
+                            }
                         }
                     }
                 }
@@ -1036,12 +1059,15 @@ component SettingsPage inherits VerticalBox {
     in-out property <float> curve-y1;
     in-out property <float> curve-x2;
     in-out property <float> curve-y2;
+    in-out property <bool> led-experimental;
     in property <string> build-stamp;
 
     callback theme-changed(int);
     callback dirty();
     callback curve-preset-changed(int);
     callback curve-changed();
+    callback led-save-state();
+    callback led-clear-state();
 
     spacing: 14px;
 
@@ -1146,6 +1172,34 @@ component SettingsPage inherits VerticalBox {
 
             Card {
                 VerticalBox { padding: 18px; spacing: 6px;
+                    Text { text: "LEDs (experimental)"; font-weight: 700; font-family: "Inter";
+                        font-size: 14px; }
+                    Rectangle { height: 6px; }
+                    SettingRow {
+                        label: "Enable LED control";
+                        description: "Drive the button LEDs (board buttons 5/6/7). Needs firmware with experimental=1.";
+                        HorizontalLayout { width: root.control-w; alignment: end;
+                            VerticalLayout { alignment: center;
+                                Toggle { checked <=> root.led-experimental;
+                                         toggled => { root.dirty(); } } } }
+                    }
+                    if root.led-experimental: SettingRow {
+                        label: "Board memory";
+                        description: "Save freezes the current look so it survives a restart; Clear turns all LEDs off and saves that.";
+                        HorizontalLayout { spacing: 8px; alignment: end;
+                            IconButton { label: "Save LED state"; primary: true;
+                                icon: @image-url("../assets/icons/check.svg");
+                                clicked => { root.led-save-state(); } }
+                            IconButton { label: "Clear";
+                                icon: @image-url("../assets/icons/x.svg");
+                                clicked => { root.led-clear-state(); } }
+                        }
+                    }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
                     Text { text: "System"; font-weight: 700; font-family: "Inter";
                         font-size: 14px; }
                     Rectangle { height: 6px; }
@@ -1186,8 +1240,10 @@ component SettingsPage inherits VerticalBox {
 component AssignPopup inherits Rectangle {
     in property <int> target-kind;
     in property <[AssignPick]> options;
+    in property <bool> has-led;
     callback cancel();
     callback choose(int);
+    callback configure-led();
 
     background: #00000099;
     TouchArea { clicked => { root.cancel(); } }
@@ -1217,6 +1273,9 @@ component AssignPopup inherits Rectangle {
                 }
             }
             HorizontalBox {
+                if root.has-led: IconButton { label: "Configure LED";
+                    icon: @image-url("../assets/icons/edit.svg");
+                    clicked => { root.configure-led(); } }
                 Rectangle { horizontal-stretch: 1; }
                 IconButton { label: "Cancel"; clicked => { root.cancel(); } }
             }
@@ -1616,6 +1675,297 @@ component WizardPopup inherits Rectangle {
     }
 }
 
+// Editor for one LED appearance (off / on / blink / breathe + timing + per-state
+// brightness, either fixed or synced to a device's live volume).
+component LedModeEditor inherits VerticalBox {
+    in property <string> title;
+    in-out property <int> kind;
+    in-out property <string> on-ms;
+    in-out property <string> off-ms;
+    in-out property <string> cycle-ms;
+    in-out property <int> bmode;        // 0 fixed, 1 sync to volume
+    in-out property <int> brightness;   // 0-100 (fixed)
+    in-out property <int> baudio;       // 0 process, 1 mic, 2 output
+    in-out property <string> btarget;
+    in property <int> btidx;            // initial picker index
+    in property <[string]> live-processes;
+    in property <[string]> live-mics;
+    in property <[string]> live-outputs;
+    spacing: 6px;
+
+    property <[string]> tlist: root.baudio == 0 ? root.live-processes
+                              : root.baudio == 1 ? root.live-mics : root.live-outputs;
+    property <int> bsel: root.btidx;
+
+    Text { text: root.title; font-weight: 600; font-family: "Inter"; font-size: 13px; }
+    Select { field-width: 200px; model: ["Off", "On", "Blink", "Breathe"];
+        current-index <=> root.kind; }
+    if root.kind == 2: HorizontalLayout { spacing: 8px;
+        VerticalLayout { spacing: 2px; horizontal-stretch: 1;
+            Text { text: "On (ms)"; font-size: 11px; font-family: "Inter";
+                color: Palette.foreground.with-alpha(0.7); }
+            LineEdit { text <=> root.on-ms; input-type: number; height: 32px; } }
+        VerticalLayout { spacing: 2px; horizontal-stretch: 1;
+            Text { text: "Off (ms)"; font-size: 11px; font-family: "Inter";
+                color: Palette.foreground.with-alpha(0.7); }
+            LineEdit { text <=> root.off-ms; input-type: number; height: 32px; } }
+    }
+    if root.kind == 3: VerticalLayout { spacing: 2px;
+        Text { text: "Cycle (ms)"; font-size: 11px; font-family: "Inter";
+            color: Palette.foreground.with-alpha(0.7); }
+        LineEdit { text <=> root.cycle-ms; input-type: number; height: 32px; } }
+
+    // Brightness — only meaningful when the LED is lit.
+    if root.kind != 0: VerticalLayout { spacing: 4px;
+        Text { text: "Brightness"; font-size: 11px; font-family: "Inter";
+            color: Palette.foreground.with-alpha(0.7); }
+        Select { field-width: 200px; model: ["Fixed", "Sync to volume"];
+            current-index <=> root.bmode; }
+        if root.bmode == 0: HorizontalLayout { spacing: 8px;
+            AccentSlider { minimum: 0; maximum: 100; value: root.brightness;
+                horizontal-stretch: 1;
+                changed(v) => { root.brightness = v; } }
+            Text { text: "\{root.brightness}%"; min-width: 36px;
+                horizontal-alignment: right; vertical-alignment: center;
+                font-family: "Inter"; }
+        }
+        if root.bmode == 1: VerticalLayout { spacing: 4px;
+            Select { field-width: 200px; model: ["Process", "Microphone", "Output"];
+                current-index <=> root.baudio; }
+            Select { field-width: 200px; model: root.tlist;
+                current-index <=> root.bsel;
+                selected(i) => { root.btarget = root.tlist[i]; } }
+        }
+    }
+}
+
+component LedConfigPopup inherits Rectangle {
+    in property <int> led-index;     // 0..2
+    in-out property <int> control;   // 0 conditional, 1 manual
+    in-out property <int> combine;   // 0 any, 1 all
+    in-out property <int> active-kind;
+    in-out property <string> active-on;
+    in-out property <string> active-off;
+    in-out property <string> active-cycle;
+    in-out property <int> active-bmode;
+    in-out property <int> active-bright;
+    in-out property <int> active-baudio;
+    in-out property <string> active-btarget;
+    in property <int> active-btidx;
+    in-out property <int> inactive-kind;
+    in-out property <string> inactive-on;
+    in-out property <string> inactive-off;
+    in-out property <string> inactive-cycle;
+    in-out property <int> inactive-bmode;
+    in-out property <int> inactive-bright;
+    in-out property <int> inactive-baudio;
+    in-out property <string> inactive-btarget;
+    in property <int> inactive-btidx;
+    in property <[LedConditionUI]> conditions;
+    in property <[string]> live-processes;
+    in property <[string]> live-mics;
+    in property <[string]> live-outputs;
+    in property <bool> live-active;
+
+    callback cancel();
+    callback save();
+    callback add-condition();
+    callback remove-condition(int);
+    callback refresh();
+    callback manual-toggle();
+    callback cond-kind(int, int);
+    callback cond-audio(int, int);
+    callback cond-target(int, string);
+    callback cond-cmp(int, int);
+    callback cond-value(int, int);
+    callback cond-method(int, int);
+    callback cond-url(int, string);
+    callback cond-payload(int, string);
+    callback cond-bearer(int, string);
+    callback cond-interval(int, string);
+    callback cond-expect(int, string);
+
+    background: #00000099;
+    TouchArea { clicked => { root.cancel(); } }
+
+    Rectangle {
+        x: parent.width / 2 - self.width / 2;
+        y: parent.height / 2 - self.height / 2;
+        width: 640px; height: 680px;
+        background: Palette.background;
+        border-radius: 14px; border-width: 1px; border-color: Palette.border;
+        TouchArea {}
+        VerticalBox {
+            padding: 22px; spacing: 14px;
+
+            Text { text: "Configure LED — Button \{root.led-index + 5}";
+                font-size: 20px; font-weight: 700; font-family: "Inter"; }
+
+            // Control mode selector
+            HorizontalLayout { spacing: 8px;
+                for opt[i] in ["Conditional", "Manual"]: Rectangle {
+                    border-radius: 8px; height: 40px; horizontal-stretch: 1;
+                    background: i == root.control ? Theme.accent-bg.with-alpha(0.18)
+                                                  : Palette.alternate-background;
+                    border-width: 1px;
+                    border-color: i == root.control ? Theme.accent-bg : Palette.border;
+                    TouchArea { mouse-cursor: pointer; clicked => { root.control = i; }
+                        Text { text: opt; horizontal-alignment: center; vertical-alignment: center;
+                            font-family: "Inter"; font-weight: i == root.control ? 600 : 500; } }
+                }
+            }
+
+            ScrollView {
+                mouse-drag-pan-enabled: false;
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 12px; alignment: start;
+
+                    // Appearance editors (active vs inactive)
+                    HorizontalLayout { spacing: 16px;
+                        LedModeEditor { horizontal-stretch: 1; title: "Active appearance";
+                            kind <=> root.active-kind; on-ms <=> root.active-on;
+                            off-ms <=> root.active-off; cycle-ms <=> root.active-cycle;
+                            bmode <=> root.active-bmode; brightness <=> root.active-bright;
+                            baudio <=> root.active-baudio; btarget <=> root.active-btarget;
+                            btidx: root.active-btidx;
+                            live-processes: root.live-processes; live-mics: root.live-mics;
+                            live-outputs: root.live-outputs; }
+                        LedModeEditor { horizontal-stretch: 1; title: "Inactive appearance";
+                            kind <=> root.inactive-kind; on-ms <=> root.inactive-on;
+                            off-ms <=> root.inactive-off; cycle-ms <=> root.inactive-cycle;
+                            bmode <=> root.inactive-bmode; brightness <=> root.inactive-bright;
+                            baudio <=> root.inactive-baudio; btarget <=> root.inactive-btarget;
+                            btidx: root.inactive-btidx;
+                            live-processes: root.live-processes; live-mics: root.live-mics;
+                            live-outputs: root.live-outputs; }
+                    }
+
+                    // Manual panel
+                    if root.control == 1: Rectangle {
+                        border-radius: 10px; background: Palette.alternate-background;
+                        border-width: 1px; border-color: Palette.border;
+                        VerticalBox { padding: 14px; spacing: 8px;
+                            Text { text: "Manual mode — pressing the button toggles the LED between the active and inactive appearance. Save to apply; the LED then responds live.";
+                                font-family: "Inter"; font-size: 12px;
+                                color: Palette.foreground.with-alpha(0.7); wrap: word-wrap; }
+                            HorizontalLayout { spacing: 10px;
+                                Text { text: "Currently: \{root.live-active ? "Active" : "Inactive"}";
+                                    font-family: "Inter"; font-weight: 600; vertical-alignment: center;
+                                    horizontal-stretch: 1; }
+                                IconButton { label: "Toggle state"; primary: true;
+                                    clicked => { root.manual-toggle(); } }
+                            }
+                        }
+                    }
+
+                    // Conditional panel
+                    if root.control == 0: VerticalBox {
+                        spacing: 10px;
+                        HorizontalLayout { spacing: 8px;
+                            Text { text: "Conditions"; font-weight: 600; font-family: "Inter";
+                                font-size: 14px; vertical-alignment: center; horizontal-stretch: 1; }
+                            if root.conditions.length > 1: Select { field-width: 150px;
+                                model: ["Active if ANY", "Active if ALL"];
+                                current-index <=> root.combine; }
+                            IconButton { icon: @image-url("../assets/icons/refresh.svg");
+                                label: "Refresh"; clicked => { root.refresh(); } }
+                        }
+
+                        if root.conditions.length == 0: Text {
+                            text: "No conditions yet — the LED stays inactive. Add one below.";
+                            font-family: "Inter"; font-italic: true;
+                            color: Palette.foreground.with-alpha(0.5); }
+
+                        for c[idx] in root.conditions: cond-row := Rectangle {
+                            property <int> vlocal: c.value;
+                            property <[string]> tlist: c.audio-kind == 0 ? root.live-processes
+                                : c.audio-kind == 1 ? root.live-mics : root.live-outputs;
+                            property <int> tsel: c.target-index;
+                            border-radius: 10px; background: Palette.alternate-background;
+                            border-width: 1px; border-color: Palette.border;
+                            VerticalBox { padding: 12px; spacing: 8px;
+                                HorizontalLayout { spacing: 8px;
+                                    Select { field-width: 170px;
+                                        model: ["Device muted", "Volume", "API call"];
+                                        current-index: c.kind;
+                                        selected(i) => { root.cond-kind(idx, i); } }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    SquareIconButton { icon: @image-url("../assets/icons/x.svg");
+                                        clicked => { root.remove-condition(idx); } }
+                                }
+                                if c.kind == 0 || c.kind == 1: HorizontalLayout { spacing: 8px;
+                                    Select { field-width: 150px;
+                                        model: ["Process", "Microphone", "Output"];
+                                        current-index: c.audio-kind;
+                                        selected(i) => { root.cond-audio(idx, i); } }
+                                    Select { field-width: 250px;
+                                        model: cond-row.tlist;
+                                        current-index <=> cond-row.tsel;
+                                        selected(i) => { root.cond-target(idx, cond-row.tlist[i]); } }
+                                }
+                                if c.kind == 1: HorizontalLayout { spacing: 8px;
+                                    Select { field-width: 130px;
+                                        model: ["Below", "Above", "Exactly"];
+                                        current-index: c.cmp;
+                                        selected(i) => { root.cond-cmp(idx, i); } }
+                                    AccentSlider { minimum: 0; maximum: 100; value: cond-row.vlocal;
+                                        horizontal-stretch: 1;
+                                        changed(v) => { cond-row.vlocal = v; root.cond-value(idx, v); } }
+                                    Text { text: "\{cond-row.vlocal}%"; min-width: 40px;
+                                        horizontal-alignment: right; vertical-alignment: center;
+                                        font-family: "Inter"; }
+                                }
+                                if c.kind == 2: VerticalBox { spacing: 6px;
+                                    HorizontalLayout { spacing: 8px;
+                                        Select { field-width: 110px;
+                                            model: ["GET", "POST", "PUT", "PATCH", "DELETE"];
+                                            current-index: c.method;
+                                            selected(i) => { root.cond-method(idx, i); } }
+                                        LineEdit { horizontal-stretch: 1; height: 34px;
+                                            text: c.url; placeholder-text: "https://api.example.com/state";
+                                            edited(t) => { root.cond-url(idx, t); } }
+                                    }
+                                    HorizontalLayout { spacing: 8px;
+                                        VerticalLayout { spacing: 2px; horizontal-stretch: 1;
+                                            Text { text: "Check interval (ms)"; font-size: 11px;
+                                                font-family: "Inter"; color: Palette.foreground.with-alpha(0.7); }
+                                            LineEdit { text: c.interval; input-type: number; height: 32px;
+                                                edited(t) => { root.cond-interval(idx, t); } } }
+                                        VerticalLayout { spacing: 2px; horizontal-stretch: 2;
+                                            Text { text: "Active when body contains"; font-size: 11px;
+                                                font-family: "Inter"; color: Palette.foreground.with-alpha(0.7); }
+                                            LineEdit { text: c.expect-body; height: 32px;
+                                                placeholder-text: "empty = any 2xx response";
+                                                edited(t) => { root.cond-expect(idx, t); } } }
+                                    }
+                                    LineEdit { text: c.bearer; height: 32px;
+                                        placeholder-text: "Bearer token (optional)";
+                                        edited(t) => { root.cond-bearer(idx, t); } }
+                                    LineEdit { text: c.payload; height: 32px;
+                                        placeholder-text: "Payload (optional JSON)";
+                                        edited(t) => { root.cond-payload(idx, t); } }
+                                }
+                            }
+                        }
+
+                        IconButton { icon: @image-url("../assets/icons/plus.svg");
+                            label: "Add condition"; clicked => { root.add-condition(); } }
+                    }
+                }
+            }
+
+            HorizontalBox {
+                IconButton { label: "Cancel"; clicked => { root.cancel(); } }
+                Rectangle { horizontal-stretch: 1; }
+                IconButton { label: "Save"; primary: true;
+                    icon: @image-url("../assets/icons/check.svg");
+                    clicked => { root.save(); } }
+            }
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Window
 // ──────────────────────────────────────────────────────────────────────────
@@ -1653,6 +2003,7 @@ export component AppWindow inherits Window {
     in-out property <int> theme-index;
     in-out property <int> accent-preset: 0;
     in-out property <int> dead-zone;
+    in-out property <bool> led-experimental;
     in-out property <bool> unmute-on-change;
     in-out property <bool> start-with-os;
     in-out property <bool> start-minimized;
@@ -1670,6 +2021,32 @@ export component AppWindow inherits Window {
     in-out property <bool> assign-popup-open: false;
     in-out property <int> assign-target-kind: 0;
     in-out property <int> assign-target-index: 0;
+
+    // ── Configure-LED popup state ──
+    in-out property <bool> led-popup-open: false;
+    in-out property <int> led-index: 0;            // 0..2
+    in-out property <int> led-control: 0;
+    in-out property <int> led-combine: 0;
+    in-out property <int> led-active-kind: 1;
+    in-out property <string> led-active-on: "500";
+    in-out property <string> led-active-off: "500";
+    in-out property <string> led-active-cycle: "2000";
+    in-out property <int> led-active-bmode: 0;
+    in-out property <int> led-active-bright: 80;
+    in-out property <int> led-active-baudio: 0;
+    in-out property <string> led-active-btarget: "";
+    in-out property <int> led-active-btidx: -1;
+    in-out property <int> led-inactive-kind: 0;
+    in-out property <string> led-inactive-on: "500";
+    in-out property <string> led-inactive-off: "500";
+    in-out property <string> led-inactive-cycle: "2000";
+    in-out property <int> led-inactive-bmode: 0;
+    in-out property <int> led-inactive-bright: 80;
+    in-out property <int> led-inactive-baudio: 0;
+    in-out property <string> led-inactive-btarget: "";
+    in-out property <int> led-inactive-btidx: -1;
+    in property <[LedConditionUI]> led-conditions;
+    in-out property <bool> led-live-active;
 
     in-out property <bool> preset-popup-open: false;
     in-out property <bool> sidebar-collapsed: false;
@@ -1733,6 +2110,30 @@ export component AppWindow inherits Window {
     callback export-preset(string);
     callback import-preset();
     callback create-preset(string);
+
+    // ── LED state persistence (board EEPROM) ──
+    callback led-save-state();
+    callback led-clear-state();
+
+    // ── Configure-LED ──
+    callback open-led-config(int);   // button index
+    callback led-save();
+    callback led-cancel();
+    callback led-add-condition();
+    callback led-remove-condition(int);
+    callback led-refresh();
+    callback led-manual-toggle();
+    callback led-cond-kind(int, int);
+    callback led-cond-audio(int, int);
+    callback led-cond-target(int, string);
+    callback led-cond-cmp(int, int);
+    callback led-cond-value(int, int);
+    callback led-cond-method(int, int);
+    callback led-cond-url(int, string);
+    callback led-cond-payload(int, string);
+    callback led-cond-bearer(int, string);
+    callback led-cond-interval(int, string);
+    callback led-cond-expect(int, string);
 
     HorizontalBox {
         padding: 0; spacing: 0;
@@ -1933,6 +2334,7 @@ export component AppWindow inherits Window {
                     theme-index <=> root.theme-index;
                     accent-preset <=> root.accent-preset;
                     dead-zone <=> root.dead-zone;
+                    led-experimental <=> root.led-experimental;
                     unmute-on-change <=> root.unmute-on-change;
                     start-with-os <=> root.start-with-os;
                     start-minimized <=> root.start-minimized;
@@ -1948,6 +2350,8 @@ export component AppWindow inherits Window {
                     dirty => { root.save-settings(); }
                     curve-preset-changed(i) => { root.curve-preset-changed(i); }
                     curve-changed => { root.curve-changed(); }
+                    led-save-state => { root.led-save-state(); }
+                    led-clear-state => { root.led-clear-state(); }
                 }
             }
         }
@@ -1956,11 +2360,64 @@ export component AppWindow inherits Window {
     if root.assign-popup-open: AssignPopup {
         target-kind: root.assign-target-kind;
         options: root.assign-options;
+        has-led: root.assign-target-kind == 1 && root.led-experimental
+                 && (root.assign-target-index == 4 || root.assign-target-index == 5
+                     || root.assign-target-index == 6);
         cancel => { root.assign-popup-open = false; }
         choose(id) => {
             root.apply-assign(id);
             root.assign-popup-open = false;
         }
+        configure-led => {
+            root.assign-popup-open = false;
+            root.open-led-config(root.assign-target-index);
+        }
+    }
+
+    if root.led-popup-open: LedConfigPopup {
+        led-index: root.led-index;
+        control <=> root.led-control;
+        combine <=> root.led-combine;
+        active-kind <=> root.led-active-kind;
+        active-on <=> root.led-active-on;
+        active-off <=> root.led-active-off;
+        active-cycle <=> root.led-active-cycle;
+        active-bmode <=> root.led-active-bmode;
+        active-bright <=> root.led-active-bright;
+        active-baudio <=> root.led-active-baudio;
+        active-btarget <=> root.led-active-btarget;
+        active-btidx: root.led-active-btidx;
+        inactive-kind <=> root.led-inactive-kind;
+        inactive-on <=> root.led-inactive-on;
+        inactive-off <=> root.led-inactive-off;
+        inactive-cycle <=> root.led-inactive-cycle;
+        inactive-bmode <=> root.led-inactive-bmode;
+        inactive-bright <=> root.led-inactive-bright;
+        inactive-baudio <=> root.led-inactive-baudio;
+        inactive-btarget <=> root.led-inactive-btarget;
+        inactive-btidx: root.led-inactive-btidx;
+        conditions: root.led-conditions;
+        live-processes: root.live-processes;
+        live-mics: root.live-mics;
+        live-outputs: root.live-outputs;
+        live-active: root.led-live-active;
+        cancel => { root.led-cancel(); }
+        save => { root.led-save(); }
+        add-condition => { root.led-add-condition(); }
+        remove-condition(i) => { root.led-remove-condition(i); }
+        refresh => { root.led-refresh(); }
+        manual-toggle => { root.led-manual-toggle(); }
+        cond-kind(i, v) => { root.led-cond-kind(i, v); }
+        cond-audio(i, v) => { root.led-cond-audio(i, v); }
+        cond-target(i, v) => { root.led-cond-target(i, v); }
+        cond-cmp(i, v) => { root.led-cond-cmp(i, v); }
+        cond-value(i, v) => { root.led-cond-value(i, v); }
+        cond-method(i, v) => { root.led-cond-method(i, v); }
+        cond-url(i, v) => { root.led-cond-url(i, v); }
+        cond-payload(i, v) => { root.led-cond-payload(i, v); }
+        cond-bearer(i, v) => { root.led-cond-bearer(i, v); }
+        cond-interval(i, v) => { root.led-cond-interval(i, v); }
+        cond-expect(i, v) => { root.led-cond-expect(i, v); }
     }
 
     if root.wizard-open: WizardPopup {

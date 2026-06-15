@@ -29,6 +29,20 @@ pub enum Cmd {
     /// Switch the default output to the next device in the list (wrapping).
     /// Empty list = cycle through all active output endpoints.
     CycleOutput(Vec<String>),
+
+    // ── Experimental LED control ──
+    /// Replace the full per-LED configuration set.
+    SetLeds(Box<[Option<crate::model::LedConfig>; crate::model::NUM_LEDS]>),
+    /// Enable/disable LED output globally (experimental toggle).
+    SetLedExperimental(bool),
+    /// Toggle a manual-mode LED's active state (led index 0..2).
+    LedManualToggle(u8),
+    /// The board (re)connected — re-push all LED state.
+    SerialConnected,
+    /// Persist the current live LED state to the board's EEPROM (`S`).
+    LedSaveState,
+    /// Turn all LEDs off and persist that to EEPROM (clear the saved look).
+    LedClearSaved,
 }
 
 /// Snapshot pushed to the UI on every dispatch tick.
@@ -149,6 +163,18 @@ impl EventEngine {
             }
             self.prev_buttons[i] = cur;
             changed = true;
+
+            // Experimental: a manual-mode LED toggles on its button's press edge,
+            // independent of any category action assigned to that button.
+            if cur == 1 {
+                if let Some(led) = crate::model::led_for_button(i) {
+                    if let Some(cfg) = &preset.leds[led] {
+                        if cfg.control == crate::model::LedControl::Manual {
+                            cmds.push(Cmd::LedManualToggle(led as u8));
+                        }
+                    }
+                }
+            }
 
             let Some(cat) = preset.button_category(i) else { continue };
             for action in &cat.actions {

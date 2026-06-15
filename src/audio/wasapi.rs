@@ -265,6 +265,38 @@ impl AudioBackend for WasapiBackend {
         }
     }
 
+    fn get_volume(&self, target: VolumeTarget<'_>) -> Option<f32> {
+        match target {
+            VolumeTarget::Process(p) => {
+                let mut vol = None;
+                self.for_each_process_session(p, |ctl, _| unsafe {
+                    if let Ok(sv) = ctl.cast::<ISimpleAudioVolume>() {
+                        if let Ok(v) = sv.GetMasterVolume() {
+                            vol = Some(v);
+                        }
+                    }
+                });
+                vol
+            }
+            VolumeTarget::Mic(m) => {
+                let _g = self.lock.lock().unwrap();
+                let dev = self.find_device(1, m).ok()?;
+                let ep = self.endpoint_volume(&dev).ok()?;
+                unsafe { ep.GetMasterVolumeLevelScalar().ok() }
+            }
+            VolumeTarget::System(name) => {
+                let _g = self.lock.lock().unwrap();
+                let dev = match name {
+                    Some(n) => self.find_device(0, n),
+                    None => self.default_device(0),
+                }
+                .ok()?;
+                let ep = self.endpoint_volume(&dev).ok()?;
+                unsafe { ep.GetMasterVolumeLevelScalar().ok() }
+            }
+        }
+    }
+
     fn list_outputs(&self) -> Vec<String> {
         list_devices(&self.enumerator, 0)
     }

@@ -39,6 +39,9 @@ dirs = "5"
 # Serial + hotplug
 serialport = "4"
 
+# HTTP client for LED "API" state-check conditions (blocking, rustls TLS).
+ureq = "2"
+
 # UI — Slint with Material style
 slint = { version = "1.16", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg"] }
 

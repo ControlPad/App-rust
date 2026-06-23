@@ -13,13 +13,16 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use crate::audio::AudioBackend;
 use crate::events::EventEngine;
 use crate::model::{
-    next_id, ActionKind, ApiCall, AudioStream, ButtonAction, ButtonCategory, HttpMethod, Preset,
-    Settings, SliderCategory, ThemeMode,
+    led_for_button, next_id, ActionKind, ApiCall, AudioKind, AudioStream, BrightnessMode,
+    ButtonAction, ButtonCategory, CombineLogic, Comparison, HttpMethod, LedCondition,
+    LedConditionKind, LedConfig, LedControl, LedMode, LedModeKind, Preset, Settings, SliderCategory,
+    ThemeMode,
 };
 use crate::protocol::{Frame, NUM_BUTTONS, NUM_SLIDERS};
 use crate::serial::{RetryKicker, SerialEvent};
 use crate::{
-    AppWindow, AssignPick, ButtonCell, CategorySummary, LineItem, PickerEntry, SliderCell, WizardResult,
+    AppWindow, AssignPick, ButtonCell, CategorySummary, LedConditionUI, LineItem, PickerEntry,
+    SliderCell, WizardResult,
 };
 
 pub struct Shared {
@@ -29,11 +32,26 @@ pub struct Shared {
     pub audio: Arc<dyn AudioBackend>,
     pub cmd_tx: crossbeam_channel::Sender<crate::events::Cmd>,
     pub kicker: RetryKicker,
+    /// Live LED state published by the actuator (for the configure-LED popup).
+    pub led_state: crate::led::LedStateHandle,
     pub pending_assign: Option<(i32, i32)>,
     pub pending_wizard: Option<(i32, u32)>,
     pub pending_retry_deadline: Option<Instant>,
     /// When editing an existing category entry, the index being replaced.
     pub editing_idx: Option<usize>,
+    /// Working copy for the configure-LED popup: (led index, config being edited).
+    pub editing_led: Option<(usize, LedConfig)>,
+}
+
+impl Shared {
+    /// Push the full LED configuration set + brightness + experimental flag to
+    /// the actuator's LED engine. Call after any change to LED config/settings.
+    pub fn push_leds(&self) {
+        let _ = self.cmd_tx.send(crate::events::Cmd::SetLedExperimental(self.settings.led_experimental));
+        let _ = self
+            .cmd_tx
+            .send(crate::events::Cmd::SetLeds(Box::new(self.preset.leds.clone())));
+    }
 }
 
 pub fn wire(
@@ -50,6 +68,7 @@ pub fn wire(
         push_settings_to_ui(ui, &s.settings, &s.preset.settings);
         push_preset_to_ui(ui, &s.preset);
         apply_appearance(ui, &s.preset.settings);
+        s.push_leds();
     }
 
     // Empty initial slider/button cells.
@@ -145,6 +164,7 @@ pub fn wire(
                     push_preset_to_ui(&ui, &s.preset);
                     push_settings_to_ui(&ui, &s.settings, &s.preset.settings);
                     apply_appearance(&ui, &s.preset.settings);
+                    s.push_leds();
                     refresh_home(&ui, &s);
                     toast(&ui, &format!("Created profile: {name}"));
                 }
@@ -616,6 +636,8 @@ pub fn wire(
             let _ = crate::autostart::set_enabled(s.settings.start_with_os, s.settings.start_minimized);
             // Live-apply appearance (accent / theme) immediately.
             apply_appearance(&ui, &s.preset.settings);
+            // LED brightness / experimental flag may have changed.
+            s.push_leds();
         });
     }
     {
@@ -646,6 +668,7 @@ pub fn wire(
                 push_preset_to_ui(&ui, &s.preset);
                 push_settings_to_ui(&ui, &s.settings, &s.preset.settings);
                 apply_appearance(&ui, &s.preset.settings);
+                s.push_leds();
                 // Refresh Home immediately with the new assignments using the
                 // last live readings — no board input required.
                 refresh_home(&ui, &s);
@@ -677,6 +700,223 @@ pub fn wire(
         });
     }
 
+    // ─── LED state persistence (board EEPROM) ──────────────────────────────
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_led_save_state(move || {
+            shared.lock().cmd_tx.send(crate::events::Cmd::LedSaveState).ok();
+            if let Some(ui) = weak.upgrade() {
+                toast(&ui, if ui.get_connected() { "Saved LED state to the board." }
+                           else { "Not connected — connect the board first." });
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_led_clear_state(move || {
+            shared.lock().cmd_tx.send(crate::events::Cmd::LedClearSaved).ok();
+            if let Some(ui) = weak.upgrade() {
+                toast(&ui, if ui.get_connected() { "Cleared saved LED state (all off)." }
+                           else { "Not connected — connect the board first." });
+            }
+        });
+    }
+
+    // ─── configure LED ─────────────────────────────────────────────────────
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_open_led_config(move |btn| {
+            let Some(led) = led_for_button(btn as usize) else { return };
+            let cfg = {
+                let mut s = shared.lock();
+                let cfg = s.preset.leds[led].clone().unwrap_or_default();
+                s.editing_led = Some((led, cfg.clone()));
+                cfg
+            };
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_led_index(led as i32);
+            ui.set_led_control(if cfg.control == LedControl::Manual { 1 } else { 0 });
+            ui.set_led_combine(if cfg.combine == CombineLogic::All { 1 } else { 0 });
+            // Populate the device lists first so target indices resolve.
+            populate_live_lists(&ui, shared.clone());
+            push_mode_to_ui(&ui, &cfg.active, true);
+            push_mode_to_ui(&ui, &cfg.inactive, false);
+            push_led_conditions(&ui, &cfg.conditions);
+            ui.set_led_live_active(false);
+            ui.set_led_popup_open(true);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_led_cancel(move || {
+            shared.lock().editing_led = None;
+            if let Some(ui) = weak.upgrade() { ui.set_led_popup_open(false); }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_led_save(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut s = shared.lock();
+            let Some((led, mut cfg)) = s.editing_led.take() else { return };
+            cfg.control = if ui.get_led_control() == 1 { LedControl::Manual } else { LedControl::Conditional };
+            cfg.combine = if ui.get_led_combine() == 1 { CombineLogic::All } else { CombineLogic::Any };
+            cfg.active = led_mode_from_ui(
+                ui.get_led_active_kind(),
+                ui.get_led_active_on().as_str(),
+                ui.get_led_active_off().as_str(),
+                ui.get_led_active_cycle().as_str(),
+                ui.get_led_active_bmode(),
+                ui.get_led_active_bright(),
+                ui.get_led_active_baudio(),
+                ui.get_led_active_btarget().as_str(),
+            );
+            cfg.inactive = led_mode_from_ui(
+                ui.get_led_inactive_kind(),
+                ui.get_led_inactive_on().as_str(),
+                ui.get_led_inactive_off().as_str(),
+                ui.get_led_inactive_cycle().as_str(),
+                ui.get_led_inactive_bmode(),
+                ui.get_led_inactive_bright(),
+                ui.get_led_inactive_baudio(),
+                ui.get_led_inactive_btarget().as_str(),
+            );
+            s.preset.leds[led] = Some(cfg);
+            let _ = crate::storage::save_preset(&s.preset);
+            s.push_leds();
+            drop(s);
+            ui.set_led_popup_open(false);
+            toast(&ui, "LED saved.");
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_led_add_condition(move || {
+            let conds = {
+                let mut s = shared.lock();
+                let Some((_, cfg)) = s.editing_led.as_mut() else { return };
+                cfg.conditions.push(LedCondition::default());
+                cfg.conditions.clone()
+            };
+            if let Some(ui) = weak.upgrade() { push_led_conditions(&ui, &conds); }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_led_remove_condition(move |idx| {
+            let conds = {
+                let mut s = shared.lock();
+                let Some((_, cfg)) = s.editing_led.as_mut() else { return };
+                let i = idx as usize;
+                if i < cfg.conditions.len() { cfg.conditions.remove(i); }
+                cfg.conditions.clone()
+            };
+            if let Some(ui) = weak.upgrade() { push_led_conditions(&ui, &conds); }
+        });
+    }
+    {
+        let shared = shared.clone();
+        let weak = ui.as_weak();
+        ui.on_led_refresh(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            populate_live_lists(&ui, shared.clone());
+            // Re-resolve dropdown indices against the freshly scanned lists.
+            let conds = shared.lock().editing_led.as_ref().map(|(_, c)| c.conditions.clone());
+            if let Some(conds) = conds {
+                push_led_conditions(&ui, &conds);
+            }
+            ui.set_led_active_btidx(list_index_of(&ui, ui.get_led_active_baudio(), ui.get_led_active_btarget().as_str()));
+            ui.set_led_inactive_btidx(list_index_of(&ui, ui.get_led_inactive_baudio(), ui.get_led_inactive_btarget().as_str()));
+        });
+    }
+    {
+        let shared = shared.clone();
+        ui.on_led_manual_toggle(move || {
+            let mut s = shared.lock();
+            let Some((led, cfg)) = s.editing_led.as_mut() else { return };
+            cfg.manual_active = !cfg.manual_active;
+            let led = *led;
+            let _ = s.cmd_tx.send(crate::events::Cmd::LedManualToggle(led as u8));
+            if let Some(saved) = s.preset.leds.get_mut(led).and_then(|c| c.as_mut()) {
+                if saved.control == LedControl::Manual {
+                    saved.manual_active = !saved.manual_active;
+                    let _ = crate::storage::save_preset(&s.preset);
+                }
+            }
+        });
+    }
+    // Per-field condition mutators. Structural edits (kind/audio) re-push the
+    // model so dependent fields show/hide; scalar/text edits update in place.
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_led_cond_kind(move |idx, v| {
+            let conds = mutate_cond_struct(&shared, idx, |c| c.kind = cond_kind_from(v));
+            if let (Some(ui), Some(conds)) = (weak.upgrade(), conds) { push_led_conditions(&ui, &conds); }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_led_cond_audio(move |idx, v| {
+            // Changing the endpoint family invalidates the previously picked target.
+            let conds = mutate_cond_struct(&shared, idx, |c| {
+                c.audio_kind = audio_kind_from(v);
+                c.target = None;
+            });
+            if let (Some(ui), Some(conds)) = (weak.upgrade(), conds) { push_led_conditions(&ui, &conds); }
+        });
+    }
+    {
+        let shared = shared.clone();
+        ui.on_led_cond_target(move |idx, v| {
+            mutate_cond(&shared, idx, |c| c.target = opt(v.as_str()));
+        });
+    }
+    {
+        let shared = shared.clone();
+        ui.on_led_cond_cmp(move |idx, v| { mutate_cond(&shared, idx, |c| c.cmp = cmp_from(v)); });
+    }
+    {
+        let shared = shared.clone();
+        ui.on_led_cond_value(move |idx, v| { mutate_cond(&shared, idx, |c| c.value = v.clamp(0, 100) as u8); });
+    }
+    {
+        let shared = shared.clone();
+        ui.on_led_cond_method(move |idx, v| { mutate_cond(&shared, idx, |c| c.api.method = HttpMethod::from_index(v)); });
+    }
+    {
+        let shared = shared.clone();
+        ui.on_led_cond_url(move |idx, v| { mutate_cond(&shared, idx, |c| c.api.url = v.to_string()); });
+    }
+    {
+        let shared = shared.clone();
+        ui.on_led_cond_payload(move |idx, v| { mutate_cond(&shared, idx, |c| c.api.payload = opt(v.as_str())); });
+    }
+    {
+        let shared = shared.clone();
+        ui.on_led_cond_bearer(move |idx, v| { mutate_cond(&shared, idx, |c| c.api.bearer = opt(v.as_str())); });
+    }
+    {
+        let shared = shared.clone();
+        ui.on_led_cond_interval(move |idx, v| {
+            if let Ok(n) = v.as_str().trim().parse::<u32>() {
+                mutate_cond(&shared, idx, |c| c.api.interval_ms = n);
+            }
+        });
+    }
+    {
+        let shared = shared.clone();
+        ui.on_led_cond_expect(move |idx, v| { mutate_cond(&shared, idx, |c| c.api.expect_body = opt(v.as_str())); });
+    }
+
     // ─── serial event pump ────────────────────────────────────────────────
     let weak = ui.as_weak();
     let timer = slint::Timer::default();
@@ -691,6 +931,8 @@ pub fn wire(
                     ui.set_connected(true);
                     ui.set_connection_msg(format!("Connected on {port}").into());
                     ui.set_retry_eta_secs(-1.0);
+                    // Board reset on connect; re-push all desired LED state.
+                    s.push_leds();
                     changed = true;
                 }
                 SerialEvent::Disconnected { reason, retrying_in } => {
@@ -705,13 +947,32 @@ pub fn wire(
                     // Cheap diff on the UI thread; side effects go to the actuator.
                     let preset = s.preset.clone();
                     let (dirty, cmds) = s.engine.ingest(&frame, &preset);
+                    let mut led_toggled = false;
                     for cmd in cmds {
+                        // Persist a manual-LED toggle into the preset so it
+                        // survives a restart (the actuator owns the live state).
+                        if let crate::events::Cmd::LedManualToggle(led) = &cmd {
+                            if let Some(cfg) = s.preset.leds.get_mut(*led as usize).and_then(|c| c.as_mut()) {
+                                cfg.manual_active = !cfg.manual_active;
+                                led_toggled = true;
+                            }
+                        }
                         let _ = s.cmd_tx.send(cmd);
+                    }
+                    if led_toggled {
+                        let _ = crate::storage::save_preset(&s.preset);
                     }
                     if dirty { changed = true; }
                 }
             }
         }
+        // Mirror live LED state into the configure popup (manual-mode readout).
+        if ui.get_led_popup_open() {
+            let led = ui.get_led_index() as usize;
+            let active = s.led_state.lock().get(led).map(|l| l.active).unwrap_or(false);
+            ui.set_led_live_active(active);
+        }
+
         // Animate retry countdown even between events.
         if let Some(deadline) = s.pending_retry_deadline {
             let remaining = deadline.saturating_duration_since(Instant::now()).as_secs_f32();
@@ -915,6 +1176,7 @@ fn push_settings_to_ui(ui: &AppWindow, global: &Settings, profile: &crate::model
     ui.set_start_with_os(global.start_with_os);
     ui.set_start_minimized(global.start_minimized);
     ui.set_minimize_to_tray(global.minimize_to_tray);
+    ui.set_led_experimental(global.led_experimental);
     ui.set_active_preset_name(global.active_preset.clone().into());
     // Appearance + sliders (profile)
     ui.set_theme_index(match profile.theme {
@@ -941,6 +1203,7 @@ fn pull_global_from_ui(ui: &AppWindow, g: &mut Settings) {
     g.start_with_os = ui.get_start_with_os();
     g.start_minimized = ui.get_start_minimized();
     g.minimize_to_tray = ui.get_minimize_to_tray();
+    g.led_experimental = ui.get_led_experimental();
 }
 
 fn pull_profile_from_ui(ui: &AppWindow, p: &mut crate::model::ProfileSettings) {
@@ -1161,6 +1424,158 @@ fn list_running_processes() -> Vec<String> {
         let _ = CloseHandle(snap);
     }
     out
+}
+
+// ── LED config <-> UI conversions ──────────────────────────────────────────
+
+fn opt(s: &str) -> Option<String> {
+    if s.is_empty() { None } else { Some(s.to_string()) }
+}
+
+fn led_mode_kind_to(k: LedModeKind) -> i32 {
+    match k { LedModeKind::Off => 0, LedModeKind::On => 1, LedModeKind::Blink => 2, LedModeKind::Breathe => 3 }
+}
+fn audio_kind_to(k: AudioKind) -> i32 {
+    match k { AudioKind::Process => 0, AudioKind::Mic => 1, AudioKind::Output => 2 }
+}
+
+/// Snapshot a UI string-model into a Vec.
+fn ui_list(model: &ModelRc<SharedString>) -> Vec<String> {
+    (0..model.row_count()).filter_map(|i| model.row_data(i)).map(|s| s.to_string()).collect()
+}
+
+/// Index of `target` within the live list for audio kind `audio` (-1 if absent).
+fn list_index_of(ui: &AppWindow, audio: i32, target: &str) -> i32 {
+    if target.is_empty() {
+        return -1;
+    }
+    let list = match audio {
+        1 => ui_list(&ui.get_live_mics()),
+        2 => ui_list(&ui.get_live_outputs()),
+        _ => ui_list(&ui.get_live_processes()),
+    };
+    list.iter().position(|x| x == target).map(|p| p as i32).unwrap_or(-1)
+}
+
+fn led_mode_from_ui(
+    kind: i32, on: &str, off: &str, cycle: &str,
+    bmode: i32, bright: i32, baudio: i32, btarget: &str,
+) -> LedMode {
+    let kind = match kind {
+        1 => LedModeKind::On,
+        2 => LedModeKind::Blink,
+        3 => LedModeKind::Breathe,
+        _ => LedModeKind::Off,
+    };
+    LedMode {
+        kind,
+        on_ms: on.trim().parse().unwrap_or(500).max(1),
+        off_ms: off.trim().parse().unwrap_or(500).max(1),
+        cycle_ms: cycle.trim().parse().unwrap_or(2000).max(1),
+        brightness_mode: if bmode == 1 { BrightnessMode::Volume } else { BrightnessMode::Fixed },
+        brightness: bright.clamp(0, 100) as u8,
+        brightness_audio: audio_kind_from(baudio),
+        brightness_target: opt(btarget),
+    }
+}
+
+fn cond_kind_from(v: i32) -> LedConditionKind {
+    match v { 1 => LedConditionKind::Volume, 2 => LedConditionKind::Api, _ => LedConditionKind::Muted }
+}
+fn audio_kind_from(v: i32) -> AudioKind {
+    match v { 1 => AudioKind::Mic, 2 => AudioKind::Output, _ => AudioKind::Process }
+}
+fn cmp_from(v: i32) -> Comparison {
+    match v { 1 => Comparison::Above, 2 => Comparison::Exact, _ => Comparison::Below }
+}
+
+fn cond_to_ui(c: &LedCondition, target_index: i32) -> LedConditionUI {
+    LedConditionUI {
+        kind: match c.kind { LedConditionKind::Muted => 0, LedConditionKind::Volume => 1, LedConditionKind::Api => 2 },
+        audio_kind: audio_kind_to(c.audio_kind),
+        target: c.target.clone().unwrap_or_default().into(),
+        target_index,
+        cmp: match c.cmp { Comparison::Below => 0, Comparison::Above => 1, Comparison::Exact => 2 },
+        value: c.value as i32,
+        method: c.api.method.to_index(),
+        url: c.api.url.clone().into(),
+        payload: c.api.payload.clone().unwrap_or_default().into(),
+        bearer: c.api.bearer.clone().unwrap_or_default().into(),
+        interval: c.api.interval_ms.to_string().into(),
+        expect_body: c.api.expect_body.clone().unwrap_or_default().into(),
+    }
+}
+
+/// Rebuild the conditions model, resolving each target's index within the live
+/// lists already on the UI (so its dropdown shows the right selection).
+fn push_led_conditions(ui: &AppWindow, conds: &[LedCondition]) {
+    let rows: Vec<LedConditionUI> = conds
+        .iter()
+        .map(|c| {
+            let tidx = list_index_of(ui, audio_kind_to(c.audio_kind), c.target.as_deref().unwrap_or(""));
+            cond_to_ui(c, tidx)
+        })
+        .collect();
+    ui.set_led_conditions(ModelRc::new(VecModel::from(rows)));
+}
+
+/// Push one LED appearance into the UI scalar props (active or inactive).
+fn push_mode_to_ui(ui: &AppWindow, m: &LedMode, active: bool) {
+    let kind = led_mode_kind_to(m.kind);
+    let on: SharedString = m.on_ms.to_string().into();
+    let off: SharedString = m.off_ms.to_string().into();
+    let cycle: SharedString = m.cycle_ms.to_string().into();
+    let bmode = if m.brightness_mode == BrightnessMode::Volume { 1 } else { 0 };
+    let bright = m.brightness as i32;
+    let baudio = audio_kind_to(m.brightness_audio);
+    let btarget: SharedString = m.brightness_target.clone().unwrap_or_default().into();
+    let btidx = list_index_of(ui, baudio, m.brightness_target.as_deref().unwrap_or(""));
+    if active {
+        ui.set_led_active_kind(kind);
+        ui.set_led_active_on(on);
+        ui.set_led_active_off(off);
+        ui.set_led_active_cycle(cycle);
+        ui.set_led_active_bmode(bmode);
+        ui.set_led_active_bright(bright);
+        ui.set_led_active_baudio(baudio);
+        ui.set_led_active_btarget(btarget);
+        ui.set_led_active_btidx(btidx);
+    } else {
+        ui.set_led_inactive_kind(kind);
+        ui.set_led_inactive_on(on);
+        ui.set_led_inactive_off(off);
+        ui.set_led_inactive_cycle(cycle);
+        ui.set_led_inactive_bmode(bmode);
+        ui.set_led_inactive_bright(bright);
+        ui.set_led_inactive_baudio(baudio);
+        ui.set_led_inactive_btarget(btarget);
+        ui.set_led_inactive_btidx(btidx);
+    }
+}
+
+/// Apply `f` to condition `idx` of the working LED config (no UI re-push).
+fn mutate_cond<F: FnOnce(&mut LedCondition)>(shared: &Arc<Mutex<Shared>>, idx: i32, f: F) {
+    let mut s = shared.lock();
+    if let Some((_, cfg)) = s.editing_led.as_mut() {
+        if let Some(c) = cfg.conditions.get_mut(idx as usize) {
+            f(c);
+        }
+    }
+}
+
+/// Like [`mutate_cond`] but returns the updated condition list so the caller can
+/// re-push the model (for structural changes that show/hide dependent fields).
+fn mutate_cond_struct<F: FnOnce(&mut LedCondition)>(
+    shared: &Arc<Mutex<Shared>>,
+    idx: i32,
+    f: F,
+) -> Option<Vec<LedCondition>> {
+    let mut s = shared.lock();
+    let (_, cfg) = s.editing_led.as_mut()?;
+    if let Some(c) = cfg.conditions.get_mut(idx as usize) {
+        f(c);
+    }
+    Some(cfg.conditions.clone())
 }
 
 fn toast(ui: &AppWindow, msg: &str) {

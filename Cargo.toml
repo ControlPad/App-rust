@@ -1,6 +1,6 @@
 [package]
 name = "slidr"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2021"
 description = "Cross-platform Arduino-based audio/macro pad controller"
 license = "MIT"
@@ -28,7 +28,8 @@ embed-resource = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# HTTP client for button/slider "API call" actions (blocking, rustls TLS).
+# HTTP client for button/slider "API call" actions and LED "API" state-check
+# conditions (blocking, rustls TLS).
 ureq = "2"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"

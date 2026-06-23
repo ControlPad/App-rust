@@ -3,23 +3,27 @@
 //! renderer smooth — per-frame WASAPI session enumeration / `pactl` calls never
 //! block the event loop.
 
-use crossbeam_channel::{Receiver, Sender};
+use std::time::Duration;
+
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
 use crate::audio::{self, AudioBackend, MuteTarget, VolumeTarget};
 use crate::events::{Cmd, Target};
 use crate::keys::KeyController;
+use crate::led::{LedEngine, LedStateHandle};
 use crate::model::HttpMethod;
+use crate::serial::SerialLink;
 
-pub fn spawn() -> Sender<Cmd> {
+pub fn spawn(serial: SerialLink, led_state: LedStateHandle) -> Sender<Cmd> {
     let (tx, rx) = crossbeam_channel::unbounded::<Cmd>();
     std::thread::Builder::new()
         .name("slidr-actuator".into())
-        .spawn(move || run(rx))
+        .spawn(move || run(rx, serial, led_state))
         .expect("spawn actuator thread");
     tx
 }
 
-fn run(rx: Receiver<Cmd>) {
+fn run(rx: Receiver<Cmd>, serial: SerialLink, led_state: LedStateHandle) {
     // On Windows, run this worker in an MTA apartment so WASAPI calls work
     // without a message pump. The backend's own CoInitializeEx(STA) will return
     // RPC_E_CHANGED_MODE and be ignored, leaving us in MTA.
@@ -37,17 +41,28 @@ fn run(rx: Receiver<Cmd>) {
             None
         }
     };
+    let mut led = LedEngine::new(serial, led_state);
 
-    // Coalesce volume commands: if several frames queue up, only the latest
-    // volume per target matters, so drain the channel and keep the last.
-    while let Ok(first) = rx.recv() {
-        let mut batch = vec![first];
-        while let Ok(more) = rx.try_recv() {
-            batch.push(more);
+    // Block for commands but wake regularly so the LED engine can re-evaluate
+    // its conditions (mute/volume polling, cached API results) and push updates.
+    let tick = Duration::from_millis(100);
+    loop {
+        match rx.recv_timeout(tick) {
+            Ok(first) => {
+                // Coalesce volume commands: if several frames queue up, only the
+                // latest volume per target matters, so drain and keep the last.
+                let mut batch = vec![first];
+                while let Ok(more) = rx.try_recv() {
+                    batch.push(more);
+                }
+                for cmd in coalesce(batch) {
+                    apply(&*audio, keys.as_mut(), &mut led, cmd);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
         }
-        for cmd in coalesce(batch) {
-            apply(&*audio, keys.as_mut(), cmd);
-        }
+        led.tick(&*audio);
     }
 }
 
@@ -80,8 +95,14 @@ fn target_key(t: &Target) -> String {
     }
 }
 
-fn apply(audio: &dyn AudioBackend, keys: Option<&mut KeyController>, cmd: Cmd) {
+fn apply(audio: &dyn AudioBackend, keys: Option<&mut KeyController>, led: &mut LedEngine, cmd: Cmd) {
     match cmd {
+        Cmd::SetLeds(cfgs) => led.set_configs(*cfgs),
+        Cmd::SetLedExperimental(on) => led.set_experimental(on),
+        Cmd::LedManualToggle(i) => led.manual_toggle(i as usize),
+        Cmd::SerialConnected => led.on_connected(),
+        Cmd::LedSaveState => led.save_state(),
+        Cmd::LedClearSaved => led.clear_and_save(),
         Cmd::SetVolume { target, value, unmute } => {
             if unmute {
                 audio.set_mute(mute_target(&target), false);

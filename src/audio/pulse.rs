@@ -201,6 +201,27 @@ impl AudioBackend for PulseBackend {
             .unwrap_or(false)
     }
 
+    fn get_volume(&self, target: VolumeTarget<'_>) -> Option<f32> {
+        let (subcmd, name) = match target {
+            VolumeTarget::Process(p) => {
+                let ids = self.sink_inputs_for(p);
+                ("get-sink-input-volume", ids.first()?.clone())
+            }
+            VolumeTarget::Mic(m) => (
+                "get-source-volume",
+                self.match_endpoint(EndpointKind::Source, Some(m))
+                    .unwrap_or_else(|| "@DEFAULT_SOURCE@".into()),
+            ),
+            VolumeTarget::System(d) => (
+                "get-sink-volume",
+                self.match_endpoint(EndpointKind::Sink, d)
+                    .unwrap_or_else(|| "@DEFAULT_SINK@".into()),
+            ),
+        };
+        let out = capture(subcmd, &[&name])?;
+        parse_first_percent(&out).map(|p| (p as f32 / 100.0).clamp(0.0, 1.0))
+    }
+
     fn list_processes(&self) -> Vec<String> {
         self.refresh();
         let c = self.cache.lock().unwrap();
@@ -331,6 +352,23 @@ fn list_endpoints(kind: &str) -> Vec<NamedId> {
         out.push(NamedId { name, description: desc });
     }
     out
+}
+
+/// Parse the first `<digits>%` occurrence (pactl volume output) into a percent.
+fn parse_first_percent(s: &str) -> Option<u32> {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'%' {
+            let mut j = i;
+            while j > 0 && bytes[j - 1].is_ascii_digit() {
+                j -= 1;
+            }
+            if j < i {
+                return s[j..i].parse().ok();
+            }
+        }
+    }
+    None
 }
 
 fn property(line: &str, key: &str) -> Option<String> {

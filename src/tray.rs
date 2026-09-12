@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use slint::ComponentHandle;
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-use tray_icon::{TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::AppWindow;
 
@@ -129,9 +129,12 @@ fn load_icon() -> Option<tray_icon::Icon> {
 }
 
 /// Build the tray and wire its events. Run on the UI thread. Returns the tray
-/// (keep it alive). `start_hidden` seeds the toggle label for a window that is
-/// never shown (autostart-minimized); from then on the poll below keeps it in
-/// sync with the window's real state.
+/// (keep it alive).
+///
+/// Left click opens the window, right click opens the menu. `start_hidden`
+/// seeds the toggle label for a window that is never shown
+/// (autostart-minimized); from then on the poll below keeps it in sync with the
+/// window's real state.
 pub fn install(ui: &AppWindow, start_hidden: bool) -> Option<Rc<Tray>> {
     let menu = Menu::new();
     let initial = if start_hidden { "Show Slidr" } else { "Minimize Slidr" };
@@ -144,6 +147,9 @@ pub fn install(ui: &AppWindow, start_hidden: bool) -> Option<Rc<Tray>> {
 
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
+        // Left click belongs to "show the window" (handled below); the menu is
+        // what right click is for.
+        .with_menu_on_left_click(false)
         .with_tooltip("Slidr");
     if let Some(icon) = load_icon() {
         builder = builder.with_icon(icon);
@@ -164,23 +170,49 @@ pub fn install(ui: &AppWindow, start_hidden: bool) -> Option<Rc<Tray>> {
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
-        std::time::Duration::from_millis(120),
+        std::time::Duration::from_millis(100),
         move || {
             // Keep the label honest even when the window state changed without
             // going through us (minimize button, Win+D, restore from taskbar).
             tray_for_timer.sync_label();
 
-            if let Ok(ev) = MenuEvent::receiver().try_recv() {
-                if ev.id == tray_for_timer.toggle_id {
-                    tray_for_timer.toggle_window();
-                } else if ev.id == tray_for_timer.exit_id {
-                    let _ = slint::quit_event_loop();
+            // Drain both queues completely, then act once.
+            //
+            // `tray-icon` posts a Move event for every mouse movement across the
+            // icon, so taking a single event per tick left a click queued behind
+            // a flood of them: it arrived seconds late, and a second click
+            // arrived a tick after that, making the window pop to the front
+            // repeatedly. Collapsing a burst into one action fixes both.
+            let mut exit = false;
+            let mut toggle = false;
+            let mut show = false;
+            while let Ok(ev) = MenuEvent::receiver().try_recv() {
+                if ev.id == tray_for_timer.exit_id {
+                    exit = true;
+                } else if ev.id == tray_for_timer.toggle_id {
+                    toggle = true;
                 }
             }
-            if let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-                if let TrayIconEvent::DoubleClick { .. } = ev {
-                    tray_for_timer.show_window();
+            while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+                match ev {
+                    // Act on the release, so pressing on the icon and dragging
+                    // away doesn't count as a click.
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    }
+                    | TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } => show = true,
+                    _ => {}
                 }
+            }
+
+            if exit {
+                let _ = slint::quit_event_loop();
+            } else if show {
+                tray_for_timer.show_window();
+            } else if toggle {
+                tray_for_timer.toggle_window();
             }
         },
     );

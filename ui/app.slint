@@ -38,7 +38,8 @@ export struct WizardResult {
 }
 // One LED toggle condition. Fields are interpreted by `kind`:
 //   kind 0 = device muted · 1 = volume compare · 2 = API call
-//        3 = media session playing · 4 = Discord voice state
+//        3 = media session · 4 = Discord voice state
+//   media  (kind 3) 0 = playing · 1 = paused · 2 = stopped · 3 = nothing
 //   signal (kind 4) 0 = muted · 1 = deafened · 2 = in a voice channel
 //   audio-kind 0 = process · 1 = microphone · 2 = output
 //   cmp 0 = below · 1 = above · 2 = exactly · method 0 GET..4 DELETE
@@ -47,7 +48,7 @@ export struct LedConditionUI {
     cmp: int, value: int,
     method: int, url: string, payload: string, bearer: string,
     interval: string, expect-body: string,
-    signal: int,
+    signal: int, media: int,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1084,6 +1085,7 @@ component SettingsPage inherits VerticalBox {
     callback curve-changed();
     callback led-save-state();
     callback led-clear-state();
+    callback open-discord-portal();
 
     spacing: 14px;
 
@@ -1210,6 +1212,11 @@ component SettingsPage inherits VerticalBox {
                                 input-type: password;
                                 placeholder-text: "Client Secret";
                                 edited(t) => { root.dirty(); } }
+                            HorizontalLayout { spacing: 6px; alignment: start;
+                                IconButton { label: "Open developer portal";
+                                    icon: @image-url("../assets/icons/world.svg");
+                                    clicked => { root.open-discord-portal(); } }
+                            }
                             if root.discord-status != "": Text { text: root.discord-status;
                                 font-size: 11px; font-family: "Inter"; wrap: word-wrap;
                                 color: Palette.foreground.with-alpha(0.6); }
@@ -1938,6 +1945,7 @@ component LedConfigPopup inherits Rectangle {
     callback manual-toggle();
     callback cond-kind(int, int);
     callback cond-media(int, string);
+    callback cond-media-state(int, int);
     callback cond-signal(int, int);
     callback cond-audio(int, int);
     callback cond-target(int, string);
@@ -2053,7 +2061,7 @@ component LedConfigPopup inherits Rectangle {
                                 HorizontalLayout { spacing: 8px;
                                     Select { field-width: 170px;
                                         model: ["Device muted", "Volume", "API call",
-                                                "Music playing", "Discord"];
+                                                "Media", "Discord"];
                                         current-index: c.kind;
                                         selected(i) => { root.cond-kind(idx, i); } }
                                     Rectangle { horizontal-stretch: 1; }
@@ -2082,8 +2090,14 @@ component LedConfigPopup inherits Rectangle {
                                         horizontal-alignment: right; vertical-alignment: center;
                                         font-family: "Inter"; }
                                 }
-                                // Media session: a source filter, empty = any player.
+                                // Media session: which playback state, and from
+                                // which player (empty filter = any player).
                                 if c.kind == 3: VerticalBox { spacing: 4px;
+                                    Select { field-width: 250px;
+                                        model: ["Playing", "Paused", "Stopped",
+                                                "Nothing detected"];
+                                        current-index: c.media;
+                                        selected(i) => { root.cond-media-state(idx, i); } }
                                     LineEdit { text: c.target; height: 34px;
                                         placeholder-text: "Player (empty = any) — e.g. spotify";
                                         edited(t) => { root.cond-media(idx, t); } }
@@ -2313,6 +2327,7 @@ export component AppWindow inherits Window {
     // ── LED state persistence (board EEPROM) ──
     callback led-save-state();
     callback led-clear-state();
+    callback open-discord-portal();
 
     // ── Configure-LED ──
     callback open-led-config(int);   // button index
@@ -2324,6 +2339,7 @@ export component AppWindow inherits Window {
     callback led-manual-toggle();
     callback led-cond-kind(int, int);
     callback led-cond-media(int, string);
+    callback led-cond-media-state(int, int);
     callback led-cond-signal(int, int);
     callback led-cond-audio(int, int);
     callback led-cond-target(int, string);
@@ -2557,6 +2573,7 @@ export component AppWindow inherits Window {
                     curve-changed => { root.curve-changed(); }
                     led-save-state => { root.led-save-state(); }
                     led-clear-state => { root.led-clear-state(); }
+                    open-discord-portal => { root.open-discord-portal(); }
                 }
             }
         }
@@ -2616,6 +2633,7 @@ export component AppWindow inherits Window {
         manual-toggle => { root.led-manual-toggle(); }
         cond-kind(i, v) => { root.led-cond-kind(i, v); }
         cond-media(i, v) => { root.led-cond-media(i, v); }
+        cond-media-state(i, v) => { root.led-cond-media-state(i, v); }
         cond-signal(i, v) => { root.led-cond-signal(i, v); }
         cond-audio(i, v) => { root.led-cond-audio(i, v); }
         cond-target(i, v) => { root.led-cond-target(i, v); }

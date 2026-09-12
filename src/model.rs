@@ -312,8 +312,8 @@ pub enum LedConditionKind {
     Muted,
     Volume,
     Api,
-    /// Something is playing through the OS media session (Spotify, a browser
-    /// tab, any player that publishes transport controls).
+    /// The OS media session's playback state (Spotify, a browser tab, any
+    /// player that publishes transport controls).
     Media,
     /// Discord voice state (self-mute / deafen / in a voice channel).
     Discord,
@@ -383,6 +383,9 @@ pub struct LedCondition {
     /// For `Discord`: which part of the voice state to follow.
     #[serde(default)]
     pub discord: crate::discord::DiscordSignal,
+    /// For `Media`: the playback state to match.
+    #[serde(default)]
+    pub media: crate::media::MediaStatus,
 }
 
 /// Per-LED configuration. Conditions decide the `active` vs `inactive` look.

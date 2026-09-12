@@ -89,6 +89,11 @@ impl DiscordState {
 }
 
 static STATE: OnceLock<Mutex<DiscordState>> = OnceLock::new();
+/// Why the last connection attempt failed, for the settings/LED status line.
+/// Without this the UI can only say "not connected", which tells the user
+/// nothing about whether Discord is closed, the id is wrong, or the redirect
+/// URI is missing from their application.
+static LAST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static CONFIG: OnceLock<Mutex<Option<Credentials>>> = OnceLock::new();
 static RUNNING: AtomicBool = AtomicBool::new(false);
 /// Bumped whenever the credentials change, so an older worker retires itself.
@@ -110,6 +115,15 @@ fn config_cell() -> &'static Mutex<Option<Credentials>> {
 
 pub fn state() -> DiscordState {
     *state_cell().lock()
+}
+
+fn error_cell() -> &'static Mutex<Option<String>> {
+    LAST_ERROR.get_or_init(|| Mutex::new(None))
+}
+
+/// Why the worker is not connected right now, if it has tried and failed.
+pub fn last_error() -> Option<String> {
+    error_cell().lock().clone()
 }
 
 /// Does this look like a Discord application id? They are snowflakes — a run of
@@ -140,6 +154,7 @@ pub fn configure(client_id: &str, client_secret: &str) {
     *slot = next.clone();
     GENERATION.fetch_add(1, Ordering::SeqCst);
     *state_cell().lock() = DiscordState::default();
+    *error_cell().lock() = None;
     drop(slot);
 
     if next.is_none() {
@@ -164,7 +179,10 @@ fn worker() {
         };
         match session(&creds, generation) {
             Ok(()) => log::info!("discord: session ended"),
-            Err(e) => log::warn!("discord: {e}"),
+            Err(e) => {
+                log::warn!("discord: {e}");
+                *error_cell().lock() = Some(e.to_string());
+            }
         }
         *state_cell().lock() = DiscordState::default();
         std::thread::sleep(RECONNECT_DELAY);
@@ -180,6 +198,7 @@ fn session(creds: &Credentials, generation: u64) -> anyhow::Result<()> {
     let token = authenticate(&mut conn, creds)?;
     save_token(&token);
     state_cell().lock().connected = true;
+    *error_cell().lock() = None;
     log::info!("discord: authenticated");
 
     // Current values first, then the live updates.
@@ -294,8 +313,8 @@ fn authenticate(conn: &mut Connection, creds: &Credentials) -> anyhow::Result<St
 
     if creds.client_secret.is_empty() {
         anyhow::bail!(
-            "no usable token and no client secret — add the secret once (or set \
-             SLIDR_DISCORD_CLIENT_SECRET) so Slidr can complete the authorisation"
+            "no cached token and no Client Secret — paste the secret once so Slidr \
+             can complete the authorisation"
         );
     }
     log::info!("discord: requesting authorisation — confirm the prompt in Discord");
@@ -367,6 +386,13 @@ fn exchange(creds: &Credentials, extra: [(&str, &str); 2]) -> anyhow::Result<Sto
         .send_form(&form)
         .map_err(|e| match e {
             // The body can echo request fields — never let it reach a log.
+            ureq::Error::Status(401, _) => anyhow::anyhow!(
+                "Discord rejected the Client ID/Secret (HTTP 401) — check both in Settings"
+            ),
+            ureq::Error::Status(400, _) => anyhow::anyhow!(
+                "Discord rejected the authorisation (HTTP 400) — the application needs \
+                 the redirect http://localhost registered under OAuth2"
+            ),
             ureq::Error::Status(code, _) => {
                 anyhow::anyhow!("token endpoint returned HTTP {code}")
             }

@@ -139,6 +139,7 @@ fn main() -> anyhow::Result<()> {
         pending_wizard: None,
         pending_retry_deadline: None,
         editing_idx: None,
+        last_status_refresh: None,
         editing_led: None,
     }));
 

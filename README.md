@@ -36,10 +36,12 @@ and macro board.
   drift apart (per-app volumes otherwise follow the *new* endpoint's remembered
   levels).
 - **LED state sources** (experimental) — besides mute/volume/HTTP, an LED can
-  follow the OS media session ("music is playing", any player that publishes
-  transport controls) or Discord's voice state (self-mute / deafen / in a voice
-  channel). Discord needs a one-off OAuth application — see
-  [`src/discord.rs`](src/discord.rs) for the three setup steps.
+  follow the OS media session (playing / paused / stopped / nothing detected,
+  for any player that publishes transport controls, optionally filtered to one)
+  or Discord's voice state (self-mute / deafen / in a voice channel). Discord
+  needs a one-off OAuth application — see [`src/discord.rs`](src/discord.rs) for
+  the three setup steps, or the "Open developer portal" button under
+  Settings → LEDs.
 - **Hot-plug** — automatic Arduino detection, reconnect with backoff.
 
 ## Architecture

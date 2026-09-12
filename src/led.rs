@@ -254,7 +254,7 @@ impl LedEngine {
             // Both of these are served from a cache kept by a background
             // worker, so the tick never waits on WinRT or a socket.
             LedConditionKind::Media => {
-                crate::media::state().is_playing(cond.target.as_deref())
+                crate::media::state().status(cond.target.as_deref()) == cond.media
             }
             LedConditionKind::Discord => crate::discord::state().get(cond.discord),
         }

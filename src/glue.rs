@@ -39,6 +39,8 @@ pub struct Shared {
     pub pending_retry_deadline: Option<Instant>,
     /// When editing an existing category entry, the index being replaced.
     pub editing_idx: Option<usize>,
+    /// Throttle for the Discord/media status lines refreshed by the UI timer.
+    pub last_status_refresh: Option<Instant>,
     /// Working copy for the configure-LED popup: (led index, config being edited).
     pub editing_led: Option<(usize, LedConfig)>,
 }
@@ -494,6 +496,16 @@ pub fn wire(
 
     // ─── settings ──────────────────────────────────────────────────────────
     {
+        // Straight to the page where the Client ID lives — the setup is a
+        // detour through a web portal and the app should at least open the door.
+        ui.on_open_discord_portal(move || {
+            let url = "https://discord.com/developers/applications";
+            if let Err(e) = open::that(url) {
+                log::warn!("could not open {url}: {e}");
+            }
+        });
+    }
+    {
         let shared = shared.clone();
         let weak = ui.as_weak();
         ui.on_theme_changed(move |idx| {
@@ -644,6 +656,7 @@ pub fn wire(
             // stops it). Cheap and idempotent when nothing moved.
             crate::discord::configure(&s.settings.discord_client_id, &s.settings.discord_client_secret);
             ui.set_discord_status(discord_hint(&s.settings).into());
+            ui.set_led_discord_hint(discord_hint(&s.settings).into());
         });
     }
     {
@@ -900,6 +913,16 @@ pub fn wire(
     {
         let shared = shared.clone();
         let weak = ui.as_weak();
+        ui.on_led_cond_media_state(move |idx, v| {
+            let conds = mutate_cond_struct(&shared, idx, |c| {
+                c.media = crate::media::MediaStatus::from_index(v)
+            });
+            if let (Some(ui), Some(conds)) = (weak.upgrade(), conds) { push_led_conditions(&ui, &conds); }
+        });
+    }
+    {
+        let shared = shared.clone();
+        let weak = ui.as_weak();
         ui.on_led_cond_signal(move |idx, v| {
             let conds = mutate_cond_struct(&shared, idx, |c| {
                 c.discord = crate::discord::DiscordSignal::from_index(v)
@@ -994,6 +1017,33 @@ pub fn wire(
             let led = ui.get_led_index() as usize;
             let active = s.led_state.lock().get(led).map(|l| l.active).unwrap_or(false);
             ui.set_led_live_active(active);
+        }
+
+        // The Discord worker connects (or fails) seconds after the settings are
+        // saved, and the media poller updates once a second — so refresh both
+        // status lines while the user is looking at them, or they would sit on
+        // whatever was true when the page opened. Throttled to ~2/s, and the
+        // strings only reach Slint when they actually change.
+        if ui.get_current_page() == 3 || ui.get_led_popup_open() {
+            let due = s
+                .last_status_refresh
+                .map_or(true, |t: Instant| t.elapsed() >= Duration::from_millis(500));
+            if due {
+                s.last_status_refresh = Some(Instant::now());
+                let hint = discord_hint(&s.settings);
+                if ui.get_discord_status() != hint.as_str() {
+                    ui.set_discord_status(hint.clone().into());
+                }
+                if ui.get_led_popup_open() {
+                    if ui.get_led_discord_hint() != hint.as_str() {
+                        ui.set_led_discord_hint(hint.into());
+                    }
+                    let media = media_hint();
+                    if ui.get_led_media_hint() != media.as_str() {
+                        ui.set_led_media_hint(media.into());
+                    }
+                }
+            }
         }
 
         // Animate retry countdown even between events.
@@ -1643,6 +1693,7 @@ fn cond_to_ui(c: &LedCondition, target_index: i32) -> LedConditionUI {
         interval: c.api.interval_ms.to_string().into(),
         expect_body: c.api.expect_body.clone().unwrap_or_default().into(),
         signal: c.discord.to_index(),
+        media: c.media.to_index(),
     }
 }
 
@@ -1651,23 +1702,29 @@ fn cond_to_ui(c: &LedCondition, target_index: i32) -> LedConditionUI {
 fn media_hint() -> String {
     let sources = crate::media::sources();
     if sources.is_empty() {
-        "No media session detected yet — start playback, then Refresh.".into()
+        "No media session detected — nothing with transport controls is open.".into()
     } else {
-        format!("Detected: {}", sources.join(", "))
+        let list: Vec<String> =
+            sources.iter().map(|(id, st)| format!("{id} ({})", st.label())).collect();
+        format!("Detected: {}", list.join(", "))
     }
 }
 
 fn discord_hint(settings: &Settings) -> String {
     if settings.discord_client_id.trim().is_empty() {
-        return "Not set up — add a Discord application under Settings → LEDs.".into();
+        return "Not set up — paste the Client ID of your Discord application below.".into();
     }
     if !crate::discord::is_valid_id(&settings.discord_client_id) {
         return "That Client ID doesn't look right — it is a long number from the developer portal.".into();
     }
     if crate::discord::state().connected {
-        "Connected to Discord.".into()
-    } else {
-        "Waiting for Discord — is it running, and did you confirm the authorisation prompt?".into()
+        return "Connected to Discord.".into();
+    }
+    // Say *why* it isn't connected. The worker retries every 10s, so a stale
+    // reason still describes the situation.
+    match crate::discord::last_error() {
+        Some(e) => format!("Not connected: {e}"),
+        None => "Connecting to Discord…".into(),
     }
 }
 

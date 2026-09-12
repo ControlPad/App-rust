@@ -6,6 +6,9 @@
 
 #[cfg(target_os = "linux")]
 pub mod pulse;
+// Pure `pactl` output parsers. Compiled everywhere (not gated) so they stay
+// unit-testable on any host; only `pulse` consumes them.
+pub mod pulse_parse;
 #[cfg(target_os = "windows")]
 pub mod wasapi;
 pub mod null;

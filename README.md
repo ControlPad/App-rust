@@ -69,12 +69,41 @@ installer/slidr.nsi   Interactive NSIS installer
 
 ```sh
 # Linux dev deps (Ubuntu 24.04 names):
-sudo apt install build-essential pkg-config libpulse-dev libudev-dev \
+sudo apt install build-essential pkg-config libudev-dev \
     libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libxcb1-dev \
-    libxdo-dev libfontconfig1-dev
+    libfontconfig1-dev
 
 cargo run --release
 ```
+
+### Linux runtime requirements
+
+* **`pactl`** (Ubuntu/Debian/Fedora: `pulseaudio-utils`). The audio backend
+  shells out to it; it also ships with `pipewire-pulse`. Without it Slidr
+  starts but every volume/mute action is a no-op.
+* **Serial port access.** Opening `/dev/ttyUSB*` / `/dev/ttyACM*` needs
+  permission, or the connection banner shows "Access denied". Either install
+  the bundled udev rule (preferred - applies on replug, no group, no re-login):
+
+  ```sh
+  sudo install -m644 packaging/99-slidr.rules /etc/udev/rules.d/99-slidr.rules
+  sudo udevadm control --reload-rules && sudo udevadm trigger
+  ```
+
+  or add yourself to the port's group and log out and back in:
+
+  ```sh
+  sudo usermod -aG dialout "$USER"
+  ```
+* **Key actions need an X11 session.** Simulated keypresses go out over XTEST,
+  which reaches X11 and XWayland windows but *not* native Wayland windows - a
+  Wayland compositor does not let an ordinary application inject input. On a
+  Wayland session Slidr logs a warning at startup and key actions will appear
+  to do nothing in Wayland-native apps; volume, mute, LED and API actions are
+  unaffected. Pick the "Xorg"/"X11" session at login if you need key actions.
+* **No system tray.** The tray (`src/tray.rs`) is Windows-only, so the
+  tray-related settings are hidden on Linux and `--hidden` is ignored - it
+  would otherwise leave a window-less process that cannot be reopened.
 
 Override the config location with `SLIDR_CONFIG_DIR=/path` (default
 `$XDG_CONFIG_HOME/slidr`, i.e. `~/.config/slidr`; `%APPDATA%/slidr` on Windows).

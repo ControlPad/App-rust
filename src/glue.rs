@@ -1173,6 +1173,10 @@ fn stream_secondary(s: &AudioStream) -> String {
 /// Push system (global) + appearance/slider (per-profile) settings into the UI.
 fn push_settings_to_ui(ui: &AppWindow, global: &Settings, profile: &crate::model::ProfileSettings) {
     // System (global)
+    // Gates the two tray rows: only Windows ships a tray (`src/tray.rs`), and
+    // without one "start minimized" would leave the app running with no window
+    // and no way to reopen it.
+    ui.set_has_tray(cfg!(target_os = "windows"));
     ui.set_start_with_os(global.start_with_os);
     ui.set_start_minimized(global.start_minimized);
     ui.set_minimize_to_tray(global.minimize_to_tray);
@@ -1393,14 +1397,39 @@ fn list_running_processes() -> Vec<String> {
         for e in rd.flatten() {
             let n = e.file_name();
             let n = n.to_string_lossy();
-            if !n.chars().all(|c| c.is_ascii_digit()) { continue }
+            if n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) { continue }
             if let Ok(comm) = std::fs::read_to_string(format!("/proc/{n}/comm")) {
                 let comm = comm.trim();
-                if !comm.is_empty() { out.push(comm.to_string()); }
+                if comm.is_empty() { continue }
+                out.push(untruncate_comm(&n, comm));
             }
         }
     }
     out
+}
+
+/// The kernel caps `/proc/<pid>/comm` at 15 characters (`TASK_COMM_LEN - 1`), so
+/// long binaries show up clipped ("gnome-terminal-", "systemd-journal") and then
+/// fail to match what PulseAudio reports as `application.process.binary`. When a
+/// name is exactly at the cap, recover the full one from `cmdline`'s argv[0].
+#[cfg(target_os = "linux")]
+fn untruncate_comm(pid: &str, comm: &str) -> String {
+    const TASK_COMM_MAX: usize = 15;
+    if comm.len() < TASK_COMM_MAX {
+        return comm.to_string();
+    }
+    let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) else {
+        return comm.to_string();
+    };
+    let argv0 = cmdline.split(' ').next().unwrap_or("");
+    let base = argv0.rsplit('/').next().unwrap_or("");
+    // Only trust it when it really is the same program, just not clipped -
+    // argv[0] can be an interpreter path or a rewritten title.
+    if base.len() > comm.len() && base.starts_with(comm) {
+        base.to_string()
+    } else {
+        comm.to_string()
+    }
 }
 
 #[cfg(target_os = "windows")]

@@ -3,7 +3,10 @@
 //! * Linux: XDG `~/.config/autostart/slidr.desktop`
 //! * Windows: `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\Slidr`
 
-use std::path::PathBuf;
+/// Whether this build has a system tray to minimise into. Only Windows does
+/// (`src/tray.rs`), so elsewhere `--hidden` is never written into the autostart
+/// entry: it would start a process with no window and no way to open one.
+const HAS_TRAY: bool = cfg!(target_os = "windows");
 
 #[cfg(target_os = "linux")]
 pub fn set_enabled(enable: bool, start_minimized: bool) -> anyhow::Result<()> {
@@ -16,17 +19,18 @@ pub fn set_enabled(enable: bool, start_minimized: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     let exe = std::env::current_exe()?;
-    let exe = exe.display();
-    let exec_line = if start_minimized {
-        format!("{exe} --hidden")
-    } else {
-        format!("{exe}")
-    };
+    let mut exec_line = quote_exec_arg(&exe.to_string_lossy());
+    if start_minimized && HAS_TRAY {
+        exec_line.push_str(" --hidden");
+    }
     let desktop = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=Slidr\n\
+         Comment=Arduino-based audio mixer and macro pad\n\
+         Icon=slidr\n\
          Exec={exec_line}\n\
+         Categories=AudioVideo;Audio;Utility;\n\
          X-GNOME-Autostart-enabled=true\n\
          Terminal=false\n"
     );
@@ -37,15 +41,64 @@ pub fn set_enabled(enable: bool, start_minimized: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Quote a path for a desktop-entry `Exec=` value.
+///
+/// Unquoted `Exec` splits on whitespace, so an install under e.g.
+/// `~/My Apps/slidr` would never launch. The desktop-entry spec wants the
+/// argument in double quotes with `"`, `` ` ``, `$` and `\` backslash-escaped.
+#[cfg(target_os = "linux")]
+fn quote_exec_arg(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 #[cfg(target_os = "linux")]
 pub fn is_enabled() -> bool {
     autostart_file().exists()
 }
 
+/// Rewrite the autostart entry if it exists but points at a different binary.
+///
+/// The entry stores an absolute path, so moving, renaming or reinstalling the
+/// executable leaves a file that silently fails at login. Called once at
+/// startup; a no-op when autostart is off or already current.
 #[cfg(target_os = "linux")]
-fn autostart_file() -> PathBuf {
+pub fn resync(start_minimized: bool) {
+    let path = autostart_file();
+    if !path.exists() {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else { return };
+    let current = quote_exec_arg(&exe.to_string_lossy());
+    let stale = match std::fs::read_to_string(&path) {
+        Ok(text) => !text
+            .lines()
+            .any(|l| l.strip_prefix("Exec=").is_some_and(|v| v.starts_with(&current))),
+        Err(e) => {
+            log::warn!("autostart: cannot read {}: {e}", path.display());
+            return;
+        }
+    };
+    if stale {
+        log::info!("autostart entry points elsewhere; rewriting for {}", exe.display());
+        if let Err(e) = set_enabled(true, start_minimized) {
+            log::warn!("autostart: rewrite failed: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn autostart_file() -> std::path::PathBuf {
     dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("autostart")
         .join("slidr.desktop")
 }
@@ -57,7 +110,6 @@ pub fn set_enabled(enable: bool, start_minimized: bool) -> anyhow::Result<()> {
         RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY,
         HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
     };
-    use windows::Win32::Foundation::HANDLE as _HANDLE;
 
     let subkey = HSTRING::from("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     let name = HSTRING::from("Slidr");
@@ -78,7 +130,7 @@ pub fn set_enabled(enable: bool, start_minimized: bool) -> anyhow::Result<()> {
         if enable {
             let exe = std::env::current_exe()?;
             let mut cmd = format!("\"{}\"", exe.display());
-            if start_minimized {
+            if start_minimized && HAS_TRAY {
                 cmd.push_str(" --hidden");
             }
             let wide: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
@@ -101,7 +153,24 @@ pub fn is_enabled() -> bool {
     false
 }
 
-#[allow(dead_code)]
-fn _path_unused() -> Option<PathBuf> {
-    None
+/// The registry value is rewritten on every settings save, so there is nothing
+/// to repair on Windows.
+#[cfg(target_os = "windows")]
+pub fn resync(_start_minimized: bool) {}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::quote_exec_arg;
+
+    #[test]
+    fn quotes_paths_with_spaces() {
+        assert_eq!(quote_exec_arg("/home/u/My Apps/slidr"), "\"/home/u/My Apps/slidr\"");
+    }
+
+    #[test]
+    fn escapes_reserved_characters() {
+        assert_eq!(quote_exec_arg("/opt/a$b"), "\"/opt/a\\$b\"");
+        assert_eq!(quote_exec_arg("/opt/a\"b"), "\"/opt/a\\\"b\"");
+        assert_eq!(quote_exec_arg("/opt/a\\b"), "\"/opt/a\\\\b\"");
+    }
 }

@@ -1048,6 +1048,10 @@ component CategoriesPage inherits VerticalBox {
 }
 
 component SettingsPage inherits VerticalBox {
+    // False on platforms without a system tray (currently everything but
+    // Windows): the tray-related rows are hidden rather than offering a toggle
+    // that does nothing - or, for "start minimized", strands the app headless.
+    in property <bool> has-tray;
     in-out property <int> theme-index;
     in-out property <int> accent-preset;
     in-out property <int> dead-zone;
@@ -1210,7 +1214,7 @@ component SettingsPage inherits VerticalBox {
                             VerticalLayout { alignment: center;
                                 Toggle { checked <=> root.start-with-os;
                                          toggled => { root.dirty(); } } } } }
-                    SettingRow { label: "Start minimized to tray";
+                    if root.has-tray: SettingRow { label: "Start minimized to tray";
                         description: root.start-with-os
                             ? "" : "Enable 'Start with OS' to enable this";
                         HorizontalLayout { width: root.control-w; alignment: end;
@@ -1218,7 +1222,7 @@ component SettingsPage inherits VerticalBox {
                                 Toggle { checked <=> root.start-minimized;
                                          enabled: root.start-with-os;
                                          toggled => { root.dirty(); } } } } }
-                    SettingRow { label: "Minimize to system tray";
+                    if root.has-tray: SettingRow { label: "Minimize to system tray";
                         HorizontalLayout { width: root.control-w; alignment: end;
                             VerticalLayout { alignment: center;
                                 Toggle { checked <=> root.minimize-to-tray;
@@ -2107,6 +2111,8 @@ export component AppWindow inherits Window {
     in-out property <bool> start-with-os;
     in-out property <bool> start-minimized;
     in-out property <bool> minimize-to-tray;
+    // Set from Rust: true only where a tray actually exists (Windows).
+    in property <bool> has-tray;
     in-out property <int> curve-preset-index;
     in property <bool> curve-editable;
     in-out property <float> curve-x1;
@@ -2443,6 +2449,7 @@ export component AppWindow inherits Window {
                     start-with-os <=> root.start-with-os;
                     start-minimized <=> root.start-minimized;
                     minimize-to-tray <=> root.minimize-to-tray;
+                    has-tray: root.has-tray;
                     curve-preset-index <=> root.curve-preset-index;
                     curve-editable: root.curve-editable;
                     curve-x1 <=> root.curve-x1;

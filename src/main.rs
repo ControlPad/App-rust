@@ -17,6 +17,7 @@ mod events;
 mod glue;
 mod keys;
 mod keys_library;
+mod keys_vk;
 mod led;
 mod model;
 mod protocol;
@@ -60,6 +61,19 @@ fn main() -> anyhow::Result<()> {
     let dark = args.iter().any(|a| a == "--dark");
     // Autostart-minimized passes --hidden so we start in the tray.
     let start_hidden = args.iter().any(|a| a == "--hidden");
+    // ...but only where there *is* a tray. Without one, starting hidden leaves a
+    // process with no window and no way to open one - `on_close_requested` never
+    // fires either, so the only exit is `kill`. Honour the flag on Windows only.
+    #[cfg(not(target_os = "windows"))]
+    let start_hidden = {
+        if start_hidden {
+            log::warn!(
+                "--hidden ignored: this build has no system tray, so a hidden window could \
+                 not be reopened. Showing the window instead."
+            );
+        }
+        false
+    };
 
     // Lock the main thread to an STA apartment before *any* COM-using crate
     // (WASAPI, winit's OleInitialize) gets a chance.
@@ -100,6 +114,11 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     });
     settings.active_preset = preset.name.clone();
+
+    // Repair a stale autostart entry (the executable moved since it was set up).
+    if settings.start_with_os {
+        autostart::resync(settings.start_minimized);
+    }
 
     let shared = Arc::new(Mutex::new(glue::Shared {
         settings,

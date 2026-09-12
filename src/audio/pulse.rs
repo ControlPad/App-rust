@@ -4,11 +4,23 @@
 //! transparently supported by PipeWire via `pipewire-pulse`. Shelling out
 //! keeps the implementation tiny vs. binding to libpulse's async C API,
 //! and the action rate (≤60Hz, throttled) is well within budget.
+//!
+//! Two things matter for correctness here:
+//!
+//! * **Locale.** `pactl`'s human-readable output is translated, so every parse
+//!   below would break on a non-English desktop ("Sink-Eingang #", "Stumm: ja").
+//!   Every invocation therefore forces `LC_ALL=C`.
+//! * **Query cost.** A `pactl` call is a fork+exec. The LED engine polls mute
+//!   and volume 10×/s per LED, so answering those from a live process each time
+//!   meant dozens of processes per second at idle. `Volume:`/`Mute:` are already
+//!   part of the `pactl list` output we refresh anyway, so reads are served from
+//!   the same short-TTL cache and cost nothing extra.
 
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use super::pulse_parse::{parse_defaults, parse_records, strip_exe, Record};
 use super::{AudioBackend, MuteTarget, VolumeTarget};
 
 pub struct PulseBackend {
@@ -17,23 +29,14 @@ pub struct PulseBackend {
 
 #[derive(Default)]
 struct Cache {
-    sink_inputs: Vec<SinkInput>,
-    sources: Vec<NamedId>,
-    sinks: Vec<NamedId>,
+    sink_inputs: Vec<Record>,
+    sources: Vec<Record>,
+    sinks: Vec<Record>,
+    /// Names reported by `pactl info`, cached alongside the lists so resolving
+    /// "System (default)" costs no extra process per query.
+    default_sink: String,
+    default_source: String,
     stamp: Option<Instant>,
-}
-
-#[derive(Clone)]
-struct SinkInput {
-    id: String,
-    process_binary: String,
-    app_name: String,
-}
-
-#[derive(Clone)]
-struct NamedId {
-    name: String,
-    description: String,
 }
 
 const CACHE_TTL: Duration = Duration::from_millis(500);
@@ -41,7 +44,7 @@ const CACHE_TTL: Duration = Duration::from_millis(500);
 impl PulseBackend {
     pub fn new() -> anyhow::Result<Self> {
         // Probe pactl presence + a working server.
-        let out = Command::new("pactl")
+        let out = pactl()
             .arg("info")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -55,45 +58,112 @@ impl PulseBackend {
     }
 
     fn refresh(&self) {
-        let mut c = self.cache.lock().unwrap();
-        if let Some(t) = c.stamp {
-            if t.elapsed() < CACHE_TTL {
-                return;
+        // Collect outside the lock so concurrent readers (UI thread listing
+        // devices while the actuator ticks) never queue behind three subprocesses.
+        {
+            let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(t) = c.stamp {
+                if t.elapsed() < CACHE_TTL {
+                    return;
+                }
             }
         }
-        c.sink_inputs = list_sink_inputs();
-        c.sources = list_endpoints("sources");
-        c.sinks = list_endpoints("sinks");
+        let sink_inputs = list("sink-inputs", "Sink Input #");
+        let sources = list("sources", "Source #");
+        let sinks = list("sinks", "Sink #");
+        let (default_sink, default_source) = defaults();
+        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.sink_inputs = sink_inputs;
+        c.sources = sources;
+        c.sinks = sinks;
+        c.default_sink = default_sink;
+        c.default_source = default_source;
         c.stamp = Some(Instant::now());
     }
 
-    fn sink_inputs_for(&self, process: &str) -> Vec<String> {
+    /// Drop the cache so the next read reflects a change we just made. Used
+    /// after mute/default-sink changes so LED feedback is immediate; *not* used
+    /// after volume writes, which arrive at up to 60Hz during a slider drag and
+    /// whose ≤500ms staleness is invisible.
+    fn invalidate(&self) {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).stamp = None;
+    }
+
+    fn sink_inputs_for(&self, process: &str) -> Vec<Record> {
         self.refresh();
-        let c = self.cache.lock().unwrap();
-        let needle = process.to_lowercase();
-        let needle = strip_exe(&needle);
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let needle = strip_exe(&process.to_lowercase());
+        if needle.is_empty() {
+            return Vec::new();
+        }
         c.sink_inputs
             .iter()
             .filter(|si| {
                 si.process_binary.to_lowercase().contains(&needle)
                     || si.app_name.to_lowercase().contains(&needle)
             })
-            .map(|si| si.id.clone())
+            .cloned()
             .collect()
     }
 
-    fn match_endpoint(&self, kind: EndpointKind, name: Option<&str>) -> Option<String> {
+    fn match_endpoint(&self, kind: EndpointKind, name: Option<&str>) -> Option<Record> {
         self.refresh();
-        let c = self.cache.lock().unwrap();
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let list = match kind {
             EndpointKind::Source => &c.sources,
             EndpointKind::Sink => &c.sinks,
         };
         let name = name?;
         let n = name.to_lowercase();
+        if n.is_empty() {
+            return None;
+        }
         list.iter()
             .find(|e| e.name.to_lowercase().contains(&n) || e.description.to_lowercase().contains(&n))
-            .map(|e| e.name.clone())
+            .cloned()
+    }
+
+    /// Resolve an endpoint to its pactl name, falling back to the server's
+    /// default when the configured device isn't present.
+    fn endpoint_name(&self, kind: EndpointKind, name: Option<&str>) -> String {
+        self.match_endpoint(kind, name).map(|e| e.name).unwrap_or_else(|| {
+            match kind {
+                EndpointKind::Source => "@DEFAULT_SOURCE@".into(),
+                EndpointKind::Sink => "@DEFAULT_SINK@".into(),
+            }
+        })
+    }
+
+    /// Cached record for an endpoint, resolving `None`/unknown to the server
+    /// default by looking up the name `pactl get-default-{sink,source}` reports.
+    fn endpoint_record(&self, kind: EndpointKind, name: Option<&str>) -> Option<Record> {
+        if let Some(r) = self.match_endpoint(kind, name) {
+            return Some(r);
+        }
+        // Unconfigured or unresolvable: fall back to the server default, read
+        // from the same cache (no subprocess).
+        self.refresh();
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let (list, default) = match kind {
+            EndpointKind::Source => (&c.sources, &c.default_source),
+            EndpointKind::Sink => (&c.sinks, &c.default_sink),
+        };
+        list.iter().find(|e| &e.name == default).cloned()
+    }
+
+    fn run(&self, subcmd: &str, args: &[&str]) {
+        let status = pactl()
+            .arg(subcmd)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => log::debug!("pactl {subcmd} {args:?} exited with {s}"),
+            Err(e) => log::warn!("pactl {subcmd} failed to run: {e}"),
+        }
     }
 }
 
@@ -103,138 +173,69 @@ enum EndpointKind {
     Sink,
 }
 
-fn strip_exe(s: &str) -> String {
-    let s = s.trim_end_matches(".exe");
-    // Use the basename if a path was provided.
-    s.rsplit(['/', '\\']).next().unwrap_or(s).to_string()
-}
 
 impl AudioBackend for PulseBackend {
     fn set_volume(&self, target: VolumeTarget<'_>, value: f32) {
         let pct = format!("{}%", (value.clamp(0.0, 1.0) * 100.0).round() as i32);
         match target {
             VolumeTarget::Process(p) => {
-                for id in self.sink_inputs_for(p) {
-                    run("set-sink-input-volume", &[&id, &pct]);
+                for si in self.sink_inputs_for(p) {
+                    self.run("set-sink-input-volume", &[&si.id, &pct]);
                 }
             }
             VolumeTarget::Mic(m) => {
-                let name = self
-                    .match_endpoint(EndpointKind::Source, Some(m))
-                    .unwrap_or_else(|| "@DEFAULT_SOURCE@".into());
-                run("set-source-volume", &[&name, &pct]);
+                let name = self.endpoint_name(EndpointKind::Source, Some(m));
+                self.run("set-source-volume", &[&name, &pct]);
             }
             VolumeTarget::System(d) => {
-                let name = self
-                    .match_endpoint(EndpointKind::Sink, d)
-                    .unwrap_or_else(|| "@DEFAULT_SINK@".into());
-                run("set-sink-volume", &[&name, &pct]);
+                let name = self.endpoint_name(EndpointKind::Sink, d);
+                self.run("set-sink-volume", &[&name, &pct]);
             }
         }
     }
 
     fn set_mute(&self, target: MuteTarget<'_>, muted: bool) {
         let flag = if muted { "1" } else { "0" };
-        match target {
-            MuteTarget::Process(p) => {
-                for id in self.sink_inputs_for(p) {
-                    run("set-sink-input-mute", &[&id, flag]);
-                }
-            }
-            MuteTarget::Mic(m) => {
-                let name = self
-                    .match_endpoint(EndpointKind::Source, Some(m))
-                    .unwrap_or_else(|| "@DEFAULT_SOURCE@".into());
-                run("set-source-mute", &[&name, flag]);
-            }
-            MuteTarget::System(d) => {
-                let name = self
-                    .match_endpoint(EndpointKind::Sink, d)
-                    .unwrap_or_else(|| "@DEFAULT_SINK@".into());
-                run("set-sink-mute", &[&name, flag]);
-            }
-        }
+        self.apply_mute(target, flag);
     }
 
     fn toggle_mute(&self, target: MuteTarget<'_>) {
-        match target {
-            MuteTarget::Process(p) => {
-                for id in self.sink_inputs_for(p) {
-                    run("set-sink-input-mute", &[&id, "toggle"]);
-                }
-            }
-            MuteTarget::Mic(m) => {
-                let name = self
-                    .match_endpoint(EndpointKind::Source, Some(m))
-                    .unwrap_or_else(|| "@DEFAULT_SOURCE@".into());
-                run("set-source-mute", &[&name, "toggle"]);
-            }
-            MuteTarget::System(d) => {
-                let name = self
-                    .match_endpoint(EndpointKind::Sink, d)
-                    .unwrap_or_else(|| "@DEFAULT_SINK@".into());
-                run("set-sink-mute", &[&name, "toggle"]);
-            }
-        }
+        self.apply_mute(target, "toggle");
     }
 
     fn is_muted(&self, target: MuteTarget<'_>) -> bool {
-        let (subcmd, name) = match target {
+        // Served entirely from the refresh cache — no subprocess.
+        match target {
             MuteTarget::Process(p) => {
-                let ids = self.sink_inputs_for(p);
-                let Some(id) = ids.first() else { return false };
-                ("get-sink-input-mute", id.clone())
+                self.sink_inputs_for(p).first().map(|si| si.muted).unwrap_or(false)
             }
-            MuteTarget::Mic(m) => (
-                "get-source-mute",
-                self.match_endpoint(EndpointKind::Source, Some(m))
-                    .unwrap_or_else(|| "@DEFAULT_SOURCE@".into()),
-            ),
-            MuteTarget::System(d) => (
-                "get-sink-mute",
-                self.match_endpoint(EndpointKind::Sink, d)
-                    .unwrap_or_else(|| "@DEFAULT_SINK@".into()),
-            ),
-        };
-        capture(subcmd, &[&name])
-            .map(|o| o.contains("yes"))
-            .unwrap_or(false)
+            MuteTarget::Mic(m) => self
+                .endpoint_record(EndpointKind::Source, Some(m))
+                .map(|e| e.muted)
+                .unwrap_or(false),
+            MuteTarget::System(d) => self
+                .endpoint_record(EndpointKind::Sink, d)
+                .map(|e| e.muted)
+                .unwrap_or(false),
+        }
     }
 
     fn get_volume(&self, target: VolumeTarget<'_>) -> Option<f32> {
-        let (subcmd, name) = match target {
-            VolumeTarget::Process(p) => {
-                let ids = self.sink_inputs_for(p);
-                ("get-sink-input-volume", ids.first()?.clone())
-            }
-            VolumeTarget::Mic(m) => (
-                "get-source-volume",
-                self.match_endpoint(EndpointKind::Source, Some(m))
-                    .unwrap_or_else(|| "@DEFAULT_SOURCE@".into()),
-            ),
-            VolumeTarget::System(d) => (
-                "get-sink-volume",
-                self.match_endpoint(EndpointKind::Sink, d)
-                    .unwrap_or_else(|| "@DEFAULT_SINK@".into()),
-            ),
-        };
-        let out = capture(subcmd, &[&name])?;
-        parse_first_percent(&out).map(|p| (p as f32 / 100.0).clamp(0.0, 1.0))
+        match target {
+            VolumeTarget::Process(p) => self.sink_inputs_for(p).first()?.volume,
+            VolumeTarget::Mic(m) => self.endpoint_record(EndpointKind::Source, Some(m))?.volume,
+            VolumeTarget::System(d) => self.endpoint_record(EndpointKind::Sink, d)?.volume,
+        }
     }
 
     fn list_processes(&self) -> Vec<String> {
         self.refresh();
-        let c = self.cache.lock().unwrap();
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         let mut names: Vec<String> = c
             .sink_inputs
             .iter()
-            .map(|si| {
-                if !si.process_binary.is_empty() {
-                    si.process_binary.clone()
-                } else {
-                    si.app_name.clone()
-                }
-            })
+            .map(Record::process_label)
+            .filter(|n| !n.is_empty())
             .collect();
         names.sort();
         names.dedup();
@@ -243,17 +244,29 @@ impl AudioBackend for PulseBackend {
 
     fn list_mics(&self) -> Vec<String> {
         self.refresh();
-        self.cache.lock().unwrap().sources.iter().map(|e| e.description.clone()).collect()
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        // Skip `.monitor` sources: those are loopbacks of output devices, not
+        // capture hardware, and only clutter the microphone picker.
+        let mut names: Vec<String> = c
+            .sources
+            .iter()
+            .filter(|s| !s.monitor)
+            .map(Record::label)
+            .filter(|n| !n.is_empty())
+            .collect();
+        names.dedup();
+        names
     }
 
     fn list_outputs(&self) -> Vec<String> {
         self.refresh();
-        self.cache.lock().unwrap().sinks.iter().map(|e| e.description.clone()).collect()
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.sinks.iter().map(Record::label).filter(|n| !n.is_empty()).collect()
     }
 
     fn cycle_output(&self, devices: &[String]) {
         self.refresh();
-        let sinks = self.cache.lock().unwrap().sinks.clone();
+        let sinks = self.cache.lock().unwrap_or_else(|e| e.into_inner()).sinks.clone();
         // Cycle order as pactl sink names. Empty list = every sink; otherwise map
         // each configured description (or name) to its sink, skipping any missing.
         let order: Vec<String> = if devices.is_empty() {
@@ -279,103 +292,69 @@ impl AudioBackend for PulseBackend {
         let cur = capture("get-default-sink", &[]).map(|s| s.trim().to_string());
         let cur_idx = cur.as_ref().and_then(|c| order.iter().position(|n| n == c));
         let next = cur_idx.map_or(0, |i| (i + 1) % order.len());
-        run("set-default-sink", &[&order[next]]);
+        self.run("set-default-sink", &[&order[next]]);
+        self.invalidate();
     }
 }
 
-fn run(subcmd: &str, args: &[&str]) {
-    let _ = Command::new("pactl")
-        .arg(subcmd)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+impl PulseBackend {
+    fn apply_mute(&self, target: MuteTarget<'_>, flag: &str) {
+        match target {
+            MuteTarget::Process(p) => {
+                for si in self.sink_inputs_for(p) {
+                    self.run("set-sink-input-mute", &[&si.id, flag]);
+                }
+            }
+            MuteTarget::Mic(m) => {
+                let name = self.endpoint_name(EndpointKind::Source, Some(m));
+                self.run("set-source-mute", &[&name, flag]);
+            }
+            MuteTarget::System(d) => {
+                let name = self.endpoint_name(EndpointKind::Sink, d);
+                self.run("set-sink-mute", &[&name, flag]);
+            }
+        }
+        // Mute changes are user-initiated and rare; refresh now so the LED
+        // engine reflects the new state on its next tick rather than up to
+        // CACHE_TTL later.
+        self.invalidate();
+    }
+}
+
+/// A `pactl` command with the locale pinned. Without this every `starts_with`
+/// below fails on a translated desktop.
+fn pactl() -> Command {
+    let mut c = Command::new("pactl");
+    c.env("LC_ALL", "C").env("LANG", "C").env_remove("LANGUAGE");
+    c
 }
 
 fn capture(subcmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new("pactl")
+    let out = pactl()
         .arg(subcmd)
         .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
         .output()
         .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn list_sink_inputs() -> Vec<SinkInput> {
-    let Some(text) = capture("list", &["sink-inputs"]) else { return Vec::new() };
-    let mut out = Vec::new();
-    let mut cur: Option<SinkInput> = None;
-    for raw in text.lines() {
-        let line = raw.trim();
-        if let Some(rest) = line.strip_prefix("Sink Input #") {
-            if let Some(c) = cur.take() {
-                out.push(c);
-            }
-            cur = Some(SinkInput {
-                id: rest.trim().to_string(),
-                process_binary: String::new(),
-                app_name: String::new(),
-            });
-        } else if let Some(c) = cur.as_mut() {
-            if let Some(v) = property(line, "application.process.binary") {
-                c.process_binary = v;
-            } else if let Some(v) = property(line, "application.name") {
-                if c.app_name.is_empty() {
-                    c.app_name = v;
-                }
-            }
-        }
-    }
-    if let Some(c) = cur {
-        out.push(c);
-    }
-    out
-}
-
-fn list_endpoints(kind: &str) -> Vec<NamedId> {
+/// Parse `pactl list <kind>`. All three entity kinds share one layout: a header
+/// line `<header_prefix><id>` followed by indented `Key: value` fields and a
+/// `Properties:` block of `key = "value"` lines.
+fn list(kind: &str, header_prefix: &str) -> Vec<Record> {
     let Some(text) = capture("list", &[kind]) else { return Vec::new() };
-    let mut out = Vec::new();
-    let mut name = String::new();
-    let mut desc = String::new();
-    for raw in text.lines() {
-        let line = raw.trim_start();
-        if line.starts_with("Name: ") {
-            if !name.is_empty() {
-                out.push(NamedId { name: std::mem::take(&mut name), description: std::mem::take(&mut desc) });
-            }
-            name = line[6..].trim().to_string();
-        } else if line.starts_with("Description: ") {
-            desc = line[13..].trim().to_string();
-        }
-    }
-    if !name.is_empty() {
-        out.push(NamedId { name, description: desc });
-    }
-    out
+    parse_records(&text, header_prefix)
 }
 
-/// Parse the first `<digits>%` occurrence (pactl volume output) into a percent.
-fn parse_first_percent(s: &str) -> Option<u32> {
-    let bytes = s.as_bytes();
-    for i in 0..bytes.len() {
-        if bytes[i] == b'%' {
-            let mut j = i;
-            while j > 0 && bytes[j - 1].is_ascii_digit() {
-                j -= 1;
-            }
-            if j < i {
-                return s[j..i].parse().ok();
-            }
-        }
-    }
-    None
+/// `(default_sink, default_source)` from a single `pactl info` call.
+fn defaults() -> (String, String) {
+    let Some(text) = capture("info", &[]) else { return (String::new(), String::new()) };
+    parse_defaults(&text)
 }
 
-fn property(line: &str, key: &str) -> Option<String> {
-    // pactl prints `key = "value"` (with leading whitespace).
-    let prefix = format!("{key} = \"");
-    let idx = line.find(&prefix)?;
-    let rest = &line[idx + prefix.len()..];
-    let end = rest.rfind('"')?;
-    Some(rest[..end].to_string())
-}
+

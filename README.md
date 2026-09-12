@@ -23,6 +23,11 @@ and macro board.
   (anything under a Steam/Epic/GOG library is a game), and from the OS itself
   (browsers registered with Windows). Extend or add categories with an
   `app_groups.json` in the config directory.
+- **Profile safety** — a profile records the newest Slidr that wrote it. Opening
+  one from a *newer* build (or one this build cannot parse at all) shows a
+  warning and, crucially, stops Slidr writing to it — an older version would
+  otherwise silently save the profile back without the fields it does not know.
+  Upgrades are never flagged.
 - **Profiles** — each profile carries its own categories, slider/button
   assignments, **and** appearance + slider settings (theme, accent, dead-zone,
   curve, unmute-on-change). Create / rename / import / export / switch.

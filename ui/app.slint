@@ -1092,6 +1092,9 @@ component SettingsPage inherits VerticalBox {
     spacing: 14px;
 
     property <length> control-w: 260px;
+    // True while the active profile is one this build must not write.
+    in property <bool> profile-write-blocked;
+    callback reopen-version-warning();
 
     HorizontalBox {
         Text { text: "Settings"; font-size: 26px; font-weight: 700; font-family: "Inter";
@@ -1325,6 +1328,23 @@ component SettingsPage inherits VerticalBox {
                             VerticalLayout { alignment: center;
                                 Toggle { checked <=> root.minimize-to-tray;
                                          toggled => { root.dirty(); } } } } }
+                }
+            }
+
+            if root.profile-write-blocked: Rectangle {
+                border-radius: 10px; border-width: 1px; border-color: #d3831f;
+                background: #d3831f22;
+                VerticalLayout {
+                    padding: 12px; spacing: 2px;
+                    Text { text: "Changes are not being saved";
+                        font-family: "Inter"; font-size: 13px; font-weight: 600; }
+                    Text { text: "This profile is not safe for this version to write. Reopen the warning to decide.";
+                        font-family: "Inter"; font-size: 11px; wrap: word-wrap;
+                        color: Palette.foreground.with-alpha(0.7); }
+                    HorizontalLayout { alignment: start;
+                        IconButton { label: "Show the warning";
+                            clicked => { root.reopen-version-warning(); } }
+                    }
                 }
             }
 
@@ -2295,6 +2315,14 @@ export component AppWindow inherits Window {
 
     // ── Configure-LED popup state ──
     in-out property <bool> led-popup-open: false;
+    // Active profile was written by a newer Slidr: the dialog explains it, and
+    // `profile-write-blocked` keeps the warning visible after it is dismissed.
+    in-out property <bool> version-warning-open: false;
+    in property <string> version-warning-title;
+    in property <string> version-warning-body;
+    in property <string> version-warning-detail;
+    in property <string> version-warning-accept-label;
+    in-out property <bool> profile-write-blocked: false;
     in-out property <int> led-index: 0;            // 0..2
     in-out property <int> led-control: 0;
     in-out property <int> led-combine: 0;
@@ -2407,6 +2435,7 @@ export component AppWindow inherits Window {
     callback led-cond-kind(int, int);
     callback led-cond-media(int, string);
     callback led-cond-media-state(int, int);
+    callback version-warning-accept();
     callback led-cond-signal(int, int);
     callback led-cond-audio(int, int);
     callback led-cond-target(int, string);
@@ -2623,6 +2652,8 @@ export component AppWindow inherits Window {
                     discord-client-secret <=> root.discord-client-secret;
                     discord-status: root.discord-status;
                     discord-redirect: root.discord-redirect;
+                    profile-write-blocked: root.profile-write-blocked;
+                    reopen-version-warning => { root.version-warning-open = true; }
                     unmute-on-change <=> root.unmute-on-change;
                     start-with-os <=> root.start-with-os;
                     start-minimized <=> root.start-minimized;
@@ -2643,6 +2674,42 @@ export component AppWindow inherits Window {
                     led-clear-state => { root.led-clear-state(); }
                     open-discord-portal => { root.open-discord-portal(); }
                     copy-discord-redirect => { root.copy-discord-redirect(); }
+                }
+            }
+        }
+    }
+
+    // Profile written by a newer version. Deliberately not dismissable by
+    // clicking the backdrop: the consequence of ignoring it is a silently
+    // reduced profile, so it takes an explicit choice.
+    if root.version-warning-open: Rectangle {
+        background: #000000cc;
+        TouchArea {}
+        Rectangle {
+            x: parent.width / 2 - self.width / 2;
+            y: parent.height / 2 - self.height / 2;
+            width: 480px;
+            height: layout.preferred-height;
+            background: Palette.background;
+            border-radius: 14px; border-width: 1px; border-color: Palette.border;
+            TouchArea {}
+            layout := VerticalBox {
+                padding: 22px; spacing: 14px;
+                Text { text: root.version-warning-title;
+                    font-size: 18px; font-weight: 700; font-family: "Inter";
+                    wrap: word-wrap; }
+                Text { text: root.version-warning-body;
+                    font-family: "Inter"; font-size: 13px; wrap: word-wrap; }
+                Text { text: root.version-warning-detail;
+                    font-family: "Inter"; font-size: 12px; wrap: word-wrap;
+                    color: Palette.foreground.with-alpha(0.7); }
+                HorizontalBox {
+                    padding: 0px;
+                    IconButton { label: "View only (don't save)";
+                        clicked => { root.version-warning-open = false; } }
+                    Rectangle { horizontal-stretch: 1; }
+                    IconButton { label: root.version-warning-accept-label; primary: true;
+                        clicked => { root.version-warning-accept(); } }
                 }
             }
         }

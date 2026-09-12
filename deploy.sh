@@ -40,7 +40,8 @@ fi
 # ── Publish ──────────────────────────────────────────────────────────────
 log "Publishing to $WEBROOT"
 mkdir -p "$WEBROOT"
-install -m644 target/release/slidr            "$WEBROOT/Slidr-linux-x86_64"
+# 0755: this is a binary users download and run, not a document.
+install -m755 target/release/slidr            "$WEBROOT/Slidr-linux-x86_64"
 if [[ "$SKIP_WINDOWS" -eq 0 ]]; then
   install -m644 installer/Slidr-windows-setup.exe       "$WEBROOT/Slidr-windows-setup.exe"
   install -m644 "target/$WIN_TARGET/release/slidr.exe"  "$WEBROOT/Slidr-windows-portable.exe"

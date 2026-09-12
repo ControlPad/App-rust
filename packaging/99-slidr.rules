@@ -1,0 +1,28 @@
+# udev rules for Slidr — grant the logged-in desktop user access to the board's
+# serial port without adding them to a group or running the app as root.
+#
+# Install:
+#   sudo install -m644 packaging/99-slidr.rules /etc/udev/rules.d/99-slidr.rules
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# Without this (or membership in the port's owning group, usually `dialout`),
+# opening /dev/ttyUSB* / /dev/ttyACM* fails with "Permission denied (os error 13)"
+# and Slidr reports "Access denied" on the connection banner.
+#
+# The VID list mirrors KNOWN_USB_VIDS in src/serial.rs — keep the two in sync.
+
+# Arduino LLC (Uno, Mega, Nano 33, ...)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2341", TAG+="uaccess"
+# Atmel / Arduino Leonardo, Micro, Pro Micro
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0d28", TAG+="uaccess"
+# WCH CH340 / CH341 (most Nano clones)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", TAG+="uaccess"
+# FTDI FT232
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", TAG+="uaccess"
+# Silicon Labs CP210x
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", TAG+="uaccess"
+
+# `uaccess` hands the device to whoever is logged in at the seat, which is what
+# you want on a single-user desktop. On systems without systemd-logind, replace
+# the TAG with a group instead, e.g.:
+#   SUBSYSTEM=="tty", ATTRS{idVendor}=="2341", MODE="0660", GROUP="dialout"

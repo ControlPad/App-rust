@@ -27,6 +27,7 @@ mod model;
 mod protocol;
 mod serial;
 mod storage;
+mod version;
 #[cfg(target_os = "windows")]
 mod tray;
 
@@ -112,11 +113,24 @@ fn main() -> anyhow::Result<()> {
     } else {
         settings.active_preset.clone()
     };
-    let preset = storage::load_preset(&preset_name).unwrap_or_else(|_| model::Preset {
-        id: 1,
-        name: preset_name.clone(),
-        ..Default::default()
-    });
+    // A profile that fails to parse must not be quietly replaced by an empty
+    // one: the app would then write that blank over the user's file on exit and
+    // the profile is gone. Load it, or carry the reason and refuse to write.
+    let (preset, load_error) = match storage::load_preset(&preset_name) {
+        Ok(p) => (p, None),
+        Err(e) => {
+            log::error!(
+                "could not read profile {preset_name:?}: {e:#} — starting with a blank \
+                 profile and refusing to write to it"
+            );
+            let blank = model::Preset {
+                id: 1,
+                name: preset_name.clone(),
+                ..Default::default()
+            };
+            (blank, Some(e.to_string()))
+        }
+    };
     settings.active_preset = preset.name.clone();
 
     // Repair a stale autostart entry (the executable moved since it was set up).
@@ -142,6 +156,7 @@ fn main() -> anyhow::Result<()> {
         editing_idx: None,
         last_status_refresh: None,
         editing_led: None,
+        profile_block: load_error.map(glue::ProfileBlock::Unreadable),
     }));
 
     let ui = AppWindow::new()?;
@@ -326,9 +341,10 @@ fn main() -> anyhow::Result<()> {
     }
     slint::run_event_loop_until_quit()?;
 
-    // Persist on exit.
-    let s = shared.lock();
+    // Persist on exit. The profile goes through the guarded path, so a
+    // profile from a newer Slidr is not quietly rewritten on the way out.
+    let mut s = shared.lock();
     let _ = storage::save_settings(&s.settings);
-    let _ = storage::save_preset(&s.preset);
+    s.save_preset();
     Ok(())
 }

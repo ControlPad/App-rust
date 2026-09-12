@@ -43,9 +43,83 @@ pub struct Shared {
     pub last_status_refresh: Option<Instant>,
     /// Working copy for the configure-LED popup: (led index, config being edited).
     pub editing_led: Option<(usize, LedConfig)>,
+    /// Set when the active profile must not be written back — see
+    /// [`ProfileBlock`]. While it is set, [`Shared::save_preset`] refuses to
+    /// write. The user clears it by acknowledging the warning.
+    pub profile_block: Option<ProfileBlock>,
+}
+
+/// Why the active profile must not be written back.
+#[derive(Debug, Clone)]
+pub enum ProfileBlock {
+    /// Stamped with a newer Slidr than this build. Loading is harmless, but
+    /// saving would drop whatever that version stored in unknown fields.
+    FromNewer(String),
+    /// Could not be read at all, so the profile in memory is a blank
+    /// stand-in. Saving would replace the file with that blank — the worst
+    /// outcome of the two, and the one that actually destroys a profile.
+    Unreadable(String),
 }
 
 impl Shared {
+    /// Persist the active profile — the only path that writes it.
+    ///
+    /// Refuses while `profile_newer` is set: the profile came from a newer
+    /// Slidr, and writing it here would drop whatever that version stored in
+    /// fields this build does not have. Stamps the profile with the newest
+    /// version that has written it on the way out.
+    pub fn save_preset(&mut self) {
+        match &self.profile_block {
+            Some(ProfileBlock::FromNewer(v)) => {
+                log::warn!(
+                    "not saving profile {:?}: written by Slidr {v}, this build is {}",
+                    self.preset.name,
+                    crate::version::CURRENT
+                );
+                return;
+            }
+            Some(ProfileBlock::Unreadable(e)) => {
+                log::warn!(
+                    "not saving profile {:?}: it could not be read ({e}), so this would \
+                     overwrite it with a blank profile",
+                    self.preset.name
+                );
+                return;
+            }
+            None => {}
+        }
+        self.preset.app_version =
+            crate::version::higher(&self.preset.app_version, crate::version::CURRENT);
+        let _ = crate::storage::save_preset(&self.preset);
+    }
+
+    /// Compare the freshly loaded profile's stamp against this build and arm
+    /// the guard if it came from the future. An existing `Unreadable` block is
+    /// kept: that one is the more serious of the two.
+    pub fn check_profile_version(&mut self) -> Option<ProfileBlock> {
+        if matches!(self.profile_block, Some(ProfileBlock::Unreadable(_))) {
+            return self.profile_block.clone();
+        }
+        self.profile_block = crate::version::is_newer_than_current(&self.preset.app_version)
+            .then(|| ProfileBlock::FromNewer(self.preset.app_version.clone()));
+        self.profile_block.clone()
+    }
+
+    /// Let the user proceed anyway: writes are allowed again from here on.
+    ///
+    /// The stamp is lowered to this build, because from the next save onwards
+    /// that is the truth — whatever the newer version stored is dropped by that
+    /// save, and warning about it again every launch would be noise.
+    pub fn acknowledge_profile_version(&mut self) {
+        if let Some(block) = self.profile_block.take() {
+            log::info!(
+                "profile warning acknowledged for {:?} ({block:?}); this build now owns it",
+                self.preset.name
+            );
+            self.preset.app_version = crate::version::CURRENT.to_string();
+        }
+    }
+
     /// Push the full LED configuration set + brightness + experimental flag to
     /// the actuator's LED engine. Call after any change to LED config/settings.
     pub fn push_leds(&self) {
@@ -71,6 +145,27 @@ pub fn wire(
         push_preset_to_ui(ui, &s.preset);
         apply_appearance(ui, &s.preset.settings);
         s.push_leds();
+    }
+
+    // Warn if the active profile was written by a newer Slidr (and block
+    // writes until acknowledged) — see `Shared::save_preset`.
+    {
+        let mut s = shared.lock();
+        let newer = s.check_profile_version();
+        push_version_warning(ui, &s, newer);
+    }
+    {
+        let shared = shared.clone();
+        let weak = ui.as_weak();
+        ui.on_version_warning_accept(move || {
+            let mut s = shared.lock();
+            s.acknowledge_profile_version();
+            if let Some(ui) = weak.upgrade() {
+                ui.set_profile_write_blocked(false);
+                ui.set_version_warning_open(false);
+                toast(&ui, "Editing enabled — the newer version's extras will be dropped on save");
+            }
+        });
     }
 
     // Empty initial slider/button cells.
@@ -121,7 +216,7 @@ pub fn wire(
             } else if target_kind == 1 && idx < NUM_BUTTONS {
                 s.preset.assignments.buttons[idx] = chosen;
             }
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
             push_preset_to_ui(&ui, &s.preset);
             let live = s.engine.state().clone();
             push_cells(&ui, &live.sliders, &live.buttons, &s.preset);
@@ -142,7 +237,7 @@ pub fn wire(
                 let id = next_id(&s.preset.button_categories, |c| c.id);
                 s.preset.button_categories.push(ButtonCategory { id, name: name.to_string(), actions: vec![], collapsed: false });
             }
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
             let Some(ui) = weak.upgrade() else { return };
             push_preset_to_ui(&ui, &s.preset);
         });
@@ -155,11 +250,14 @@ pub fn wire(
             let new_preset = Preset {
                 id: 1,
                 name: name.to_string(),
+                app_version: crate::version::CURRENT.to_string(),
                 ..Default::default()
             };
             if crate::storage::save_preset(&new_preset).is_ok() {
                 let mut s = shared.lock();
                 s.preset = new_preset;
+                // Freshly created here, so nothing to guard against.
+                s.profile_block = None;
                 s.settings.active_preset = name.to_string();
                 let _ = crate::storage::save_settings(&s.settings);
                 if let Some(ui) = weak.upgrade() {
@@ -185,7 +283,7 @@ pub fn wire(
             } else if let Some(c) = s.preset.button_categories.iter_mut().find(|c| c.id as i32 == id) {
                 c.name = name.to_string();
             }
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
             let Some(ui) = weak.upgrade() else { return };
             push_preset_to_ui(&ui, &s.preset);
             refresh_home(&ui, &s);  // update Home preview names without a board input
@@ -208,7 +306,7 @@ pub fn wire(
                     if *slot == Some(id) { *slot = None }
                 }
             }
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
             let Some(ui) = weak.upgrade() else { return };
             push_preset_to_ui(&ui, &s.preset);
             refresh_home(&ui, &s);
@@ -228,7 +326,7 @@ pub fn wire(
             } else if let Some(c) = s.preset.button_categories.iter_mut().find(|c| c.id == cat_id) {
                 if idx < c.actions.len() { c.actions.remove(idx); }
             }
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
             let Some(ui) = weak.upgrade() else { return };
             push_preset_to_ui(&ui, &s.preset);
         });
@@ -247,7 +345,7 @@ pub fn wire(
             } else if let Some(c) = s.preset.button_categories.iter_mut().find(|c| c.id == id) {
                 c.collapsed = !c.collapsed;
             }
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
             let Some(ui) = weak.upgrade() else { return };
             push_preset_to_ui(&ui, &s.preset);
         });
@@ -265,7 +363,7 @@ pub fn wire(
             } else {
                 reorder_by_id(&mut s.preset.button_categories, from_id, to, |c| c.id);
             }
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
             let Some(ui) = weak.upgrade() else { return };
             push_preset_to_ui(&ui, &s.preset);
             refresh_home(&ui, &s);
@@ -286,7 +384,7 @@ pub fn wire(
                 move_line(&mut s.preset.button_categories, from_cat, from_idx, to_cat, to_idx,
                     |c| c.id, |c| &mut c.actions);
             }
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
             let Some(ui) = weak.upgrade() else { return };
             push_preset_to_ui(&ui, &s.preset);
         });
@@ -454,7 +552,7 @@ pub fn wire(
                         Some(i) if i < c.actions.len() => c.actions[i] = action,
                         _ => c.actions.push(action),
                     }
-                    let _ = crate::storage::save_preset(&s.preset);
+                    s.save_preset();
                     let Some(ui) = weak.upgrade() else { return };
                     push_preset_to_ui(&ui, &s.preset);
                     toast(&ui, if editing.is_some() { "Updated." } else { "Added." });
@@ -487,7 +585,7 @@ pub fn wire(
                     _ => c.actions.push(action),
                 }
             }
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
             let Some(ui) = weak.upgrade() else { return };
             push_preset_to_ui(&ui, &s.preset);
             toast(&ui, if editing.is_some() { "Updated." } else { "Added." });
@@ -530,7 +628,7 @@ pub fn wire(
             {
                 let mut s = shared.lock();
                 s.preset.settings.theme = mode;
-                let _ = crate::storage::save_preset(&s.preset);
+                s.save_preset();
             }
             if let Some(ui) = weak.upgrade() {
                 apply_color_scheme(&ui, mode);
@@ -548,7 +646,7 @@ pub fn wire(
             if matches!(preset, crate::curve::CurvePreset::Custom) {
                 s.preset.settings.custom_curve = crate::curve::BezierPoints::CUSTOM_DEFAULT;
             }
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
             if let Some(ui) = weak.upgrade() {
                 push_curve_to_ui(&ui, &s.preset.settings);
             }
@@ -565,7 +663,7 @@ pub fn wire(
                 x2: ui.get_curve_x2(), y2: ui.get_curve_y2(),
             };
             s.preset.settings.curve_preset = crate::curve::CurvePreset::Custom;
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
         });
     }
     {
@@ -578,6 +676,18 @@ pub fn wire(
             if old.is_empty() || new.is_empty() || old == new { return }
             // Read the old preset, write under new name, delete old.
             if let Ok(mut p) = crate::storage::load_preset(&old) {
+                // Renaming writes the whole file back, which would drop fields
+                // a newer Slidr put there — same hazard as saving, so refuse.
+                if crate::version::is_newer_than_current(&p.app_version) {
+                    if let Some(ui) = weak.upgrade() {
+                        toast(&ui, &format!(
+                            "Can't rename: {old} was written by Slidr {} (this is {})",
+                            p.app_version,
+                            crate::version::CURRENT
+                        ));
+                    }
+                    return;
+                }
                 p.name = new.to_string();
                 if crate::storage::save_preset(&p).is_ok() {
                     let _ = crate::storage::delete_preset(&old);
@@ -628,6 +738,20 @@ pub fn wire(
                 if let Some(ui) = weak.upgrade() { toast(&ui, "Import failed: invalid preset file"); }
                 return;
             };
+            // Parsing already dropped any field this build doesn't know, so
+            // writing the copy would hand back a quietly reduced profile. The
+            // file itself stays untouched — better to refuse and let the user
+            // import it with a matching version.
+            if crate::version::is_newer_than_current(&preset.app_version) {
+                if let Some(ui) = weak.upgrade() {
+                    toast(&ui, &format!(
+                        "Import refused: profile is from Slidr {} (this is {})",
+                        preset.app_version,
+                        crate::version::CURRENT
+                    ));
+                }
+                return;
+            }
             // Ensure a unique, non-empty name (avoid clobbering an existing one).
             if preset.name.trim().is_empty() {
                 preset.name = path.file_stem().map(|s| s.to_string_lossy().to_string())
@@ -661,7 +785,7 @@ pub fn wire(
             pull_global_from_ui(&ui, &mut s.settings);
             pull_profile_from_ui(&ui, &mut s.preset.settings);
             let _ = crate::storage::save_settings(&s.settings);
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
             let _ = crate::autostart::set_enabled(s.settings.start_with_os, s.settings.start_minimized);
             // Live-apply appearance (accent / theme) immediately.
             apply_appearance(&ui, &s.preset.settings);
@@ -693,12 +817,25 @@ pub fn wire(
         let shared = shared.clone();
         let weak = ui.as_weak();
         ui.on_load_preset(move |name| {
-            let Ok(p) = crate::storage::load_preset(&name) else { return };
+            let p = match crate::storage::load_preset(&name) {
+                Ok(p) => p,
+                Err(e) => {
+                    // Leave the current profile loaded; switching to a profile
+                    // we cannot read would mean editing a blank stand-in.
+                    log::error!("could not read profile {name:?}: {e:#}");
+                    if let Some(ui) = weak.upgrade() {
+                        toast(&ui, &format!("Could not read profile {name} — left unchanged"));
+                    }
+                    return;
+                }
+            };
             let mut s = shared.lock();
             s.preset = p;
             s.settings.active_preset = s.preset.name.clone();
             let _ = crate::storage::save_settings(&s.settings);
+            let newer = s.check_profile_version();
             if let Some(ui) = weak.upgrade() {
+                push_version_warning(&ui, &s, newer);
                 push_preset_to_ui(&ui, &s.preset);
                 push_settings_to_ui(&ui, &s.settings, &s.preset.settings);
                 apply_appearance(&ui, &s.preset.settings);
@@ -822,7 +959,7 @@ pub fn wire(
                 ui.get_led_inactive_btarget().as_str(),
             );
             s.preset.leds[led] = Some(cfg);
-            let _ = crate::storage::save_preset(&s.preset);
+            s.save_preset();
             s.push_leds();
             drop(s);
             ui.set_led_popup_open(false);
@@ -883,7 +1020,7 @@ pub fn wire(
             if let Some(saved) = s.preset.leds.get_mut(led).and_then(|c| c.as_mut()) {
                 if saved.control == LedControl::Manual {
                     saved.manual_active = !saved.manual_active;
-                    let _ = crate::storage::save_preset(&s.preset);
+                    s.save_preset();
                 }
             }
         });
@@ -1021,7 +1158,7 @@ pub fn wire(
                         let _ = s.cmd_tx.send(cmd);
                     }
                     if led_toggled {
-                        let _ = crate::storage::save_preset(&s.preset);
+                        s.save_preset();
                     }
                     if dirty { changed = true; }
                 }
@@ -1163,6 +1300,44 @@ fn move_line<C, E>(
     let to = if from_cat == to_cat && from_idx < to_idx { to_idx - 1 } else { to_idx };
     let v = lines(&mut cats[to_pos]);
     v.insert(to.min(v.len()), item);
+}
+
+/// Show (or clear) the warning that the active profile must not be written.
+fn push_version_warning(ui: &AppWindow, s: &Shared, block: Option<ProfileBlock>) {
+    let Some(block) = block else {
+        ui.set_profile_write_blocked(false);
+        ui.set_version_warning_open(false);
+        return;
+    };
+    let name = s.preset.name.clone();
+    let current = crate::version::CURRENT;
+    let (title, body, detail, accept) = match &block {
+        ProfileBlock::FromNewer(v) => (
+            "Profile from a newer Slidr".to_string(),
+            format!("“{name}” was last written by Slidr {v}. This build is {current}."),
+            "It can hold settings this version does not know about. Loading is safe — saving \
+             is not: anything newer would be dropped. Until you decide, Slidr keeps the \
+             profile loaded but does not write to it."
+                .to_string(),
+            "Edit anyway".to_string(),
+        ),
+        ProfileBlock::Unreadable(e) => (
+            "Profile could not be read".to_string(),
+            format!("“{name}” could not be parsed, so Slidr loaded a blank profile under that name.\n\n{e}"),
+            "This usually means the file came from a newer version whose format this build \
+             does not understand. Saving would replace it with the blank one, so Slidr will \
+             not write to it. Your file on disk is untouched."
+                .to_string(),
+            "Overwrite with a blank profile".to_string(),
+        ),
+    };
+    log::warn!("profile {name:?}: {block:?} — writes blocked");
+    ui.set_version_warning_title(title.into());
+    ui.set_version_warning_body(body.into());
+    ui.set_version_warning_detail(detail.into());
+    ui.set_version_warning_accept_label(accept.into());
+    ui.set_profile_write_blocked(true);
+    ui.set_version_warning_open(true);
 }
 
 fn push_preset_to_ui(ui: &AppWindow, preset: &Preset) {

@@ -586,6 +586,11 @@ pub struct Preset {
     /// Per-LED config, indexed by LED (0/1/2 = buttons 5/6/7). None = not configured.
     #[serde(default)]
     pub leds: [Option<LedConfig>; NUM_LEDS],
+    /// Newest Slidr version that has written this profile. Raised on save,
+    /// never lowered; empty for profiles written before stamping existed.
+    /// See [`crate::version`] for why the comparison only matters downwards.
+    #[serde(default)]
+    pub app_version: String,
 }
 
 impl Preset {

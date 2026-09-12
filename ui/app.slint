@@ -590,9 +590,9 @@ component SettingRow inherits HorizontalLayout {
 
     VerticalLayout {
         horizontal-stretch: 1; spacing: 2px;
-        Text { text: root.label; vertical-alignment: center;
+        Text { text: root.label; vertical-alignment: center; wrap: word-wrap;
             font-family: "Inter"; font-size: 13px; font-weight: 500; }
-        if root.description != "": Text { text: root.description;
+        if root.description != "": Text { text: root.description; wrap: word-wrap;
             font-family: "Inter"; font-size: 11px;
             color: Palette.foreground.with-alpha(0.55); }
     }
@@ -1077,6 +1077,7 @@ component SettingsPage inherits VerticalBox {
     in-out property <string> discord-client-id;
     in-out property <string> discord-client-secret;
     in property <string> discord-status;
+    in property <string> discord-redirect;
     in property <string> build-stamp;
 
     callback theme-changed(int);
@@ -1086,6 +1087,7 @@ component SettingsPage inherits VerticalBox {
     callback led-save-state();
     callback led-clear-state();
     callback open-discord-portal();
+    callback copy-discord-redirect();
 
     spacing: 14px;
 
@@ -1102,6 +1104,10 @@ component SettingsPage inherits VerticalBox {
         vertical-stretch: 1;
         VerticalBox {
             spacing: 12px; alignment: start;
+            // Pin the content to the viewport width so this page scrolls only
+            // vertically. Left to itself the layout takes its preferred width,
+            // and one long description then drags every card off to the right.
+            width: parent.width - 18px;
 
             Card {
                 VerticalBox { padding: 18px; spacing: 6px;
@@ -1203,7 +1209,7 @@ component SettingsPage inherits VerticalBox {
                     }
                     if root.led-experimental: SettingRow {
                         label: "Discord (LED source)";
-                        description: "Lets an LED follow your Discord mute. Create an application at discord.com/developers, add the redirect http://localhost, then paste its Client ID and Secret. Discord asks you to confirm once; the secret is only needed until then.";
+                        description: "Let an LED follow your Discord mute";
                         VerticalLayout { width: root.control-w; spacing: 6px;
                             LineEdit { height: 32px; text <=> root.discord-client-id;
                                 placeholder-text: "Client ID";
@@ -1212,14 +1218,73 @@ component SettingsPage inherits VerticalBox {
                                 input-type: password;
                                 placeholder-text: "Client Secret";
                                 edited(t) => { root.dirty(); } }
-                            HorizontalLayout { spacing: 6px; alignment: start;
-                                IconButton { label: "Open developer portal";
-                                    icon: @image-url("../assets/icons/world.svg");
-                                    clicked => { root.open-discord-portal(); } }
-                            }
                             if root.discord-status != "": Text { text: root.discord-status;
                                 font-size: 11px; font-family: "Inter"; wrap: word-wrap;
                                 color: Palette.foreground.with-alpha(0.6); }
+                        }
+                    }
+
+                    // Setup checklist. Discord gates the voice-state scopes on an
+                    // OAuth application the user has to create once, so the least
+                    // we can do is name the three steps and hand over the exact
+                    // redirect URL -- forgetting that one is the usual failure.
+                    if root.led-experimental: Rectangle {
+                        border-radius: 10px; border-width: 1px;
+                        border-color: Palette.border;
+                        background: Palette.alternate-background;
+                        VerticalLayout {
+                            padding: 12px; spacing: 8px;
+                            Text { text: "One-time setup"; font-weight: 600;
+                                font-family: "Inter"; font-size: 12px; }
+
+                            HorizontalLayout { spacing: 8px;
+                                Text { text: "1."; font-family: "Inter"; font-size: 11px;
+                                    min-width: 14px; vertical-alignment: center;
+                                    color: Palette.foreground.with-alpha(0.55); }
+                                Text { text: "Create an application in the Discord developer portal.";
+                                    font-family: "Inter"; font-size: 11px; wrap: word-wrap;
+                                    horizontal-stretch: 1; vertical-alignment: center;
+                                    color: Palette.foreground.with-alpha(0.75); }
+                                IconButton { label: "Open portal";
+                                    icon: @image-url("../assets/icons/world.svg");
+                                    clicked => { root.open-discord-portal(); } }
+                            }
+
+                            HorizontalLayout { spacing: 8px;
+                                Text { text: "2."; font-family: "Inter"; font-size: 11px;
+                                    min-width: 14px; vertical-alignment: center;
+                                    color: Palette.foreground.with-alpha(0.55); }
+                                VerticalLayout { spacing: 4px; horizontal-stretch: 1;
+                                    Text { text: "In OAuth2 > Redirects, add exactly this URL and save:";
+                                        font-family: "Inter"; font-size: 11px; wrap: word-wrap;
+                                        color: Palette.foreground.with-alpha(0.75); }
+                                    HorizontalLayout { spacing: 6px;
+                                        Rectangle {
+                                            height: 30px; horizontal-stretch: 1;
+                                            border-radius: 6px; border-width: 1px;
+                                            border-color: Palette.border;
+                                            background: Palette.background;
+                                            HorizontalLayout { padding-left: 8px; padding-right: 8px;
+                                                Text { text: root.discord-redirect;
+                                                    font-size: 12px; overflow: elide;
+                                                    vertical-alignment: center; }
+                                            }
+                                        }
+                                        IconButton { label: "Copy";
+                                            clicked => { root.copy-discord-redirect(); } }
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout { spacing: 8px;
+                                Text { text: "3."; font-family: "Inter"; font-size: 11px;
+                                    min-width: 14px; vertical-alignment: center;
+                                    color: Palette.foreground.with-alpha(0.55); }
+                                Text { text: "Paste the Client ID and Client Secret above. Discord asks you to confirm once; after that the secret is no longer read.";
+                                    font-family: "Inter"; font-size: 11px; wrap: word-wrap;
+                                    horizontal-stretch: 1;
+                                    color: Palette.foreground.with-alpha(0.75); }
+                            }
                         }
                     }
                     if root.led-experimental: SettingRow {
@@ -2207,6 +2272,7 @@ export component AppWindow inherits Window {
     in-out property <string> discord-client-id;
     in-out property <string> discord-client-secret;
     in property <string> discord-status;
+    in property <string> discord-redirect;
     in-out property <bool> unmute-on-change;
     in-out property <bool> start-with-os;
     in-out property <bool> start-minimized;
@@ -2328,6 +2394,7 @@ export component AppWindow inherits Window {
     callback led-save-state();
     callback led-clear-state();
     callback open-discord-portal();
+    callback copy-discord-redirect();
 
     // ── Configure-LED ──
     callback open-led-config(int);   // button index
@@ -2555,6 +2622,7 @@ export component AppWindow inherits Window {
                     discord-client-id <=> root.discord-client-id;
                     discord-client-secret <=> root.discord-client-secret;
                     discord-status: root.discord-status;
+                    discord-redirect: root.discord-redirect;
                     unmute-on-change <=> root.unmute-on-change;
                     start-with-os <=> root.start-with-os;
                     start-minimized <=> root.start-minimized;
@@ -2574,6 +2642,7 @@ export component AppWindow inherits Window {
                     led-save-state => { root.led-save-state(); }
                     led-clear-state => { root.led-clear-state(); }
                     open-discord-portal => { root.open-discord-portal(); }
+                    copy-discord-redirect => { root.copy-discord-redirect(); }
                 }
             }
         }

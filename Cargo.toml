@@ -86,6 +86,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Diagnostics_ToolHelp",
     # Restoring/raising our own window from the tray (EnumWindows + SetForegroundWindow).
     "Win32_UI_WindowsAndMessaging",
+    # Clipboard for the "copy this value" buttons (src/clipboard.rs).
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     # OS media session (SMTC) as an LED state source — "music is playing".
     "Media_Control",
     "Foundation",

@@ -496,6 +496,21 @@ pub fn wire(
 
     // ─── settings ──────────────────────────────────────────────────────────
     {
+        let weak = ui.as_weak();
+        // The redirect has to match character for character, so hand it over
+        // rather than asking anyone to retype it.
+        ui.on_copy_discord_redirect(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            match crate::clipboard::set_text(crate::discord::REDIRECT_URI) {
+                Ok(()) => toast(&ui, "Copied http://localhost"),
+                Err(e) => {
+                    log::warn!("clipboard: {e}");
+                    toast(&ui, "Could not copy — select the URL and copy it manually");
+                }
+            }
+        });
+    }
+    {
         // Straight to the page where the Client ID lives — the setup is a
         // detour through a web portal and the app should at least open the door.
         ui.on_open_discord_portal(move || {
@@ -1272,6 +1287,7 @@ fn push_settings_to_ui(ui: &AppWindow, global: &Settings, profile: &crate::model
     ui.set_discord_client_id(global.discord_client_id.clone().into());
     ui.set_discord_client_secret(global.discord_client_secret.clone().into());
     ui.set_discord_status(discord_hint(global).into());
+    ui.set_discord_redirect(crate::discord::REDIRECT_URI.into());
     ui.set_active_preset_name(global.active_preset.clone().into());
     // Appearance + sliders (profile)
     ui.set_theme_index(match profile.theme {

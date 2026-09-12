@@ -30,7 +30,9 @@ use serde_json::{json, Value};
 /// Scopes we need: `rpc` to talk to the client at all, `rpc.voice.read` for the
 /// voice settings. Both are read-only.
 const SCOPES: [&str; 2] = ["rpc", "rpc.voice.read"];
-const REDIRECT_URI: &str = "http://localhost";
+/// Redirect the user registers on their application, and which the token
+/// exchange must repeat verbatim. Shown in the settings checklist.
+pub const REDIRECT_URI: &str = "http://localhost";
 const TOKEN_URL: &str = "https://discord.com/api/v10/oauth2/token";
 
 /// Wait between reconnect attempts when Discord isn't running (or rejected us).

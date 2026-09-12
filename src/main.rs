@@ -13,6 +13,7 @@ mod actuator;
 mod app_groups;
 mod audio;
 mod autostart;
+mod clipboard;
 mod curve;
 mod discord;
 mod events;

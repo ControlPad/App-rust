@@ -1421,7 +1421,7 @@ fn untruncate_comm(pid: &str, comm: &str) -> String {
     let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) else {
         return comm.to_string();
     };
-    let argv0 = cmdline.split(' ').next().unwrap_or("");
+    let argv0 = cmdline.split('\0').next().unwrap_or("");
     let base = argv0.rsplit('/').next().unwrap_or("");
     // Only trust it when it really is the same program, just not clipped -
     // argv[0] can be an interpreter path or a rewritten title.

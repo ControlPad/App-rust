@@ -370,7 +370,3 @@ fn defaults() -> (String, String) {
 }
 
 
-
-/// Parse the first `<digits>%` occurrence (pactl volume output) into a percent.
-
-

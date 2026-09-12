@@ -20,21 +20,49 @@ pub struct Tray {
     toggle_id: tray_icon::menu::MenuId,
     exit_id: tray_icon::menu::MenuId,
     weak: slint::Weak<AppWindow>,
+    /// Last label state pushed to the menu item, so the visibility poll only
+    /// touches the item when it actually changes.
+    shown_label: std::cell::Cell<bool>,
 }
 
 impl Tray {
     /// Reflect window visibility in the toggle label.
     /// hidden=true → "Show Slidr"; hidden=false → "Minimize Slidr".
     pub fn set_window_hidden(&self, hidden: bool) {
+        if self.shown_label.get() == !hidden {
+            return;
+        }
+        self.shown_label.set(!hidden);
         self.toggle
             .set_text(if hidden { "Show Slidr" } else { "Minimize Slidr" });
+    }
+
+    /// True when the window is actually on screen — visible *and* not minimized
+    /// to the taskbar. A minimized window is "not shown" for the toggle's
+    /// purposes: the next click should bring it back, not hide it further.
+    fn is_shown(&self) -> bool {
+        self.weak
+            .upgrade()
+            .map(|ui| ui.window().is_visible() && !ui.window().is_minimized())
+            .unwrap_or(false)
+    }
+
+    /// Re-derive the toggle label from the window's real state. Called every
+    /// poll tick so the label can't drift out of sync — whether the window was
+    /// never shown (autostart `--hidden`), minimized from the taskbar, or
+    /// restored by the user outside our own code paths.
+    fn sync_label(&self) {
+        self.set_window_hidden(!self.is_shown());
     }
 
     fn show_window(&self) {
         if let Some(ui) = self.weak.upgrade() {
             let _ = ui.show();
+            // Un-minimize covers the "sitting in the taskbar" case; `show()`
+            // alone is a no-op for a window that is visible but minimized.
             ui.window().set_minimized(false);
         }
+        raise_to_foreground();
         self.set_window_hidden(false);
     }
 
@@ -46,11 +74,49 @@ impl Tray {
     }
 
     fn toggle_window(&self) {
-        let visible = self.weak.upgrade().map(|ui| ui.window().is_visible()).unwrap_or(false);
-        if visible {
+        if self.is_shown() {
             self.hide_window();
         } else {
             self.show_window();
+        }
+    }
+}
+
+/// Bring this process's main window to the front.
+///
+/// Slint has no "focus the window" API, and `set_minimized(false)` restores the
+/// window without necessarily raising it above whatever the user was in. We
+/// locate our own top-level window by process id and ask the shell directly.
+fn raise_to_foreground() {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindow, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow,
+        ShowWindow, GW_OWNER, SW_RESTORE,
+    };
+
+    unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let out = &mut *(lparam.0 as *mut Option<HWND>);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        // Ours, top-level (no owner), and actually mapped — skips the hidden
+        // helper windows winit and the tray create alongside the real one.
+        if pid == GetCurrentProcessId()
+            && GetWindow(hwnd, GW_OWNER).is_err()
+            && IsWindowVisible(hwnd).as_bool()
+        {
+            *out = Some(hwnd);
+            return BOOL(0); // found it — stop enumerating
+        }
+        BOOL(1)
+    }
+
+    unsafe {
+        let mut found: Option<HWND> = None;
+        let _ = EnumWindows(Some(cb), LPARAM(&mut found as *mut _ as isize));
+        if let Some(hwnd) = found {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
         }
     }
 }
@@ -63,10 +129,13 @@ fn load_icon() -> Option<tray_icon::Icon> {
 }
 
 /// Build the tray and wire its events. Run on the UI thread. Returns the tray
-/// (keep it alive). The toggle starts as "Minimize Slidr" (window visible).
-pub fn install(ui: &AppWindow) -> Option<Rc<Tray>> {
+/// (keep it alive). `start_hidden` seeds the toggle label for a window that is
+/// never shown (autostart-minimized); from then on the poll below keeps it in
+/// sync with the window's real state.
+pub fn install(ui: &AppWindow, start_hidden: bool) -> Option<Rc<Tray>> {
     let menu = Menu::new();
-    let toggle = MenuItem::new("Minimize Slidr", true, None);
+    let initial = if start_hidden { "Show Slidr" } else { "Minimize Slidr" };
+    let toggle = MenuItem::new(initial, true, None);
     let exit = MenuItem::new("Exit", true, None);
     menu.append(&toggle).ok()?;
     menu.append(&exit).ok()?;
@@ -87,6 +156,7 @@ pub fn install(ui: &AppWindow) -> Option<Rc<Tray>> {
         toggle_id,
         exit_id,
         weak: ui.as_weak(),
+        shown_label: std::cell::Cell::new(!start_hidden),
     });
 
     // Poll tray + menu events on the UI thread via a Slint timer.
@@ -96,6 +166,10 @@ pub fn install(ui: &AppWindow) -> Option<Rc<Tray>> {
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(120),
         move || {
+            // Keep the label honest even when the window state changed without
+            // going through us (minimize button, Win+D, restore from taskbar).
+            tray_for_timer.sync_label();
+
             if let Ok(ev) = MenuEvent::receiver().try_recv() {
                 if ev.id == tray_for_timer.toggle_id {
                     tray_for_timer.toggle_window();

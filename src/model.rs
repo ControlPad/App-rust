@@ -7,7 +7,9 @@ use crate::curve::{BezierPoints, CurvePreset};
 /// Audio target on a slider.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AudioStream {
-    /// Process name (e.g. `firefox`) or absolute path to an executable.
+    /// Process name (e.g. `firefox`), absolute path to an executable, or a
+    /// program-category reference (`@group:<id>`, see [`crate::app_groups`])
+    /// that follows every member of the category.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<String>,
     /// Microphone friendly name.
@@ -27,7 +29,7 @@ impl AudioStream {
         if let Some(api) = &self.api {
             api.label()
         } else if let Some(p) = &self.process {
-            p.clone()
+            crate::app_groups::label_for(p)
         } else if let Some(m) = &self.mic_name {
             format!("mic: {m}")
         } else if let Some(d) = &self.device_name {
@@ -156,7 +158,7 @@ impl ActionKind {
 pub struct ButtonAction {
     pub kind: ActionKind,
     /// Payload, semantics vary by kind:
-    /// * `MuteProcess` / `OpenProcess` → process name or path
+    /// * `MuteProcess` / `OpenProcess` → process name, path, or `@group:<id>`
     /// * `MuteMainAudio` → optional device name
     /// * `MuteMic` → mic friendly name
     /// * `OpenWebsite` → URL
@@ -310,6 +312,11 @@ pub enum LedConditionKind {
     Muted,
     Volume,
     Api,
+    /// Something is playing through the OS media session (Spotify, a browser
+    /// tab, any player that publishes transport controls).
+    Media,
+    /// Discord voice state (self-mute / deafen / in a voice channel).
+    Discord,
 }
 
 /// HTTP poll used by an `Api` condition. Mirrors a button "API call", plus the
@@ -360,7 +367,8 @@ pub struct LedCondition {
     /// For `Muted`/`Volume`: which endpoint family.
     #[serde(default)]
     pub audio_kind: AudioKind,
-    /// Process/mic/output device name. None = default output endpoint.
+    /// Process/mic/output device name, or — for `Media` — the media source to
+    /// watch (empty/None = any source). None = default output endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// For `Volume`: comparison against `value`.
@@ -372,6 +380,9 @@ pub struct LedCondition {
     /// For `Api`.
     #[serde(default)]
     pub api: LedApi,
+    /// For `Discord`: which part of the voice state to follow.
+    #[serde(default)]
+    pub discord: crate::discord::DiscordSignal,
 }
 
 /// Per-LED configuration. Conditions decide the `active` vs `inactive` look.
@@ -471,6 +482,14 @@ pub struct Settings {
     #[serde(default)]
     pub led_experimental: bool,
 
+    /// Discord application used for the LED "Discord" condition source. The id
+    /// is not a secret; the secret is only needed until a token is cached, and
+    /// `SLIDR_DISCORD_CLIENT_SECRET` overrides whatever is stored here.
+    #[serde(default)]
+    pub discord_client_id: String,
+    #[serde(default)]
+    pub discord_client_secret: String,
+
     /// Last loaded profile name (sticky across launches).
     #[serde(default)]
     pub active_preset: String,
@@ -484,6 +503,8 @@ impl Default for Settings {
             start_minimized: false,
             tray_intro_shown: false,
             led_experimental: false,
+            discord_client_id: String::new(),
+            discord_client_secret: String::new(),
             active_preset: "Default".into(),
         }
     }

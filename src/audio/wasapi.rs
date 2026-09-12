@@ -113,12 +113,19 @@ impl WasapiBackend {
         unsafe { dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) }
     }
 
+    /// Visit every audio session belonging to `process`.
+    ///
+    /// `process` is either a plain executable name (matched loosely, so
+    /// "chrome" finds "chrome.exe") or a program-group reference such as
+    /// `@group:games`, in which case every session whose program belongs to that
+    /// group is visited — see [`crate::app_groups`].
     fn for_each_process_session<F: FnMut(&IAudioSessionControl2, u32)>(
         &self,
         process: &str,
         mut visit: F,
     ) {
         let _guard = self.lock.lock().unwrap();
+        let group = crate::app_groups::parse_ref(process);
         let needle = strip_exe(&process.to_lowercase());
         unsafe {
             let Ok(dev) = self.default_device(0) else { return };
@@ -138,9 +145,20 @@ impl WasapiBackend {
                     continue;
                 }
                 let Some(name) = process_name(pid) else { continue };
-                if strip_exe(&name.to_lowercase()).contains(&needle)
-                    || needle.contains(&strip_exe(&name.to_lowercase()))
-                {
+                let hit = match group {
+                    // Group membership also considers where the program lives
+                    // (game libraries), so it needs the full image path.
+                    Some(id) => crate::app_groups::matches(
+                        id,
+                        &name,
+                        crate::app_groups::process_path(pid).as_deref(),
+                    ),
+                    None => {
+                        strip_exe(&name.to_lowercase()).contains(&needle)
+                            || needle.contains(&strip_exe(&name.to_lowercase()))
+                    }
+                };
+                if hit {
                     visit(&ctl2, pid);
                 }
             }
@@ -236,15 +254,21 @@ impl AudioBackend for WasapiBackend {
     fn is_muted(&self, target: MuteTarget<'_>) -> bool {
         match target {
             MuteTarget::Process(p) => {
-                let mut muted = false;
+                // "Muted" means *every* matching session is muted. With several
+                // sessions — a browser's tabs, or a whole program group — that
+                // makes the toggle do the obvious thing: a mixed set mutes
+                // fully first, and only a fully muted set unmutes.
+                let mut seen = false;
+                let mut all_muted = true;
                 self.for_each_process_session(p, |ctl, _| unsafe {
                     if let Ok(vol) = ctl.cast::<ISimpleAudioVolume>() {
                         if let Ok(b) = vol.GetMute() {
-                            muted = b.as_bool();
+                            seen = true;
+                            all_muted &= b.as_bool();
                         }
                     }
                 });
-                muted
+                seen && all_muted
             }
             MuteTarget::Mic(name) => {
                 let _g = self.lock.lock().unwrap();
@@ -295,6 +319,11 @@ impl AudioBackend for WasapiBackend {
                 unsafe { ep.GetMasterVolumeLevelScalar().ok() }
             }
         }
+    }
+
+    fn default_output_id(&self) -> Option<String> {
+        let _g = self.lock.lock().unwrap();
+        device_id(&self.default_device(0).ok()?)
     }
 
     fn list_outputs(&self) -> Vec<String> {

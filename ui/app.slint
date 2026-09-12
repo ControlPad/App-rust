@@ -26,7 +26,10 @@ export struct ButtonCell { pressed: bool, category: string, assigned: bool }
 export struct LineItem { id: int, primary: string, secondary: string, icon-kind: int }
 export struct CategorySummary { id: int, name: string, count: int, collapsed: bool, lines: [LineItem] }
 export struct AssignPick { id: int, name: string }
-export struct PickerEntry { name: string, icon-kind: int, selected: bool }
+// A row in the wizard's picker. `name` is what the user reads; `value` is what
+// gets stored (a process name, an executable path, or an "@group:<id>" reference
+// for a curated program category — `is-group` marks the latter).
+export struct PickerEntry { name: string, value: string, icon-kind: int, selected: bool, is-group: bool }
 export struct WizardResult {
     target-kind: int, category-id: int, kind: int,
     property: string, display: string,
@@ -35,6 +38,9 @@ export struct WizardResult {
 }
 // One LED toggle condition. Fields are interpreted by `kind`:
 //   kind 0 = device muted · 1 = volume compare · 2 = API call
+//        3 = media session · 4 = Discord voice state
+//   media  (kind 3) 0 = playing · 1 = paused · 2 = stopped · 3 = nothing
+//   signal (kind 4) 0 = muted · 1 = deafened · 2 = in a voice channel
 //   audio-kind 0 = process · 1 = microphone · 2 = output
 //   cmp 0 = below · 1 = above · 2 = exactly · method 0 GET..4 DELETE
 export struct LedConditionUI {
@@ -42,6 +48,7 @@ export struct LedConditionUI {
     cmp: int, value: int,
     method: int, url: string, payload: string, bearer: string,
     interval: string, expect-body: string,
+    signal: int, media: int,
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -92,6 +99,7 @@ component KindIcon {
               : root.kind == 3 ? @image-url("../assets/icons/world.svg")
               : root.kind == 4 ? @image-url("../assets/icons/keyboard.svg")
               : root.kind == 5 ? @image-url("../assets/icons/volume.svg")
+              : root.kind == 6 ? @image-url("../assets/icons/grid-dots.svg")
               :                  @image-url("../assets/icons/app-window.svg");
     }
 }
@@ -582,9 +590,9 @@ component SettingRow inherits HorizontalLayout {
 
     VerticalLayout {
         horizontal-stretch: 1; spacing: 2px;
-        Text { text: root.label; vertical-alignment: center;
+        Text { text: root.label; vertical-alignment: center; wrap: word-wrap;
             font-family: "Inter"; font-size: 13px; font-weight: 500; }
-        if root.description != "": Text { text: root.description;
+        if root.description != "": Text { text: root.description; wrap: word-wrap;
             font-family: "Inter"; font-size: 11px;
             color: Palette.foreground.with-alpha(0.55); }
     }
@@ -1066,6 +1074,10 @@ component SettingsPage inherits VerticalBox {
     in-out property <float> curve-x2;
     in-out property <float> curve-y2;
     in-out property <bool> led-experimental;
+    in-out property <string> discord-client-id;
+    in-out property <string> discord-client-secret;
+    in property <string> discord-status;
+    in property <string> discord-redirect;
     in property <string> build-stamp;
 
     callback theme-changed(int);
@@ -1074,6 +1086,8 @@ component SettingsPage inherits VerticalBox {
     callback curve-changed();
     callback led-save-state();
     callback led-clear-state();
+    callback open-discord-portal();
+    callback copy-discord-redirect();
 
     spacing: 14px;
 
@@ -1090,6 +1104,10 @@ component SettingsPage inherits VerticalBox {
         vertical-stretch: 1;
         VerticalBox {
             spacing: 12px; alignment: start;
+            // Pin the content to the viewport width so this page scrolls only
+            // vertically. Left to itself the layout takes its preferred width,
+            // and one long description then drags every card off to the right.
+            width: parent.width - 18px;
 
             Card {
                 VerticalBox { padding: 18px; spacing: 6px;
@@ -1188,6 +1206,86 @@ component SettingsPage inherits VerticalBox {
                             VerticalLayout { alignment: center;
                                 Toggle { checked <=> root.led-experimental;
                                          toggled => { root.dirty(); } } } }
+                    }
+                    if root.led-experimental: SettingRow {
+                        label: "Discord (LED source)";
+                        description: "Let an LED follow your Discord mute";
+                        VerticalLayout { width: root.control-w; spacing: 6px;
+                            LineEdit { height: 32px; text <=> root.discord-client-id;
+                                placeholder-text: "Client ID";
+                                edited(t) => { root.dirty(); } }
+                            LineEdit { height: 32px; text <=> root.discord-client-secret;
+                                input-type: password;
+                                placeholder-text: "Client Secret";
+                                edited(t) => { root.dirty(); } }
+                            if root.discord-status != "": Text { text: root.discord-status;
+                                font-size: 11px; font-family: "Inter"; wrap: word-wrap;
+                                color: Palette.foreground.with-alpha(0.6); }
+                        }
+                    }
+
+                    // Setup checklist. Discord gates the voice-state scopes on an
+                    // OAuth application the user has to create once, so the least
+                    // we can do is name the three steps and hand over the exact
+                    // redirect URL -- forgetting that one is the usual failure.
+                    if root.led-experimental: Rectangle {
+                        border-radius: 10px; border-width: 1px;
+                        border-color: Palette.border;
+                        background: Palette.alternate-background;
+                        VerticalLayout {
+                            padding: 12px; spacing: 8px;
+                            Text { text: "One-time setup"; font-weight: 600;
+                                font-family: "Inter"; font-size: 12px; }
+
+                            HorizontalLayout { spacing: 8px;
+                                Text { text: "1."; font-family: "Inter"; font-size: 11px;
+                                    min-width: 14px; vertical-alignment: center;
+                                    color: Palette.foreground.with-alpha(0.55); }
+                                Text { text: "Create an application in the Discord developer portal.";
+                                    font-family: "Inter"; font-size: 11px; wrap: word-wrap;
+                                    horizontal-stretch: 1; vertical-alignment: center;
+                                    color: Palette.foreground.with-alpha(0.75); }
+                                IconButton { label: "Open portal";
+                                    icon: @image-url("../assets/icons/world.svg");
+                                    clicked => { root.open-discord-portal(); } }
+                            }
+
+                            HorizontalLayout { spacing: 8px;
+                                Text { text: "2."; font-family: "Inter"; font-size: 11px;
+                                    min-width: 14px; vertical-alignment: center;
+                                    color: Palette.foreground.with-alpha(0.55); }
+                                VerticalLayout { spacing: 4px; horizontal-stretch: 1;
+                                    Text { text: "In OAuth2 > Redirects, add exactly this URL and save:";
+                                        font-family: "Inter"; font-size: 11px; wrap: word-wrap;
+                                        color: Palette.foreground.with-alpha(0.75); }
+                                    HorizontalLayout { spacing: 6px;
+                                        Rectangle {
+                                            height: 30px; horizontal-stretch: 1;
+                                            border-radius: 6px; border-width: 1px;
+                                            border-color: Palette.border;
+                                            background: Palette.background;
+                                            HorizontalLayout { padding-left: 8px; padding-right: 8px;
+                                                Text { text: root.discord-redirect;
+                                                    font-size: 12px; overflow: elide;
+                                                    vertical-alignment: center; }
+                                            }
+                                        }
+                                        IconButton { label: "Copy";
+                                            clicked => { root.copy-discord-redirect(); } }
+                                    }
+                                }
+                            }
+
+                            HorizontalLayout { spacing: 8px;
+                                Text { text: "3."; font-family: "Inter"; font-size: 11px;
+                                    min-width: 14px; vertical-alignment: center;
+                                    color: Palette.foreground.with-alpha(0.55); }
+                                Text { text: "Paste the Client ID and Client Secret above. Discord asks you to confirm once; after that the secret is no longer read.";
+                                    font-family: "Inter"; font-size: 11px; wrap: word-wrap;
+                                    horizontal-stretch: 1;
+                                    color: Palette.foreground.with-alpha(0.75); }
+                            }
+                        }
                     }
                     if root.led-experimental: SettingRow {
                         label: "Board memory";
@@ -1459,6 +1557,9 @@ component WizardPopup inherits Rectangle {
     in property <[string]> live-outputs;
 
     in-out property <string> filter: "";
+    // True while `property` holds a program-category reference rather than a
+    // concrete program. Drives the category chip in the "Open application" form.
+    in-out property <bool> picked-group: false;
 
     callback cancel();
     callback finish();
@@ -1489,8 +1590,13 @@ component WizardPopup inherits Rectangle {
     // Key library uses the picker list too (kind 5); cycle-output (kind 6) is a
     // multi-select list, so its rows toggle membership. App/website (3/4) and the
     // API call use a form instead of a picker list.
-    property <bool> picker-is-list: !(root.target-kind == 1 && (root.kind == 3 || root.kind == 4))
+    property <bool> picker-is-list: !(root.target-kind == 1 && root.kind == 4)
                                     && !root.is-api;
+    // "Open application" pairs the picker with a free-form path + Browse…;
+    // "Open website" has only the form.
+    property <bool> needs-path-form: root.target-kind == 1
+                                  && (root.kind == 3 || root.kind == 4)
+                                  && !root.is-api;
     property <bool> multi-select: root.target-kind == 1 && root.kind == 6;
 
     Rectangle {
@@ -1594,7 +1700,7 @@ component WizardPopup inherits Rectangle {
                             // Single-select kinds highlight the chosen name; multi-select
                             // (cycle output) tracks each row's `selected` flag instead.
                             property <bool> row-selected:
-                                root.multi-select ? e.selected : e.name == root.property;
+                                root.multi-select ? e.selected : e.value == root.property;
                             border-radius: 8px;
                             background: row.row-selected
                                 ? Theme.accent-bg.with-alpha(0.22)
@@ -1609,7 +1715,9 @@ component WizardPopup inherits Rectangle {
                                     if (root.multi-select) {
                                         root.toggle-pick(e.name);
                                     } else {
-                                        root.property = e.name; root.display = e.name;
+                                        root.property = e.value;
+                                        root.display = e.name;
+                                        root.picked-group = e.is-group;
                                     }
                                 }
                                 HorizontalLayout { padding-left: 12px; padding-right: 12px;
@@ -1630,10 +1738,30 @@ component WizardPopup inherits Rectangle {
                     }
                 }
 
-                if !root.picker-is-list && !root.is-api: VerticalBox {
+                // A chosen category has no path to show — offer to clear it instead.
+                if root.needs-path-form && root.picked-group: HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        border-radius: 8px; height: 36px;
+                        background: Theme.accent-bg.with-alpha(0.22);
+                        border-width: 1px; border-color: Theme.accent-bg;
+                        horizontal-stretch: 1;
+                        HorizontalLayout { padding-left: 12px; padding-right: 12px; spacing: 8px;
+                            VerticalLayout { alignment: center;
+                                KindIcon { kind: 6; size: 18px; } }
+                            Text { text: "Category: " + root.display; vertical-alignment: center;
+                                font-family: "Inter"; horizontal-stretch: 1; }
+                        }
+                    }
+                    IconButton { label: "Clear";
+                        clicked => { root.property = ""; root.display = "";
+                                     root.picked-group = false; } }
+                }
+
+                if root.needs-path-form && !root.picked-group: VerticalBox {
                     spacing: 6px; alignment: start;
                     Text {
-                        text: root.kind == 3 ? "Path or command to launch"
+                        text: root.kind == 3 ? "…or pick a path / command to launch"
                             :                  "URL (e.g. https://example.com)";
                         font-size: 12px; font-family: "Inter";
                         color: Palette.foreground.with-alpha(0.7);
@@ -1865,6 +1993,10 @@ component LedConfigPopup inherits Rectangle {
     in-out property <string> inactive-btarget;
     in property <int> inactive-btidx;
     in property <[LedConditionUI]> conditions;
+    /// Media sources the OS has seen, shown as a hint under the media filter.
+    in property <string> media-hint;
+    /// One-line status for the Discord source (configured / connected / why not).
+    in property <string> discord-hint;
     in property <[string]> live-processes;
     in property <[string]> live-mics;
     in property <[string]> live-outputs;
@@ -1877,6 +2009,9 @@ component LedConfigPopup inherits Rectangle {
     callback refresh();
     callback manual-toggle();
     callback cond-kind(int, int);
+    callback cond-media(int, string);
+    callback cond-media-state(int, int);
+    callback cond-signal(int, int);
     callback cond-audio(int, int);
     callback cond-target(int, string);
     callback cond-cmp(int, int);
@@ -1990,7 +2125,8 @@ component LedConfigPopup inherits Rectangle {
                             VerticalBox { padding: 12px; spacing: 8px;
                                 HorizontalLayout { spacing: 8px;
                                     Select { field-width: 170px;
-                                        model: ["Device muted", "Volume", "API call"];
+                                        model: ["Device muted", "Volume", "API call",
+                                                "Media", "Discord"];
                                         current-index: c.kind;
                                         selected(i) => { root.cond-kind(idx, i); } }
                                     Rectangle { horizontal-stretch: 1; }
@@ -2018,6 +2154,32 @@ component LedConfigPopup inherits Rectangle {
                                     Text { text: "\{cond-row.vlocal}%"; min-width: 40px;
                                         horizontal-alignment: right; vertical-alignment: center;
                                         font-family: "Inter"; }
+                                }
+                                // Media session: which playback state, and from
+                                // which player (empty filter = any player).
+                                if c.kind == 3: VerticalBox { spacing: 4px;
+                                    Select { field-width: 250px;
+                                        model: ["Playing", "Paused", "Stopped",
+                                                "Nothing detected"];
+                                        current-index: c.media;
+                                        selected(i) => { root.cond-media-state(idx, i); } }
+                                    LineEdit { text: c.target; height: 34px;
+                                        placeholder-text: "Player (empty = any) — e.g. spotify";
+                                        edited(t) => { root.cond-media(idx, t); } }
+                                    if root.media-hint != "": Text { text: root.media-hint;
+                                        font-size: 11px; font-family: "Inter"; wrap: word-wrap;
+                                        color: Palette.foreground.with-alpha(0.6); }
+                                }
+                                // Discord voice state.
+                                if c.kind == 4: VerticalBox { spacing: 4px;
+                                    Select { field-width: 250px;
+                                        model: ["Muted in Discord", "Deafened in Discord",
+                                                "In a voice channel"];
+                                        current-index: c.signal;
+                                        selected(i) => { root.cond-signal(idx, i); } }
+                                    if root.discord-hint != "": Text { text: root.discord-hint;
+                                        font-size: 11px; font-family: "Inter"; wrap: word-wrap;
+                                        color: Palette.foreground.with-alpha(0.6); }
                                 }
                                 if c.kind == 2: VerticalBox { spacing: 6px;
                                     HorizontalLayout { spacing: 8px;
@@ -2107,6 +2269,10 @@ export component AppWindow inherits Window {
     in-out property <int> accent-preset: 0;
     in-out property <int> dead-zone;
     in-out property <bool> led-experimental;
+    in-out property <string> discord-client-id;
+    in-out property <string> discord-client-secret;
+    in property <string> discord-status;
+    in property <string> discord-redirect;
     in-out property <bool> unmute-on-change;
     in-out property <bool> start-with-os;
     in-out property <bool> start-minimized;
@@ -2151,6 +2317,8 @@ export component AppWindow inherits Window {
     in-out property <string> led-inactive-btarget: "";
     in-out property <int> led-inactive-btidx: -1;
     in property <[LedConditionUI]> led-conditions;
+    in property <string> led-media-hint;
+    in property <string> led-discord-hint;
     in-out property <bool> led-live-active;
 
     in-out property <bool> preset-popup-open: false;
@@ -2166,6 +2334,7 @@ export component AppWindow inherits Window {
     in-out property <string> wizard-property: "";
     in-out property <string> wizard-display: "";
     in-out property <string> wizard-filter: "";
+    in-out property <bool> wizard-picked-group: false;
     in-out property <int> wizard-method: 1;       // default POST
     in-out property <string> wizard-url: "";
     in-out property <string> wizard-payload: "";
@@ -2224,6 +2393,8 @@ export component AppWindow inherits Window {
     // ── LED state persistence (board EEPROM) ──
     callback led-save-state();
     callback led-clear-state();
+    callback open-discord-portal();
+    callback copy-discord-redirect();
 
     // ── Configure-LED ──
     callback open-led-config(int);   // button index
@@ -2234,6 +2405,9 @@ export component AppWindow inherits Window {
     callback led-refresh();
     callback led-manual-toggle();
     callback led-cond-kind(int, int);
+    callback led-cond-media(int, string);
+    callback led-cond-media-state(int, int);
+    callback led-cond-signal(int, int);
     callback led-cond-audio(int, int);
     callback led-cond-target(int, string);
     callback led-cond-cmp(int, int);
@@ -2445,6 +2619,10 @@ export component AppWindow inherits Window {
                     accent-preset <=> root.accent-preset;
                     dead-zone <=> root.dead-zone;
                     led-experimental <=> root.led-experimental;
+                    discord-client-id <=> root.discord-client-id;
+                    discord-client-secret <=> root.discord-client-secret;
+                    discord-status: root.discord-status;
+                    discord-redirect: root.discord-redirect;
                     unmute-on-change <=> root.unmute-on-change;
                     start-with-os <=> root.start-with-os;
                     start-minimized <=> root.start-minimized;
@@ -2463,6 +2641,8 @@ export component AppWindow inherits Window {
                     curve-changed => { root.curve-changed(); }
                     led-save-state => { root.led-save-state(); }
                     led-clear-state => { root.led-clear-state(); }
+                    open-discord-portal => { root.open-discord-portal(); }
+                    copy-discord-redirect => { root.copy-discord-redirect(); }
                 }
             }
         }
@@ -2508,6 +2688,8 @@ export component AppWindow inherits Window {
         inactive-btarget <=> root.led-inactive-btarget;
         inactive-btidx: root.led-inactive-btidx;
         conditions: root.led-conditions;
+        media-hint: root.led-media-hint;
+        discord-hint: root.led-discord-hint;
         live-processes: root.live-processes;
         live-mics: root.live-mics;
         live-outputs: root.live-outputs;
@@ -2519,6 +2701,9 @@ export component AppWindow inherits Window {
         refresh => { root.led-refresh(); }
         manual-toggle => { root.led-manual-toggle(); }
         cond-kind(i, v) => { root.led-cond-kind(i, v); }
+        cond-media(i, v) => { root.led-cond-media(i, v); }
+        cond-media-state(i, v) => { root.led-cond-media-state(i, v); }
+        cond-signal(i, v) => { root.led-cond-signal(i, v); }
         cond-audio(i, v) => { root.led-cond-audio(i, v); }
         cond-target(i, v) => { root.led-cond-target(i, v); }
         cond-cmp(i, v) => { root.led-cond-cmp(i, v); }
@@ -2543,6 +2728,7 @@ export component AppWindow inherits Window {
         bearer <=> root.wizard-bearer;
         throttle <=> root.wizard-throttle;
         filter <=> root.wizard-filter;
+        picked-group <=> root.wizard-picked-group;
         picker-source: root.wizard-picker-source;
         live-processes: root.live-processes;
         live-mics: root.live-mics;
@@ -2553,7 +2739,8 @@ export component AppWindow inherits Window {
         cancel => { root.wizard-open = false; root.wizard-step = 0;
                     root.wizard-property = ""; root.wizard-display = "";
                     root.wizard-url = ""; root.wizard-payload = ""; root.wizard-bearer = "";
-                    root.wizard-throttle = 500; root.wizard-filter = ""; }
+                    root.wizard-throttle = 500; root.wizard-filter = "";
+                    root.wizard-picked-group = false; }
         refresh => { root.refresh-live-lists(); root.wizard-state-changed(); }
         finish => {
             root.wizard-finish({
@@ -2577,6 +2764,7 @@ export component AppWindow inherits Window {
             root.wizard-bearer = "";
             root.wizard-throttle = 500;
             root.wizard-filter = "";
+            root.wizard-picked-group = false;
         }
     }
 

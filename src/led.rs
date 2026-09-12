@@ -4,7 +4,9 @@
 //! the board over the [`SerialLink`] (see `LED-Steuerung.md`). Runs on the
 //! actuator thread, ticked ~10×/s, so audio-state polling and HTTP checks never
 //! block the UI. API conditions are polled on detached threads at their own
-//! interval; the tick only reads the cached boolean.
+//! interval; the tick only reads the cached boolean. The media-session and
+//! Discord sources work the same way — see [`crate::media`] and
+//! [`crate::discord`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -249,6 +251,12 @@ impl LedEngine {
                 }
             }
             LedConditionKind::Api => self.eval_api(led, idx, cond),
+            // Both of these are served from a cache kept by a background
+            // worker, so the tick never waits on WinRT or a socket.
+            LedConditionKind::Media => {
+                crate::media::state().status(cond.target.as_deref()) == cond.media
+            }
+            LedConditionKind::Discord => crate::discord::state().get(cond.discord),
         }
     }
 

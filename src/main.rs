@@ -10,15 +10,19 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod actuator;
+mod app_groups;
 mod audio;
 mod autostart;
+mod clipboard;
 mod curve;
+mod discord;
 mod events;
 mod glue;
 mod keys;
 mod keys_library;
 mod keys_vk;
 mod led;
+mod media;
 mod model;
 mod protocol;
 mod serial;
@@ -120,6 +124,10 @@ fn main() -> anyhow::Result<()> {
         autostart::resync(settings.start_minimized);
     }
 
+    // Start the Discord voice-state worker if an application is configured; a
+    // blank client id leaves it stopped (the LED source then never fires).
+    discord::configure(&settings.discord_client_id, &settings.discord_client_secret);
+
     let shared = Arc::new(Mutex::new(glue::Shared {
         settings,
         preset,
@@ -132,6 +140,7 @@ fn main() -> anyhow::Result<()> {
         pending_wizard: None,
         pending_retry_deadline: None,
         editing_idx: None,
+        last_status_refresh: None,
         editing_led: None,
     }));
 
@@ -284,7 +293,7 @@ fn main() -> anyhow::Result<()> {
 
     // System tray (Windows). Held for the process lifetime.
     #[cfg(target_os = "windows")]
-    let _tray = tray::install(&ui);
+    let _tray = tray::install(&ui, start_hidden);
 
     // Close handling. On Windows with the tray + minimize-to-tray enabled,
     // closing hides the window instead of quitting. Otherwise it quits.

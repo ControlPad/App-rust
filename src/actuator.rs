@@ -3,7 +3,8 @@
 //! renderer smooth — per-frame WASAPI session enumeration / `pactl` calls never
 //! block the event loop.
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
@@ -43,6 +44,14 @@ fn run(rx: Receiver<Cmd>, serial: SerialLink, led_state: LedStateHandle) {
     };
     let mut led = LedEngine::new(serial, led_state);
 
+    // Last volume applied per target. Re-played after an output-device switch
+    // (see `OUTPUT_REAPPLY_DELAYS`).
+    let mut applied: HashMap<String, (Target, f32)> = HashMap::new();
+    let mut last_output = audio.default_output_id();
+    let mut next_output_check = Instant::now() + OUTPUT_POLL;
+    // Scheduled re-apply passes, earliest first.
+    let mut reapply: Vec<Instant> = Vec::new();
+
     // Block for commands but wake regularly so the LED engine can re-evaluate
     // its conditions (mute/volume polling, cached API results) and push updates.
     let tick = Duration::from_millis(100);
@@ -56,13 +65,54 @@ fn run(rx: Receiver<Cmd>, serial: SerialLink, led_state: LedStateHandle) {
                     batch.push(more);
                 }
                 for cmd in coalesce(batch) {
-                    apply(&*audio, keys.as_mut(), &mut led, cmd);
+                    apply(&*audio, keys.as_mut(), &mut led, &mut applied, cmd);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
         led.tick(&*audio);
+
+        let now = Instant::now();
+        if now >= next_output_check {
+            next_output_check = now + OUTPUT_POLL;
+            let cur = audio.default_output_id();
+            // `None` means the backend can't report an id — never treat that as
+            // a switch, or we'd re-apply on every poll.
+            if cur.is_some() && cur != last_output {
+                log::info!("default output changed; re-applying volumes");
+                last_output = cur;
+                reapply = OUTPUT_REAPPLY_DELAYS.iter().map(|d| now + *d).collect();
+            }
+        }
+        if reapply.first().is_some_and(|t| now >= *t) {
+            reapply.remove(0);
+            reapply_volumes(&*audio, &applied);
+        }
+    }
+}
+
+/// How often the default output endpoint is checked for a switch.
+const OUTPUT_POLL: Duration = Duration::from_millis(400);
+
+/// When to re-apply volumes after the default output changed, measured from the
+/// moment we noticed. Sessions don't all migrate to the new endpoint at once —
+/// an app can take a beat to reopen its stream — so we replay twice: once for
+/// the streams that moved immediately, once for the stragglers.
+const OUTPUT_REAPPLY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(350), Duration::from_millis(1500)];
+
+/// Re-send the last volume we set for every target.
+///
+/// Why this is needed: per-app volumes live on the audio *session*, and a
+/// session that follows the default device to a new endpoint arrives carrying
+/// that endpoint's remembered level, not the one the slider is sitting at. The
+/// physical slider and the actual volume then disagree until the next nudge —
+/// which is the jump the user sees. Mute state is deliberately left alone: the
+/// switch shouldn't un-mute anything the user muted on purpose.
+fn reapply_volumes(audio: &dyn AudioBackend, applied: &HashMap<String, (Target, f32)>) {
+    for (target, value) in applied.values() {
+        audio.set_volume(vol_target(target), *value);
     }
 }
 
@@ -95,7 +145,13 @@ fn target_key(t: &Target) -> String {
     }
 }
 
-fn apply(audio: &dyn AudioBackend, keys: Option<&mut KeyController>, led: &mut LedEngine, cmd: Cmd) {
+fn apply(
+    audio: &dyn AudioBackend,
+    keys: Option<&mut KeyController>,
+    led: &mut LedEngine,
+    applied: &mut HashMap<String, (Target, f32)>,
+    cmd: Cmd,
+) {
     match cmd {
         Cmd::SetLeds(cfgs) => led.set_configs(*cfgs),
         Cmd::SetLedExperimental(on) => led.set_experimental(on),
@@ -108,11 +164,31 @@ fn apply(audio: &dyn AudioBackend, keys: Option<&mut KeyController>, led: &mut L
                 audio.set_mute(mute_target(&target), false);
             }
             audio.set_volume(vol_target(&target), value);
+            applied.insert(target_key(&target), (target, value));
         }
         Cmd::ToggleMute(target) => audio.toggle_mute(mute_target(&target)),
         Cmd::Open(t) => {
-            if let Err(e) = open::that(&t) {
-                log::warn!("open {t:?} failed: {e}");
+            // A program group resolves to whichever member is running right now
+            // ("Games" → the game you're in). Nothing running means there is
+            // nothing to open: a group has no single executable of its own.
+            let target = match crate::app_groups::parse_ref(&t) {
+                Some(id) => match crate::app_groups::running_in_group(id)
+                    .into_iter()
+                    .find_map(|a| a.path)
+                {
+                    Some(path) => path,
+                    None => {
+                        log::info!(
+                            "open: no running program in group {:?}; nothing to launch",
+                            crate::app_groups::display_name(id)
+                        );
+                        return;
+                    }
+                },
+                None => t,
+            };
+            if let Err(e) = open::that(&target) {
+                log::warn!("open {target:?} failed: {e}");
             }
         }
         Cmd::KeyDown(vk) => {

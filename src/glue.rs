@@ -39,6 +39,8 @@ pub struct Shared {
     pub pending_retry_deadline: Option<Instant>,
     /// When editing an existing category entry, the index being replaced.
     pub editing_idx: Option<usize>,
+    /// Throttle for the Discord/media status lines refreshed by the UI timer.
+    pub last_status_refresh: Option<Instant>,
     /// Working copy for the configure-LED popup: (led index, config being edited).
     pub editing_led: Option<(usize, LedConfig)>,
 }
@@ -307,6 +309,7 @@ pub fn wire(
             ui.set_wizard_kind(0);
             ui.set_wizard_property("".into());
             ui.set_wizard_display("".into());
+            ui.set_wizard_picked_group(false);
             reset_wizard_api(&ui);
             populate_live_lists(&ui, shared.clone());
             ui.set_wizard_filter("".into());
@@ -354,6 +357,7 @@ pub fn wire(
             ui.set_wizard_category_id(cat_id as i32);
             ui.set_wizard_kind(wkind);
             ui.set_wizard_step(1);  // jump straight to the target step
+            ui.set_wizard_picked_group(crate::app_groups::parse_ref(&prop).is_some());
             ui.set_wizard_property(prop.into());
             ui.set_wizard_display(disp.into());
             push_wizard_api(&ui, api.as_ref());
@@ -491,6 +495,31 @@ pub fn wire(
     }
 
     // ─── settings ──────────────────────────────────────────────────────────
+    {
+        let weak = ui.as_weak();
+        // The redirect has to match character for character, so hand it over
+        // rather than asking anyone to retype it.
+        ui.on_copy_discord_redirect(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            match crate::clipboard::set_text(crate::discord::REDIRECT_URI) {
+                Ok(()) => toast(&ui, "Copied http://localhost"),
+                Err(e) => {
+                    log::warn!("clipboard: {e}");
+                    toast(&ui, "Could not copy — select the URL and copy it manually");
+                }
+            }
+        });
+    }
+    {
+        // Straight to the page where the Client ID lives — the setup is a
+        // detour through a web portal and the app should at least open the door.
+        ui.on_open_discord_portal(move || {
+            let url = "https://discord.com/developers/applications";
+            if let Err(e) = open::that(url) {
+                log::warn!("could not open {url}: {e}");
+            }
+        });
+    }
     {
         let shared = shared.clone();
         let weak = ui.as_weak();
@@ -638,6 +667,11 @@ pub fn wire(
             apply_appearance(&ui, &s.preset.settings);
             // LED brightness / experimental flag may have changed.
             s.push_leds();
+            // Re-point the Discord worker if the application changed (a blank id
+            // stops it). Cheap and idempotent when nothing moved.
+            crate::discord::configure(&s.settings.discord_client_id, &s.settings.discord_client_secret);
+            ui.set_discord_status(discord_hint(&s.settings).into());
+            ui.set_led_discord_hint(discord_hint(&s.settings).into());
         });
     }
     {
@@ -745,6 +779,7 @@ pub fn wire(
             push_mode_to_ui(&ui, &cfg.active, true);
             push_mode_to_ui(&ui, &cfg.inactive, false);
             push_led_conditions(&ui, &cfg.conditions);
+            ui.set_led_discord_hint(discord_hint(&shared.lock().settings).into());
             ui.set_led_live_active(false);
             ui.set_led_popup_open(true);
         });
@@ -832,6 +867,7 @@ pub fn wire(
             if let Some(conds) = conds {
                 push_led_conditions(&ui, &conds);
             }
+            ui.set_led_discord_hint(discord_hint(&shared.lock().settings).into());
             ui.set_led_active_btidx(list_index_of(&ui, ui.get_led_active_baudio(), ui.get_led_active_btarget().as_str()));
             ui.set_led_inactive_btidx(list_index_of(&ui, ui.get_led_inactive_baudio(), ui.get_led_inactive_btarget().as_str()));
         });
@@ -883,6 +919,31 @@ pub fn wire(
     {
         let shared = shared.clone();
         ui.on_led_cond_cmp(move |idx, v| { mutate_cond(&shared, idx, |c| c.cmp = cmp_from(v)); });
+    }
+    {
+        let shared = shared.clone();
+        // Media source filter (free text; empty = any player).
+        ui.on_led_cond_media(move |idx, v| { mutate_cond(&shared, idx, |c| c.target = opt(v.as_str())); });
+    }
+    {
+        let shared = shared.clone();
+        let weak = ui.as_weak();
+        ui.on_led_cond_media_state(move |idx, v| {
+            let conds = mutate_cond_struct(&shared, idx, |c| {
+                c.media = crate::media::MediaStatus::from_index(v)
+            });
+            if let (Some(ui), Some(conds)) = (weak.upgrade(), conds) { push_led_conditions(&ui, &conds); }
+        });
+    }
+    {
+        let shared = shared.clone();
+        let weak = ui.as_weak();
+        ui.on_led_cond_signal(move |idx, v| {
+            let conds = mutate_cond_struct(&shared, idx, |c| {
+                c.discord = crate::discord::DiscordSignal::from_index(v)
+            });
+            if let (Some(ui), Some(conds)) = (weak.upgrade(), conds) { push_led_conditions(&ui, &conds); }
+        });
     }
     {
         let shared = shared.clone();
@@ -971,6 +1032,33 @@ pub fn wire(
             let led = ui.get_led_index() as usize;
             let active = s.led_state.lock().get(led).map(|l| l.active).unwrap_or(false);
             ui.set_led_live_active(active);
+        }
+
+        // The Discord worker connects (or fails) seconds after the settings are
+        // saved, and the media poller updates once a second — so refresh both
+        // status lines while the user is looking at them, or they would sit on
+        // whatever was true when the page opened. Throttled to ~2/s, and the
+        // strings only reach Slint when they actually change.
+        if ui.get_current_page() == 3 || ui.get_led_popup_open() {
+            let due = s
+                .last_status_refresh
+                .map_or(true, |t: Instant| t.elapsed() >= Duration::from_millis(500));
+            if due {
+                s.last_status_refresh = Some(Instant::now());
+                let hint = discord_hint(&s.settings);
+                if ui.get_discord_status() != hint.as_str() {
+                    ui.set_discord_status(hint.clone().into());
+                }
+                if ui.get_led_popup_open() {
+                    if ui.get_led_discord_hint() != hint.as_str() {
+                        ui.set_led_discord_hint(hint.into());
+                    }
+                    let media = media_hint();
+                    if ui.get_led_media_hint() != media.as_str() {
+                        ui.set_led_media_hint(media.into());
+                    }
+                }
+            }
         }
 
         // Animate retry countdown even between events.
@@ -1109,7 +1197,7 @@ fn push_preset_to_ui(ui: &AppWindow, preset: &Preset) {
                     id: i as i32,
                     primary: SharedString::from(a.kind.label()),
                     secondary: action_secondary(a).into(),
-                    icon_kind: action_icon_kind(a.kind),
+                    icon_kind: action_icon_kind_for(a),
                 }).collect::<Vec<_>>(),
             )),
         })
@@ -1124,6 +1212,7 @@ fn push_preset_to_ui(ui: &AppWindow, preset: &Preset) {
 
 fn stream_icon_kind(s: &AudioStream) -> i32 {
     if s.api.is_some() { 3 }
+    else if s.process.as_deref().is_some_and(|p| crate::app_groups::parse_ref(p).is_some()) { 6 }
     else if s.process.is_some() { 0 }
     else if s.mic_name.is_some() { 1 }
     else { 2 }
@@ -1145,7 +1234,18 @@ fn action_secondary(a: &crate::model::ButtonAction) -> String {
     if a.kind == ActionKind::ApiCall {
         return a.api.as_ref().map(|api| api.label()).unwrap_or_else(|| "API call".into());
     }
+    // A category stores an "@group:<id>" reference; show the category's name.
+    if let Some(id) = a.property.as_deref().and_then(crate::app_groups::parse_ref) {
+        return format!("{} (category)", crate::app_groups::display_name(id));
+    }
     a.display.clone().or_else(|| a.property.clone()).unwrap_or_default()
+}
+
+fn action_icon_kind_for(a: &crate::model::ButtonAction) -> i32 {
+    if a.property.as_deref().and_then(crate::app_groups::parse_ref).is_some() {
+        return 6;
+    }
+    action_icon_kind(a.kind)
 }
 
 fn action_icon_kind(k: ActionKind) -> i32 {
@@ -1159,8 +1259,11 @@ fn action_icon_kind(k: ActionKind) -> i32 {
 fn stream_secondary(s: &AudioStream) -> String {
     if s.api.is_some() {
         "API call".into()
-    } else if s.process.is_some() {
-        "process".into()
+    } else if let Some(p) = &s.process {
+        match crate::app_groups::parse_ref(p) {
+            Some(_) => "program category".into(),
+            None => "process".into(),
+        }
     } else if s.mic_name.is_some() {
         "microphone".into()
     } else if s.device_name.is_some() {
@@ -1181,6 +1284,10 @@ fn push_settings_to_ui(ui: &AppWindow, global: &Settings, profile: &crate::model
     ui.set_start_minimized(global.start_minimized);
     ui.set_minimize_to_tray(global.minimize_to_tray);
     ui.set_led_experimental(global.led_experimental);
+    ui.set_discord_client_id(global.discord_client_id.clone().into());
+    ui.set_discord_client_secret(global.discord_client_secret.clone().into());
+    ui.set_discord_status(discord_hint(global).into());
+    ui.set_discord_redirect(crate::discord::REDIRECT_URI.into());
     ui.set_active_preset_name(global.active_preset.clone().into());
     // Appearance + sliders (profile)
     ui.set_theme_index(match profile.theme {
@@ -1208,6 +1315,8 @@ fn pull_global_from_ui(ui: &AppWindow, g: &mut Settings) {
     g.start_minimized = ui.get_start_minimized();
     g.minimize_to_tray = ui.get_minimize_to_tray();
     g.led_experimental = ui.get_led_experimental();
+    g.discord_client_id = ui.get_discord_client_id().to_string();
+    g.discord_client_secret = ui.get_discord_client_secret().to_string();
 }
 
 fn pull_profile_from_ui(ui: &AppWindow, p: &mut crate::model::ProfileSettings) {
@@ -1312,6 +1421,9 @@ fn push_wizard_picker(ui: &AppWindow, shared: Arc<Mutex<Shared>>) {
         (1, 0) => merged_processes(s.audio.as_ref()),
         (1, 1) => s.audio.list_outputs(),
         (1, 2) => s.audio.list_mics(),
+        // Open application — running programs, stored by full path so the entry
+        // survives a PATH lookup failing later.
+        (1, 3) => Vec::new(),
         // Simulate key — full library
         (1, 5) => crate::keys_library::KEYS.iter().map(|k| k.name.to_string()).collect(),
         // Cycle output device — multi-select list of outputs
@@ -1340,6 +1452,48 @@ fn push_wizard_picker(ui: &AppWindow, shared: Arc<Mutex<Shared>>) {
         filtered.sort();
         filtered.dedup();
     }
+    // Program-category rows, offered wherever the target is a program. They sit
+    // at the top of the list: a category is the answer to "I don't want to redo
+    // this every time I install a game".
+    let groups: Vec<crate::PickerEntry> = if is_program_kind(target_kind, kind) {
+        crate::app_groups::groups()
+            .iter()
+            .filter(|g| filter_norm.is_empty() || g.name.to_lowercase().contains(filter_norm))
+            .map(|g| crate::PickerEntry {
+                selected: false,
+                name: g.name.clone().into(),
+                value: crate::app_groups::make_ref(&g.id).into(),
+                icon_kind: g.icon,
+                is_group: true,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // "Open application" launches an executable, so its rows carry the full path
+    // as the stored value while still reading as the program name.
+    let program_rows: Vec<crate::PickerEntry> = if target_kind == 1 && kind == 3 {
+        let mut apps: Vec<(String, String)> = crate::app_groups::running_apps()
+            .into_iter()
+            .filter_map(|a| a.path.map(|p| (a.name, p)))
+            .filter(|(n, _)| filter_norm.is_empty() || n.to_lowercase().contains(filter_norm))
+            .collect();
+        apps.sort();
+        apps.dedup();
+        apps.into_iter()
+            .map(|(name, path)| crate::PickerEntry {
+                selected: false,
+                name: name.into(),
+                value: path.into(),
+                icon_kind: 0,
+                is_group: false,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let icon_kind: i32 = match (target_kind, kind) {
         (_, 1) if target_kind == 0 => 1,   // slider mic
         (0, 2) => 2,                        // slider output
@@ -1349,15 +1503,25 @@ fn push_wizard_picker(ui: &AppWindow, shared: Arc<Mutex<Shared>>) {
         (1, 6) => 2,                        // cycle output
         _ => 0,                             // process
     };
-    ui.set_wizard_picker_source(ModelRc::new(VecModel::from(
-        filtered.into_iter()
-            .map(|n| crate::PickerEntry {
-                selected: chosen.iter().any(|c| c == &n),
-                name: n.into(),
-                icon_kind,
-            })
-            .collect::<Vec<_>>(),
-    )));
+    let rows: Vec<crate::PickerEntry> = groups
+        .into_iter()
+        .chain(program_rows)
+        .chain(filtered.into_iter().map(|n| crate::PickerEntry {
+            selected: chosen.iter().any(|c| c == &n),
+            value: n.clone().into(),
+            name: n.into(),
+            icon_kind,
+            is_group: false,
+        }))
+        .collect();
+    ui.set_wizard_picker_source(ModelRc::new(VecModel::from(rows)));
+}
+
+/// Wizard kinds whose target is a program, and which therefore accept a
+/// program category: slider "Process volume", button "Mute process" and button
+/// "Open application".
+fn is_program_kind(target_kind: i32, kind: i32) -> bool {
+    matches!((target_kind, kind), (0, 0) | (1, 0) | (1, 3))
 }
 
 /// Merge sessions-with-audio with all running processes, so the picker isn't
@@ -1509,7 +1673,13 @@ fn led_mode_from_ui(
 }
 
 fn cond_kind_from(v: i32) -> LedConditionKind {
-    match v { 1 => LedConditionKind::Volume, 2 => LedConditionKind::Api, _ => LedConditionKind::Muted }
+    match v {
+        1 => LedConditionKind::Volume,
+        2 => LedConditionKind::Api,
+        3 => LedConditionKind::Media,
+        4 => LedConditionKind::Discord,
+        _ => LedConditionKind::Muted,
+    }
 }
 fn audio_kind_from(v: i32) -> AudioKind {
     match v { 1 => AudioKind::Mic, 2 => AudioKind::Output, _ => AudioKind::Process }
@@ -1520,7 +1690,13 @@ fn cmp_from(v: i32) -> Comparison {
 
 fn cond_to_ui(c: &LedCondition, target_index: i32) -> LedConditionUI {
     LedConditionUI {
-        kind: match c.kind { LedConditionKind::Muted => 0, LedConditionKind::Volume => 1, LedConditionKind::Api => 2 },
+        kind: match c.kind {
+            LedConditionKind::Muted => 0,
+            LedConditionKind::Volume => 1,
+            LedConditionKind::Api => 2,
+            LedConditionKind::Media => 3,
+            LedConditionKind::Discord => 4,
+        },
         audio_kind: audio_kind_to(c.audio_kind),
         target: c.target.clone().unwrap_or_default().into(),
         target_index,
@@ -1532,6 +1708,39 @@ fn cond_to_ui(c: &LedCondition, target_index: i32) -> LedConditionUI {
         bearer: c.api.bearer.clone().unwrap_or_default().into(),
         interval: c.api.interval_ms.to_string().into(),
         expect_body: c.api.expect_body.clone().unwrap_or_default().into(),
+        signal: c.discord.to_index(),
+        media: c.media.to_index(),
+    }
+}
+
+/// One-line hints under the two new condition sources, so the popup can say why
+/// a source isn't producing anything yet.
+fn media_hint() -> String {
+    let sources = crate::media::sources();
+    if sources.is_empty() {
+        "No media session detected — nothing with transport controls is open.".into()
+    } else {
+        let list: Vec<String> =
+            sources.iter().map(|(id, st)| format!("{id} ({})", st.label())).collect();
+        format!("Detected: {}", list.join(", "))
+    }
+}
+
+fn discord_hint(settings: &Settings) -> String {
+    if settings.discord_client_id.trim().is_empty() {
+        return "Not set up — paste the Client ID of your Discord application below.".into();
+    }
+    if !crate::discord::is_valid_id(&settings.discord_client_id) {
+        return "That Client ID doesn't look right — it is a long number from the developer portal.".into();
+    }
+    if crate::discord::state().connected {
+        return "Connected to Discord.".into();
+    }
+    // Say *why* it isn't connected. The worker retries every 10s, so a stale
+    // reason still describes the situation.
+    match crate::discord::last_error() {
+        Some(e) => format!("Not connected: {e}"),
+        None => "Connecting to Discord…".into(),
     }
 }
 
@@ -1541,11 +1750,19 @@ fn push_led_conditions(ui: &AppWindow, conds: &[LedCondition]) {
     let rows: Vec<LedConditionUI> = conds
         .iter()
         .map(|c| {
-            let tidx = list_index_of(ui, audio_kind_to(c.audio_kind), c.target.as_deref().unwrap_or(""));
+            // Only the audio kinds pick from a live list; the media filter is
+            // free text and Discord has no target at all.
+            let tidx = match c.kind {
+                LedConditionKind::Muted | LedConditionKind::Volume => {
+                    list_index_of(ui, audio_kind_to(c.audio_kind), c.target.as_deref().unwrap_or(""))
+                }
+                _ => -1,
+            };
             cond_to_ui(c, tidx)
         })
         .collect();
     ui.set_led_conditions(ModelRc::new(VecModel::from(rows)));
+    ui.set_led_media_hint(media_hint().into());
 }
 
 /// Push one LED appearance into the UI scalar props (active or inactive).

@@ -17,6 +17,12 @@ and macro board.
   physical sliders; volume mapped through a configurable response curve.
 - **Button actions** — mute process / main audio / mic, open an application,
   open a website, or simulate a key (full key library ported from the original).
+- **Program categories** — target *Browsers* or *Games* instead of one
+  executable, so a newly installed game or browser is picked up without editing
+  anything. Membership comes from `assets/app_groups.json`, from path heuristics
+  (anything under a Steam/Epic/GOG library is a game), and from the OS itself
+  (browsers registered with Windows). Extend or add categories with an
+  `app_groups.json` in the config directory.
 - **Profiles** — each profile carries its own categories, slider/button
   assignments, **and** appearance + slider settings (theme, accent, dead-zone,
   curve, unmute-on-change). Create / rename / import / export / switch.
@@ -25,6 +31,17 @@ and macro board.
   presets are visualised read-only.
 - **System integration** — minimise-to-tray (Windows), autostart, start
   minimised, light/dark/system theme.
+- **Output-switch resync** — when the default output device changes, the volumes
+  Slidr last applied are re-sent, so the sliders and the actual levels don't
+  drift apart (per-app volumes otherwise follow the *new* endpoint's remembered
+  levels).
+- **LED state sources** (experimental) — besides mute/volume/HTTP, an LED can
+  follow the OS media session (playing / paused / stopped / nothing detected,
+  for any player that publishes transport controls, optionally filtered to one)
+  or Discord's voice state (self-mute / deafen / in a voice channel). Discord
+  needs a one-off OAuth application — see [`src/discord.rs`](src/discord.rs) for
+  the three setup steps, or the "Open developer portal" button under
+  Settings → LEDs.
 - **Hot-plug** — automatic Arduino detection, reconnect with backoff.
 
 ## Architecture
@@ -52,6 +69,10 @@ src/
 ├── curve.rs          Slider normalization + cubic Bézier curves    [tests]
 ├── keys.rs           enigo wrapper with hold/repeat semantics
 ├── keys_library.rs   Virtual-key catalogue (media, F-keys, …)
+├── app_groups.rs     Curated program categories + OS discovery      [tests]
+├── media.rs          OS media session ("is music playing")          [tests]
+├── discord.rs        Discord RPC voice state (local socket)         [tests]
+├── led.rs            LED engine: conditions → board commands
 ├── storage.rs        JSON: global settings + per-profile folders
 ├── autostart.rs      XDG desktop entry / HKCU\Run
 ├── tray.rs           Windows system tray (cfg-gated)

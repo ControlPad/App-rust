@@ -1,0 +1,65 @@
+name: CI
+
+# Build and test on every push / PR. `release.yml` only ever fires on a tag, so
+# without this nothing compiles the Linux target until release time — and the
+# Linux-gated code (audio/pulse.rs, the non-Windows half of keys.rs,
+# autostart.rs) is invisible to a Windows developer's compiler entirely.
+on:
+  push:
+    branches-ignore:
+      - "gh-pages"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (build + test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libudev-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libxcb1-dev libfontconfig1-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-linux
+          cache-all-crates: true
+
+      # Type-checks the Linux-only modules that never see a compiler on a
+      # Windows dev machine.
+      - name: cargo check
+        run: cargo check --all-targets
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo build --release
+        run: cargo build --release
+
+      # The shipped Linux binary is a bare dynamically-linked ELF, so anything
+      # in DT_NEEDED must exist on a plain desktop. Print it so a newly
+      # introduced native dependency (libxdo, libpulse, ...) is visible in the
+      # log instead of surfacing as "it won't start" on a user's machine.
+      - name: Report runtime library dependencies
+        run: |
+          ldd target/release/slidr || true
+          echo "--- DT_NEEDED ---"
+          readelf -d target/release/slidr | grep NEEDED || true

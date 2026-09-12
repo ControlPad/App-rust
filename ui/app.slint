@@ -26,7 +26,10 @@ export struct ButtonCell { pressed: bool, category: string, assigned: bool }
 export struct LineItem { id: int, primary: string, secondary: string, icon-kind: int }
 export struct CategorySummary { id: int, name: string, count: int, collapsed: bool, lines: [LineItem] }
 export struct AssignPick { id: int, name: string }
-export struct PickerEntry { name: string, icon-kind: int, selected: bool }
+// A row in the wizard's picker. `name` is what the user reads; `value` is what
+// gets stored (a process name, an executable path, or an "@group:<id>" reference
+// for a curated program category — `is-group` marks the latter).
+export struct PickerEntry { name: string, value: string, icon-kind: int, selected: bool, is-group: bool }
 export struct WizardResult {
     target-kind: int, category-id: int, kind: int,
     property: string, display: string,
@@ -92,6 +95,7 @@ component KindIcon {
               : root.kind == 3 ? @image-url("../assets/icons/world.svg")
               : root.kind == 4 ? @image-url("../assets/icons/keyboard.svg")
               : root.kind == 5 ? @image-url("../assets/icons/volume.svg")
+              : root.kind == 6 ? @image-url("../assets/icons/grid-dots.svg")
               :                  @image-url("../assets/icons/app-window.svg");
     }
 }
@@ -1048,6 +1052,10 @@ component CategoriesPage inherits VerticalBox {
 }
 
 component SettingsPage inherits VerticalBox {
+    // False on platforms without a system tray (currently everything but
+    // Windows): the tray-related rows are hidden rather than offering a toggle
+    // that does nothing — or, for "start minimized", strands the app headless.
+    in property <bool> has-tray;
     in-out property <int> theme-index;
     in-out property <int> accent-preset;
     in-out property <int> dead-zone;
@@ -1210,7 +1218,7 @@ component SettingsPage inherits VerticalBox {
                             VerticalLayout { alignment: center;
                                 Toggle { checked <=> root.start-with-os;
                                          toggled => { root.dirty(); } } } } }
-                    SettingRow { label: "Start minimized to tray";
+                    if root.has-tray: SettingRow { label: "Start minimized to tray";
                         description: root.start-with-os
                             ? "" : "Enable 'Start with OS' to enable this";
                         HorizontalLayout { width: root.control-w; alignment: end;
@@ -1218,7 +1226,7 @@ component SettingsPage inherits VerticalBox {
                                 Toggle { checked <=> root.start-minimized;
                                          enabled: root.start-with-os;
                                          toggled => { root.dirty(); } } } } }
-                    SettingRow { label: "Minimize to system tray";
+                    if root.has-tray: SettingRow { label: "Minimize to system tray";
                         HorizontalLayout { width: root.control-w; alignment: end;
                             VerticalLayout { alignment: center;
                                 Toggle { checked <=> root.minimize-to-tray;
@@ -1455,6 +1463,9 @@ component WizardPopup inherits Rectangle {
     in property <[string]> live-outputs;
 
     in-out property <string> filter: "";
+    // True while `property` holds a program-category reference rather than a
+    // concrete program. Drives the category chip in the "Open application" form.
+    in-out property <bool> picked-group: false;
 
     callback cancel();
     callback finish();
@@ -1485,8 +1496,13 @@ component WizardPopup inherits Rectangle {
     // Key library uses the picker list too (kind 5); cycle-output (kind 6) is a
     // multi-select list, so its rows toggle membership. App/website (3/4) and the
     // API call use a form instead of a picker list.
-    property <bool> picker-is-list: !(root.target-kind == 1 && (root.kind == 3 || root.kind == 4))
+    property <bool> picker-is-list: !(root.target-kind == 1 && root.kind == 4)
                                     && !root.is-api;
+    // "Open application" pairs the picker with a free-form path + Browse…;
+    // "Open website" has only the form.
+    property <bool> needs-path-form: root.target-kind == 1
+                                  && (root.kind == 3 || root.kind == 4)
+                                  && !root.is-api;
     property <bool> multi-select: root.target-kind == 1 && root.kind == 6;
 
     Rectangle {
@@ -1590,7 +1606,7 @@ component WizardPopup inherits Rectangle {
                             // Single-select kinds highlight the chosen name; multi-select
                             // (cycle output) tracks each row's `selected` flag instead.
                             property <bool> row-selected:
-                                root.multi-select ? e.selected : e.name == root.property;
+                                root.multi-select ? e.selected : e.value == root.property;
                             border-radius: 8px;
                             background: row.row-selected
                                 ? Theme.accent-bg.with-alpha(0.22)
@@ -1605,7 +1621,9 @@ component WizardPopup inherits Rectangle {
                                     if (root.multi-select) {
                                         root.toggle-pick(e.name);
                                     } else {
-                                        root.property = e.name; root.display = e.name;
+                                        root.property = e.value;
+                                        root.display = e.name;
+                                        root.picked-group = e.is-group;
                                     }
                                 }
                                 HorizontalLayout { padding-left: 12px; padding-right: 12px;
@@ -1626,10 +1644,30 @@ component WizardPopup inherits Rectangle {
                     }
                 }
 
-                if !root.picker-is-list && !root.is-api: VerticalBox {
+                // A chosen category has no path to show — offer to clear it instead.
+                if root.needs-path-form && root.picked-group: HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        border-radius: 8px; height: 36px;
+                        background: Theme.accent-bg.with-alpha(0.22);
+                        border-width: 1px; border-color: Theme.accent-bg;
+                        horizontal-stretch: 1;
+                        HorizontalLayout { padding-left: 12px; padding-right: 12px; spacing: 8px;
+                            VerticalLayout { alignment: center;
+                                KindIcon { kind: 6; size: 18px; } }
+                            Text { text: "Category: " + root.display; vertical-alignment: center;
+                                font-family: "Inter"; horizontal-stretch: 1; }
+                        }
+                    }
+                    IconButton { label: "Clear";
+                        clicked => { root.property = ""; root.display = "";
+                                     root.picked-group = false; } }
+                }
+
+                if root.needs-path-form && !root.picked-group: VerticalBox {
                     spacing: 6px; alignment: start;
                     Text {
-                        text: root.kind == 3 ? "Path or command to launch"
+                        text: root.kind == 3 ? "…or pick a path / command to launch"
                             :                  "URL (e.g. https://example.com)";
                         font-size: 12px; font-family: "Inter";
                         color: Palette.foreground.with-alpha(0.7);
@@ -2107,6 +2145,8 @@ export component AppWindow inherits Window {
     in-out property <bool> start-with-os;
     in-out property <bool> start-minimized;
     in-out property <bool> minimize-to-tray;
+    // Set from Rust: true only where a tray actually exists (Windows).
+    in property <bool> has-tray;
     in-out property <int> curve-preset-index;
     in property <bool> curve-editable;
     in-out property <float> curve-x1;
@@ -2160,6 +2200,7 @@ export component AppWindow inherits Window {
     in-out property <string> wizard-property: "";
     in-out property <string> wizard-display: "";
     in-out property <string> wizard-filter: "";
+    in-out property <bool> wizard-picked-group: false;
     in-out property <int> wizard-method: 1;       // default POST
     in-out property <string> wizard-url: "";
     in-out property <string> wizard-payload: "";
@@ -2443,6 +2484,7 @@ export component AppWindow inherits Window {
                     start-with-os <=> root.start-with-os;
                     start-minimized <=> root.start-minimized;
                     minimize-to-tray <=> root.minimize-to-tray;
+                    has-tray: root.has-tray;
                     curve-preset-index <=> root.curve-preset-index;
                     curve-editable: root.curve-editable;
                     curve-x1 <=> root.curve-x1;
@@ -2536,6 +2578,7 @@ export component AppWindow inherits Window {
         bearer <=> root.wizard-bearer;
         throttle <=> root.wizard-throttle;
         filter <=> root.wizard-filter;
+        picked-group <=> root.wizard-picked-group;
         picker-source: root.wizard-picker-source;
         live-processes: root.live-processes;
         live-mics: root.live-mics;
@@ -2546,7 +2589,8 @@ export component AppWindow inherits Window {
         cancel => { root.wizard-open = false; root.wizard-step = 0;
                     root.wizard-property = ""; root.wizard-display = "";
                     root.wizard-url = ""; root.wizard-payload = ""; root.wizard-bearer = "";
-                    root.wizard-throttle = 500; root.wizard-filter = ""; }
+                    root.wizard-throttle = 500; root.wizard-filter = "";
+                    root.wizard-picked-group = false; }
         refresh => { root.refresh-live-lists(); root.wizard-state-changed(); }
         finish => {
             root.wizard-finish({
@@ -2570,6 +2614,7 @@ export component AppWindow inherits Window {
             root.wizard-bearer = "";
             root.wizard-throttle = 500;
             root.wizard-filter = "";
+            root.wizard-picked-group = false;
         }
     }
 

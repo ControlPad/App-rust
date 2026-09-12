@@ -307,6 +307,7 @@ pub fn wire(
             ui.set_wizard_kind(0);
             ui.set_wizard_property("".into());
             ui.set_wizard_display("".into());
+            ui.set_wizard_picked_group(false);
             reset_wizard_api(&ui);
             populate_live_lists(&ui, shared.clone());
             ui.set_wizard_filter("".into());
@@ -354,6 +355,7 @@ pub fn wire(
             ui.set_wizard_category_id(cat_id as i32);
             ui.set_wizard_kind(wkind);
             ui.set_wizard_step(1);  // jump straight to the target step
+            ui.set_wizard_picked_group(crate::app_groups::parse_ref(&prop).is_some());
             ui.set_wizard_property(prop.into());
             ui.set_wizard_display(disp.into());
             push_wizard_api(&ui, api.as_ref());
@@ -1109,7 +1111,7 @@ fn push_preset_to_ui(ui: &AppWindow, preset: &Preset) {
                     id: i as i32,
                     primary: SharedString::from(a.kind.label()),
                     secondary: action_secondary(a).into(),
-                    icon_kind: action_icon_kind(a.kind),
+                    icon_kind: action_icon_kind_for(a),
                 }).collect::<Vec<_>>(),
             )),
         })
@@ -1124,6 +1126,7 @@ fn push_preset_to_ui(ui: &AppWindow, preset: &Preset) {
 
 fn stream_icon_kind(s: &AudioStream) -> i32 {
     if s.api.is_some() { 3 }
+    else if s.process.as_deref().is_some_and(|p| crate::app_groups::parse_ref(p).is_some()) { 6 }
     else if s.process.is_some() { 0 }
     else if s.mic_name.is_some() { 1 }
     else { 2 }
@@ -1145,7 +1148,18 @@ fn action_secondary(a: &crate::model::ButtonAction) -> String {
     if a.kind == ActionKind::ApiCall {
         return a.api.as_ref().map(|api| api.label()).unwrap_or_else(|| "API call".into());
     }
+    // A category stores an "@group:<id>" reference; show the category's name.
+    if let Some(id) = a.property.as_deref().and_then(crate::app_groups::parse_ref) {
+        return format!("{} (category)", crate::app_groups::display_name(id));
+    }
     a.display.clone().or_else(|| a.property.clone()).unwrap_or_default()
+}
+
+fn action_icon_kind_for(a: &crate::model::ButtonAction) -> i32 {
+    if a.property.as_deref().and_then(crate::app_groups::parse_ref).is_some() {
+        return 6;
+    }
+    action_icon_kind(a.kind)
 }
 
 fn action_icon_kind(k: ActionKind) -> i32 {
@@ -1159,8 +1173,11 @@ fn action_icon_kind(k: ActionKind) -> i32 {
 fn stream_secondary(s: &AudioStream) -> String {
     if s.api.is_some() {
         "API call".into()
-    } else if s.process.is_some() {
-        "process".into()
+    } else if let Some(p) = &s.process {
+        match crate::app_groups::parse_ref(p) {
+            Some(_) => "program category".into(),
+            None => "process".into(),
+        }
     } else if s.mic_name.is_some() {
         "microphone".into()
     } else if s.device_name.is_some() {
@@ -1173,6 +1190,10 @@ fn stream_secondary(s: &AudioStream) -> String {
 /// Push system (global) + appearance/slider (per-profile) settings into the UI.
 fn push_settings_to_ui(ui: &AppWindow, global: &Settings, profile: &crate::model::ProfileSettings) {
     // System (global)
+    // Gates the two tray rows: only Windows ships a tray (`src/tray.rs`), and
+    // without one "start minimized" would leave the app running with no window
+    // and no way to reopen it.
+    ui.set_has_tray(cfg!(target_os = "windows"));
     ui.set_start_with_os(global.start_with_os);
     ui.set_start_minimized(global.start_minimized);
     ui.set_minimize_to_tray(global.minimize_to_tray);
@@ -1308,6 +1329,9 @@ fn push_wizard_picker(ui: &AppWindow, shared: Arc<Mutex<Shared>>) {
         (1, 0) => merged_processes(s.audio.as_ref()),
         (1, 1) => s.audio.list_outputs(),
         (1, 2) => s.audio.list_mics(),
+        // Open application — running programs, stored by full path so the entry
+        // survives a PATH lookup failing later.
+        (1, 3) => Vec::new(),
         // Simulate key — full library
         (1, 5) => crate::keys_library::KEYS.iter().map(|k| k.name.to_string()).collect(),
         // Cycle output device — multi-select list of outputs
@@ -1336,6 +1360,48 @@ fn push_wizard_picker(ui: &AppWindow, shared: Arc<Mutex<Shared>>) {
         filtered.sort();
         filtered.dedup();
     }
+    // Program-category rows, offered wherever the target is a program. They sit
+    // at the top of the list: a category is the answer to "I don't want to redo
+    // this every time I install a game".
+    let groups: Vec<crate::PickerEntry> = if is_program_kind(target_kind, kind) {
+        crate::app_groups::groups()
+            .iter()
+            .filter(|g| filter_norm.is_empty() || g.name.to_lowercase().contains(filter_norm))
+            .map(|g| crate::PickerEntry {
+                selected: false,
+                name: g.name.clone().into(),
+                value: crate::app_groups::make_ref(&g.id).into(),
+                icon_kind: g.icon,
+                is_group: true,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // "Open application" launches an executable, so its rows carry the full path
+    // as the stored value while still reading as the program name.
+    let program_rows: Vec<crate::PickerEntry> = if target_kind == 1 && kind == 3 {
+        let mut apps: Vec<(String, String)> = crate::app_groups::running_apps()
+            .into_iter()
+            .filter_map(|a| a.path.map(|p| (a.name, p)))
+            .filter(|(n, _)| filter_norm.is_empty() || n.to_lowercase().contains(filter_norm))
+            .collect();
+        apps.sort();
+        apps.dedup();
+        apps.into_iter()
+            .map(|(name, path)| crate::PickerEntry {
+                selected: false,
+                name: name.into(),
+                value: path.into(),
+                icon_kind: 0,
+                is_group: false,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let icon_kind: i32 = match (target_kind, kind) {
         (_, 1) if target_kind == 0 => 1,   // slider mic
         (0, 2) => 2,                        // slider output
@@ -1345,15 +1411,25 @@ fn push_wizard_picker(ui: &AppWindow, shared: Arc<Mutex<Shared>>) {
         (1, 6) => 2,                        // cycle output
         _ => 0,                             // process
     };
-    ui.set_wizard_picker_source(ModelRc::new(VecModel::from(
-        filtered.into_iter()
-            .map(|n| crate::PickerEntry {
-                selected: chosen.iter().any(|c| c == &n),
-                name: n.into(),
-                icon_kind,
-            })
-            .collect::<Vec<_>>(),
-    )));
+    let rows: Vec<crate::PickerEntry> = groups
+        .into_iter()
+        .chain(program_rows)
+        .chain(filtered.into_iter().map(|n| crate::PickerEntry {
+            selected: chosen.iter().any(|c| c == &n),
+            value: n.clone().into(),
+            name: n.into(),
+            icon_kind,
+            is_group: false,
+        }))
+        .collect();
+    ui.set_wizard_picker_source(ModelRc::new(VecModel::from(rows)));
+}
+
+/// Wizard kinds whose target is a program, and which therefore accept a
+/// program category: slider "Process volume", button "Mute process" and button
+/// "Open application".
+fn is_program_kind(target_kind: i32, kind: i32) -> bool {
+    matches!((target_kind, kind), (0, 0) | (1, 0) | (1, 3))
 }
 
 /// Merge sessions-with-audio with all running processes, so the picker isn't
@@ -1393,14 +1469,39 @@ fn list_running_processes() -> Vec<String> {
         for e in rd.flatten() {
             let n = e.file_name();
             let n = n.to_string_lossy();
-            if !n.chars().all(|c| c.is_ascii_digit()) { continue }
+            if n.is_empty() || !n.chars().all(|c| c.is_ascii_digit()) { continue }
             if let Ok(comm) = std::fs::read_to_string(format!("/proc/{n}/comm")) {
                 let comm = comm.trim();
-                if !comm.is_empty() { out.push(comm.to_string()); }
+                if comm.is_empty() { continue }
+                out.push(untruncate_comm(&n, comm));
             }
         }
     }
     out
+}
+
+/// The kernel caps `/proc/<pid>/comm` at 15 characters (`TASK_COMM_LEN - 1`), so
+/// long binaries show up clipped ("gnome-terminal-", "systemd-journal") and then
+/// fail to match what PulseAudio reports as `application.process.binary`. When a
+/// name is exactly at the cap, recover the full one from `cmdline`'s argv[0].
+#[cfg(target_os = "linux")]
+fn untruncate_comm(pid: &str, comm: &str) -> String {
+    const TASK_COMM_MAX: usize = 15;
+    if comm.len() < TASK_COMM_MAX {
+        return comm.to_string();
+    }
+    let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) else {
+        return comm.to_string();
+    };
+    let argv0 = cmdline.split('\0').next().unwrap_or("");
+    let base = argv0.rsplit('/').next().unwrap_or("");
+    // Only trust it when it really is the same program, just not clipped —
+    // argv[0] can be an interpreter path or a rewritten title.
+    if base.len() > comm.len() && base.starts_with(comm) {
+        base.to_string()
+    } else {
+        comm.to_string()
+    }
 }
 
 #[cfg(target_os = "windows")]

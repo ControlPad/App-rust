@@ -171,13 +171,68 @@ pub fn spawn(tx: Sender<SerialEvent>) -> (RetryKicker, SerialLink) {
 
 fn friendly(err: &str) -> String {
     // Translate the common platform error strings to something a human can act on.
+    //
+    // serialport's `Display` is the underlying `io::Error`'s message, so on Linux
+    // these are the libc strings ("Permission denied (os error 13)"), not the
+    // Windows wording — both spellings have to be matched here.
     let l = err.to_lowercase();
-    if l.contains("zugriff verweigert") || l.contains("access is denied") || l.contains("permissiondenied") {
-        "Access denied — the port is held by another program (or you lack permission)".into()
-    } else if l.contains("nicht gefunden") || l.contains("not found") || l.contains("nosuchdevice") {
+    if l.contains("zugriff verweigert")
+        || l.contains("access is denied")
+        || l.contains("permission denied")
+        || l.contains("permissiondenied")
+        || l.contains("os error 13")
+    {
+        if cfg!(target_os = "linux") {
+            // By far the most common Linux first-run failure: the user is not in
+            // the group that owns /dev/ttyUSB*, so name the fix.
+            "Access denied — add yourself to the 'dialout' group \
+             (sudo usermod -aG dialout $USER, then log out and back in), \
+             or the port is held by another program"
+                .into()
+        } else {
+            "Access denied — the port is held by another program (or you lack permission)".into()
+        }
+    } else if l.contains("nicht gefunden")
+        || l.contains("not found")
+        || l.contains("no such file or directory")
+        || l.contains("nosuchdevice")
+        || l.contains("os error 2")
+        || l.contains("os error 19")
+    {
         "Device disappeared".into()
     } else {
         err.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::friendly;
+
+    #[test]
+    fn linux_permission_denied_is_translated() {
+        let msg = friendly("Permission denied (os error 13)");
+        assert!(msg.starts_with("Access denied"), "got: {msg}");
+        if cfg!(target_os = "linux") {
+            assert!(msg.contains("dialout"), "Linux hint missing: {msg}");
+        }
+    }
+
+    #[test]
+    fn linux_missing_device_is_translated() {
+        assert_eq!(friendly("No such file or directory (os error 2)"), "Device disappeared");
+        assert_eq!(friendly("No such device (os error 19)"), "Device disappeared");
+    }
+
+    #[test]
+    fn windows_wording_still_matches() {
+        assert!(friendly("Access is denied.").starts_with("Access denied"));
+        assert!(friendly("Zugriff verweigert").starts_with("Access denied"));
+    }
+
+    #[test]
+    fn unknown_errors_pass_through() {
+        assert_eq!(friendly("Broken pipe (os error 32)"), "Broken pipe (os error 32)");
     }
 }
 

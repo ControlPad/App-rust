@@ -6,6 +6,9 @@
 
 #[cfg(target_os = "linux")]
 pub mod pulse;
+// Pure `pactl` output parsers. Compiled everywhere (not gated) so they stay
+// unit-testable on any host; only `pulse` consumes them.
+pub mod pulse_parse;
 #[cfg(target_os = "windows")]
 pub mod wasapi;
 pub mod null;
@@ -38,6 +41,18 @@ pub trait AudioBackend: Send + Sync {
     /// the backend doesn't support reading it. Used by LED volume conditions.
     fn get_volume(&self, target: VolumeTarget<'_>) -> Option<f32> {
         let _ = target;
+        None
+    }
+
+    /// Stable id of the current default output endpoint (WASAPI endpoint id,
+    /// PulseAudio sink name, …), or `None` if the backend can't report one.
+    ///
+    /// The actuator polls this to notice that the default output changed —
+    /// whether Slidr's own "Cycle output device" action did it or the user
+    /// switched in the OS — so it can re-apply the volumes it last set. Sessions
+    /// migrate to the new endpoint carrying *its* levels, which is what makes
+    /// the slider positions and the actual volumes drift apart.
+    fn default_output_id(&self) -> Option<String> {
         None
     }
 

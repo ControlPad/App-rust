@@ -49,18 +49,20 @@ slint = { version = "1.16", default-features = false, features = ["std", "compat
 # Build timestamp injected at compile time
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
-# Key simulation (cross-platform)
-enigo = "0.2"
+# Key simulation (cross-platform).
+# Linux: the `x11rb` backend (pure Rust XTEST) instead of the default `xdo`
+# one. `xdo` is `#[link(name = "xdo")]`, which makes libxdo.so.3 a hard load-time
+# dependency of the shipped binary — it would refuse to start on any machine
+# without xdotool installed. `x11rb` has the same reach (X11 + XWayland) with no
+# native library. Native Wayland clients are unreachable either way; `keys.rs`
+# warns about that at startup.
+enigo = { version = "0.2", default-features = false, features = ["x11rb"] }
 
 # Cross-platform "open file/url"
 open = "5"
 
 # Native file dialog for "Browse…" buttons
 rfd = "0.15"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libpulse-binding = "2.28"
-udev = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Direct dep so the `#[interface]` macro's `::windows_core` paths resolve; pinned
@@ -82,6 +84,12 @@ windows = { version = "0.58", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_System_Diagnostics_ToolHelp",
+    # Restoring/raising our own window from the tray (EnumWindows + SetForegroundWindow).
+    "Win32_UI_WindowsAndMessaging",
+    # OS media session (SMTC) as an LED state source — "music is playing".
+    "Media_Control",
+    "Foundation",
+    "Foundation_Collections",
 ] }
 tray-icon = "0.19"
 image = { version = "0.25", default-features = false, features = ["ico"] }

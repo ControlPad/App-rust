@@ -59,8 +59,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libpulse-dev libudev-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libwayland-dev libxcb1-dev libfontconfig1-dev libxdo-dev
+            pkg-config libudev-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libxcb1-dev libfontconfig1-dev
 
       - name: Install dependencies (Windows build)
         if: matrix.target == 'windows'

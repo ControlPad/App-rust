@@ -228,6 +228,18 @@ impl AudioBackend for PulseBackend {
         }
     }
 
+    /// The default sink's pactl name. Read from the same refresh cache, so the
+    /// actuator's poll for output-device switches costs no extra process.
+    fn default_output_id(&self) -> Option<String> {
+        self.refresh();
+        let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if c.default_sink.is_empty() {
+            None
+        } else {
+            Some(c.default_sink.clone())
+        }
+    }
+
     fn list_processes(&self) -> Vec<String> {
         self.refresh();
         let c = self.cache.lock().unwrap_or_else(|e| e.into_inner());

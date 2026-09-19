@@ -123,6 +123,9 @@ cargo run --release
   sudo udevadm control --reload-rules && sudo udevadm trigger
   ```
 
+  The same file is attached to every [release](https://github.com/ControlPad/App-rust/releases/latest)
+  as `99-slidr.rules`, so there is no need to clone the repository for it.
+
   or add yourself to the port's group and log out and back in:
 
   ```sh

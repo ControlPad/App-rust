@@ -85,6 +85,10 @@ jobs:
           cargo build --release
           mkdir -p dist
           cp target/release/slidr dist/Slidr-linux-x86_64
+          # Ships alongside the binary: without this rule the serial device is
+          # root-only on most distributions, and someone who downloaded the
+          # binary (rather than cloning) has no way to get at the file.
+          cp packaging/99-slidr.rules dist/99-slidr.rules
 
       - name: Build (Windows + interactive installer)
         if: matrix.target == 'windows'

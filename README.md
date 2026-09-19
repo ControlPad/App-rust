@@ -48,6 +48,13 @@ and macro board.
   the three setup steps, or the "Open developer portal" button under
   Settings → LEDs.
 - **Hot-plug** — automatic Arduino detection, reconnect with backoff.
+- **Update check** — one request to the GitHub releases API per launch (opt-out
+  under Settings → Updates, plus a "Check now" button). When a newer release
+  exists, a notice appears in the sidebar and opens
+  [the releases page](https://github.com/ControlPad/App-rust/releases/latest) in
+  the browser. Nothing is ever downloaded or installed automatically; the
+  comparison uses the same version parsing as the profile stamp
+  ([`src/update.rs`](src/update.rs)).
 
 ## Architecture
 

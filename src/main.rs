@@ -27,6 +27,7 @@ mod model;
 mod protocol;
 mod serial;
 mod storage;
+mod update;
 mod version;
 #[cfg(target_os = "windows")]
 mod tray;

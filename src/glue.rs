@@ -137,6 +137,7 @@ pub fn wire(
     build_stamp: &'static str,
 ) {
     ui.set_build_stamp(SharedString::from(build_stamp));
+    ui.set_app_version(crate::version::CURRENT.into());
 
     // Push initial state from settings/preset → UI.
     {
@@ -167,6 +168,21 @@ pub fn wire(
             }
         });
     }
+
+    // One update check per launch, unless it has been switched off. Runs on its
+    // own thread: an unreachable GitHub must not hold up the first frame.
+    if shared.lock().settings.update_check {
+        spawn_update_check(ui);
+    }
+    {
+        let weak = ui.as_weak();
+        ui.on_check_for_updates(move || {
+            if let Some(ui) = weak.upgrade() {
+                spawn_update_check(&ui);
+            }
+        });
+    }
+    ui.on_open_releases(crate::update::open_releases_page);
 
     // Empty initial slider/button cells.
     push_cells(ui, &[0; NUM_SLIDERS], &[0; NUM_BUTTONS], &shared.lock().preset);
@@ -1459,6 +1475,7 @@ fn push_settings_to_ui(ui: &AppWindow, global: &Settings, profile: &crate::model
     ui.set_start_minimized(global.start_minimized);
     ui.set_minimize_to_tray(global.minimize_to_tray);
     ui.set_led_experimental(global.led_experimental);
+    ui.set_update_check(global.update_check);
     ui.set_discord_client_id(global.discord_client_id.clone().into());
     ui.set_discord_client_secret(global.discord_client_secret.clone().into());
     ui.set_discord_status(discord_hint(global).into());
@@ -1490,6 +1507,7 @@ fn pull_global_from_ui(ui: &AppWindow, g: &mut Settings) {
     g.start_minimized = ui.get_start_minimized();
     g.minimize_to_tray = ui.get_minimize_to_tray();
     g.led_experimental = ui.get_led_experimental();
+    g.update_check = ui.get_update_check();
     g.discord_client_id = ui.get_discord_client_id().to_string();
     g.discord_client_secret = ui.get_discord_client_secret().to_string();
 }
@@ -1997,6 +2015,38 @@ fn mutate_cond_struct<F: FnOnce(&mut LedCondition)>(
         f(c);
     }
     Some(cfg.conditions.clone())
+}
+
+/// Run one update check on a detached thread and push the result back into the
+/// UI from the event loop. A second call while one is in flight is ignored, so
+/// leaning on "Check now" cannot pile up requests.
+fn spawn_update_check(ui: &AppWindow) {
+    if ui.get_update_state() == "checking" {
+        return;
+    }
+    ui.set_update_state("checking".into());
+    let weak = ui.as_weak();
+    std::thread::spawn(move || {
+        let outcome = crate::update::check();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(ui) = weak.upgrade() else { return };
+            match outcome {
+                crate::update::Outcome::Available(v) => {
+                    ui.set_update_latest(v.clone().into());
+                    ui.set_update_state("available".into());
+                    log::info!("update available: {v}");
+                }
+                crate::update::Outcome::UpToDate => {
+                    ui.set_update_state("up-to-date".into());
+                    log::info!("no update: {} is current", crate::version::CURRENT);
+                }
+                crate::update::Outcome::Failed(e) => {
+                    ui.set_update_state("failed".into());
+                    log::warn!("update check failed: {e}");
+                }
+            }
+        });
+    });
 }
 
 fn toast(ui: &AppWindow, msg: &str) {

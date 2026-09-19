@@ -493,6 +493,13 @@ pub struct Settings {
     #[serde(default)]
     pub discord_client_secret: String,
 
+    /// Ask GitHub once per launch whether a newer release exists. Opt-out: the
+    /// check is a single outbound request and nothing is ever downloaded or
+    /// installed automatically, but it is still the app talking to the network
+    /// unprompted, so it can be switched off.
+    #[serde(default = "default_true")]
+    pub update_check: bool,
+
     /// Last loaded profile name (sticky across launches).
     #[serde(default)]
     pub active_preset: String,
@@ -508,6 +515,7 @@ impl Default for Settings {
             led_experimental: false,
             discord_client_id: String::new(),
             discord_client_secret: String::new(),
+            update_check: true,
             active_preset: "Default".into(),
         }
     }

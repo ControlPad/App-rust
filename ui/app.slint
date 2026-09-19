@@ -1079,8 +1079,15 @@ component SettingsPage inherits VerticalBox {
     in property <string> discord-status;
     in property <string> discord-redirect;
     in property <string> build-stamp;
+    in property <string> app-version;
+    in-out property <bool> update-check;
+    // "", "checking", "up-to-date", "available", "failed"
+    in property <string> update-state;
+    in property <string> update-latest;
 
     callback theme-changed(int);
+    callback check-for-updates();
+    callback open-releases();
     callback dirty();
     callback curve-preset-changed(int);
     callback curve-changed();
@@ -1328,6 +1335,44 @@ component SettingsPage inherits VerticalBox {
                             VerticalLayout { alignment: center;
                                 Toggle { checked <=> root.minimize-to-tray;
                                          toggled => { root.dirty(); } } } } }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
+                    Text { text: "Updates"; font-weight: 700; font-family: "Inter";
+                        font-size: 14px; }
+                    Rectangle { height: 6px; }
+                    SettingRow {
+                        label: "Check for updates on start";
+                        description: "Asks GitHub once per launch. Nothing is downloaded or installed automatically.";
+                        HorizontalLayout { width: root.control-w; alignment: end;
+                            VerticalLayout { alignment: center;
+                                Toggle { checked <=> root.update-check;
+                                         toggled => { root.dirty(); } } } }
+                    }
+                    SettingRow {
+                        label: "Version " + root.app-version;
+                        description: root.update-state == "checking"
+                            ? "Checking for updates…"
+                            : root.update-state == "available"
+                                ? "Slidr " + root.update-latest + " is available."
+                                : root.update-state == "up-to-date"
+                                    ? "You are on the latest release."
+                                    : root.update-state == "failed"
+                                        ? "Could not reach GitHub. Check again when you are online."
+                                        : "";
+                        HorizontalLayout { width: root.control-w; spacing: 8px; alignment: end;
+                            IconButton { label: "Check now";
+                                icon: @image-url("../assets/icons/refresh.svg");
+                                enabled: root.update-state != "checking";
+                                clicked => { root.check-for-updates(); } }
+                            if root.update-state == "available": IconButton {
+                                label: "Download";
+                                primary: true;
+                                clicked => { root.open-releases(); } }
+                        }
+                    }
                 }
             }
 
@@ -2273,6 +2318,11 @@ export component AppWindow inherits Window {
     in property <bool> connected;
     in property <string> connection-msg;
     in property <float> retry-eta-secs;
+    in property <string> app-version;
+    in-out property <bool> update-check;
+    // "", "checking", "up-to-date", "available", "failed" — see `src/update.rs`.
+    in property <string> update-state;
+    in property <string> update-latest;
     in property <string> badge-text;
     in property <string> active-preset-name;
     in property <string> build-stamp;
@@ -2399,6 +2449,8 @@ export component AppWindow inherits Window {
     callback edit-line(int, int, int);
     callback wizard-finish(WizardResult);
     callback theme-changed(int);
+    callback check-for-updates();
+    callback open-releases();
     callback save-settings();
     callback curve-preset-changed(int);
     callback curve-changed();
@@ -2520,6 +2572,33 @@ export component AppWindow inherits Window {
                     clicked => { root.current-page = 3; root.edit-mode = false; root.page-changed(3); } }
 
                 Rectangle { vertical-stretch: 1; }
+
+                // Update notice — only present when a newer release exists, so
+                // the sidebar is unchanged for someone who is up to date.
+                // Clicking opens the releases page in the browser.
+                if root.update-state == "available": update-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    height: 34px;
+                    clicked => { root.open-releases(); }
+                    Rectangle {
+                        background: update-ta.has-hover
+                            ? Theme.accent-bg : Theme.accent-bg.with-alpha(0.15);
+                        border-radius: 8px;
+                        border-width: 1px; border-color: Theme.accent-bg;
+                    }
+                    HorizontalLayout {
+                        padding-left: root.sidebar-collapsed ? 0px : 10px;
+                        padding-right: root.sidebar-collapsed ? 0px : 10px;
+                        spacing: 6px; alignment: center;
+                        Icon { source: @image-url("../assets/icons/refresh.svg"); size: 14px;
+                            tint: update-ta.has-hover ? Theme.accent-fg : Theme.accent-bg; }
+                        if !root.sidebar-collapsed: Text {
+                            text: "Update " + root.update-latest;
+                            font-size: 12px; font-family: "Inter"; font-weight: 600;
+                            vertical-alignment: center;
+                            color: update-ta.has-hover ? Theme.accent-fg : Palette.foreground; }
+                    }
+                }
 
                 // Status pill — same vertical padding in both modes
                 Rectangle {
@@ -2666,6 +2745,12 @@ export component AppWindow inherits Window {
                     curve-x2 <=> root.curve-x2;
                     curve-y2 <=> root.curve-y2;
                     build-stamp: root.build-stamp;
+                    app-version: root.app-version;
+                    update-check <=> root.update-check;
+                    update-state: root.update-state;
+                    update-latest: root.update-latest;
+                    check-for-updates => { root.check-for-updates(); }
+                    open-releases => { root.open-releases(); }
                     theme-changed(i) => { root.theme-changed(i); }
                     dirty => { root.save-settings(); }
                     curve-preset-changed(i) => { root.curve-preset-changed(i); }

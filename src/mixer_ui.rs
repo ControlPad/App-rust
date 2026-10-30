@@ -8,8 +8,8 @@ use parking_lot::Mutex;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::glue::Shared;
-use crate::model::{Effects, EqBand, EqBandKind, MixChannel, MixTarget, MixerConfig};
-use crate::{AppWindow, EqBandUI, FxUI, MixChannelUI, PickerEntry};
+use crate::model::{Effects, EqBand, EqBandKind, Fx, FxPreset, FxSlot, MixChannel, MixTarget, MixerConfig};
+use crate::{AppWindow, EqBandUI, FxSlotUI, MixChannelUI, PickerEntry};
 
 /// Device names behind the page's selectors, as last shown — an index from
 /// the UI is resolved against exactly the list it was picked from.
@@ -34,8 +34,8 @@ const CABLE_DOWNLOAD: &str = "https://vb-audio.com/Cable/";
 /// Strip whose effects the effects popup is editing.
 static EDITING_FX: Mutex<Option<MixTarget>> = Mutex::new(None);
 
-/// Strip whose EQ the editor popup is editing.
-static EDITING_EQ: Mutex<Option<MixTarget>> = Mutex::new(None);
+/// Strip and EQ slot the EQ editor is editing.
+static EDITING_EQ: Mutex<Option<(MixTarget, u32)>> = Mutex::new(None);
 
 /// Channel whose programs the picker popup is editing.
 static PICKING: Mutex<Option<u32>> = Mutex::new(None);
@@ -114,8 +114,7 @@ pub fn push(ui: &AppWindow, s: &mut Shared) {
     ui.set_mixer_voice_level(m.voice.level * 100.0);
     ui.set_mixer_voice_muted(m.voice.muted);
     ui.set_mixer_voice_monitor(m.voice.to_monitor);
-    ui.set_mixer_voice_eq_on(m.voice.fx.eq_on);
-    ui.set_mixer_voice_fx_count(m.voice.fx.dynamics_on() as i32);
+    ui.set_mixer_voice_fx_count(m.voice.fx.active() as i32);
     push_channels(ui, m);
 
     let no_cable = cables.is_empty();
@@ -148,8 +147,7 @@ fn push_channels(ui: &AppWindow, m: &MixerConfig) {
             programs: c.programs.iter().map(|p| crate::app_groups::label_for(p)).collect::<Vec<_>>().join(", ").into(),
             level: c.level * 100.0,
             muted: c.muted,
-            eq_on: c.fx.eq_on,
-            fx_count: c.fx.dynamics_on() as i32,
+            fx_count: c.fx.active() as i32,
             reroute: c.reroute,
             send_on: c.mic_send.is_some(),
             send: c.mic_send.unwrap_or(1.0) * 100.0,
@@ -158,46 +156,107 @@ fn push_channels(ui: &AppWindow, m: &MixerConfig) {
     ui.set_mixer_channels(ModelRc::new(VecModel::from(rows)));
 }
 
-// ── Effects editor ──────────────────────────────────────────────────────────
+// ── Effects rack ────────────────────────────────────────────────────────────
 
-fn fx_ui(fx: &Effects) -> FxUI {
-    FxUI {
-        gate_on: fx.gate.on,
-        gate_threshold: fx.gate.threshold_db,
-        gate_release: fx.gate.release_ms,
-        comp_on: fx.comp.on,
-        comp_threshold: fx.comp.threshold_db,
-        comp_ratio: fx.comp.ratio,
-        comp_attack: fx.comp.attack_ms,
-        comp_release: fx.comp.release_ms,
-        comp_makeup: fx.comp.makeup_db,
-        norm_on: fx.norm.on,
-        norm_target: fx.norm.target_db,
-        norm_max: fx.norm.max_gain_db,
-        lim_on: fx.limit.on,
-        lim_ceiling: fx.limit.ceiling_db,
+/// Position of an effect in [`Fx::catalog`] — the UI's `kind`.
+fn fx_kind(fx: &Fx) -> i32 {
+    match fx {
+        Fx::Gate(_) => 0,
+        Fx::Eq { .. } => 1,
+        Fx::Compressor(_) => 2,
+        Fx::Normalizer(_) => 3,
+        Fx::Limiter(_) => 4,
     }
 }
 
-/// Apply one field from the effects popup (`on` switches arrive as 0 / 1).
-fn set_fx(fx: &mut Effects, field: &str, v: f32) {
-    let on = v > 0.5;
-    match field {
-        "gate-on" => fx.gate.on = on,
-        "gate-threshold" => fx.gate.threshold_db = v,
-        "gate-release" => fx.gate.release_ms = v,
-        "comp-on" => fx.comp.on = on,
-        "comp-threshold" => fx.comp.threshold_db = v,
-        "comp-ratio" => fx.comp.ratio = v.max(1.0),
-        "comp-attack" => fx.comp.attack_ms = v,
-        "comp-release" => fx.comp.release_ms = v,
-        "comp-makeup" => fx.comp.makeup_db = v,
-        "norm-on" => fx.norm.on = on,
-        "norm-target" => fx.norm.target_db = v,
-        "norm-max" => fx.norm.max_gain_db = v,
-        "lim-on" => fx.limit.on = on,
-        "lim-ceiling" => fx.limit.ceiling_db = v.min(0.0),
-        other => log::warn!("effects editor: unknown field {other:?}"),
+fn slot_ui(slot: &FxSlot) -> FxSlotUI {
+    let mut p = [0f32; 5];
+    let mut summary = String::new();
+    match &slot.fx {
+        Fx::Gate(g) => p[..2].copy_from_slice(&[g.threshold_db, g.release_ms]),
+        Fx::Eq { bands } => {
+            summary = match bands.len() {
+                0 => "No bands yet".into(),
+                1 => "1 band".into(),
+                n => format!("{n} bands"),
+            }
+        }
+        Fx::Compressor(c) => p.copy_from_slice(&[c.threshold_db, c.ratio, c.attack_ms, c.release_ms, c.makeup_db]),
+        Fx::Normalizer(n) => p[..2].copy_from_slice(&[n.target_db, n.max_gain_db]),
+        Fx::Limiter(l) => p[0] = l.ceiling_db,
+    }
+    FxSlotUI {
+        id: slot.id as i32,
+        kind: fx_kind(&slot.fx),
+        name: slot.fx.name().into(),
+        on: slot.on,
+        p1: p[0],
+        p2: p[1],
+        p3: p[2],
+        p4: p[3],
+        p5: p[4],
+        summary: summary.into(),
+    }
+}
+
+/// Parameter `n` (1-based, in the rack's row order) of an effect.
+fn set_param(fx: &mut Fx, n: i32, v: f32) {
+    match fx {
+        Fx::Gate(g) => match n {
+            1 => g.threshold_db = v,
+            2 => g.release_ms = v,
+            _ => {}
+        },
+        Fx::Compressor(c) => match n {
+            1 => c.threshold_db = v,
+            2 => c.ratio = v.max(1.0),
+            3 => c.attack_ms = v,
+            4 => c.release_ms = v,
+            5 => c.makeup_db = v,
+            _ => {}
+        },
+        Fx::Normalizer(x) => match n {
+            1 => x.target_db = v,
+            2 => x.max_gain_db = v,
+            _ => {}
+        },
+        Fx::Limiter(l) => {
+            if n == 1 {
+                l.ceiling_db = v.min(0.0);
+            }
+        }
+        Fx::Eq { .. } => {}
+    }
+}
+
+/// Built-in chains first, then the user's.
+fn fx_presets(s: &Shared) -> Vec<FxPreset> {
+    FxPreset::built_in().into_iter().chain(s.settings.fx_presets.iter().cloned()).collect()
+}
+
+fn push_rack(ui: &AppWindow, s: &Shared, fx: &Effects) {
+    ui.set_mixer_fx_slots(ModelRc::new(VecModel::from(fx.chain.iter().map(slot_ui).collect::<Vec<_>>())));
+    let builtin = FxPreset::built_in().len();
+    let presets: Vec<String> = fx_presets(s)
+        .iter()
+        .enumerate()
+        .map(|(i, p)| if i < builtin { p.name.clone() } else { format!("{} (mine)", p.name) })
+        .collect();
+    ui.set_mixer_fx_preset_names(names("Load preset…", presets.iter().map(String::as_str)));
+    let catalog: Vec<&str> = Fx::catalog().iter().map(Fx::name).collect();
+    ui.set_mixer_fx_add_names(names("Add effect…", catalog.into_iter()));
+}
+
+/// Change the chain being edited, save, and (for structural changes) redraw
+/// the rack. Parameter moves don't redraw: the slider shows its own value.
+fn edit_rack(ui: &AppWindow, s: &mut Shared, redraw: bool, edit: impl FnOnce(&mut Effects)) {
+    let Some(target) = *EDITING_FX.lock() else { return };
+    let Some(fx) = effects_mut(&mut s.preset.mixer, target) else { return };
+    edit(fx);
+    let fx = fx.clone();
+    commit(s);
+    if redraw {
+        push_rack(ui, s, &fx);
     }
 }
 
@@ -274,8 +333,8 @@ fn effects_mut(m: &mut MixerConfig, target: MixTarget) -> Option<&mut Effects> {
 /// Fill the editor. `rebuild` replaces the band rows (after add/delete/load,
 /// and when a drag ends so sliders pick up the new values); otherwise rows
 /// are updated in place, which keeps a handle that is being dragged alive.
-fn push_eq(ui: &AppWindow, fx: &Effects, rebuild: bool) {
-    let rows: Vec<EqBandUI> = fx.eq.iter().map(band_ui).collect();
+fn push_eq(ui: &AppWindow, on: bool, bands: &[EqBand], rebuild: bool) {
+    let rows: Vec<EqBandUI> = bands.iter().map(band_ui).collect();
     let model = ui.get_mixer_eq_bands();
     if !rebuild && model.row_count() == rows.len() {
         for (i, r) in rows.into_iter().enumerate() {
@@ -284,18 +343,20 @@ fn push_eq(ui: &AppWindow, fx: &Effects, rebuild: bool) {
     } else {
         ui.set_mixer_eq_bands(ModelRc::new(VecModel::from(rows)));
     }
-    ui.set_mixer_eq_on(fx.eq_on);
-    ui.set_mixer_eq_curve(curve(&fx.eq).into());
+    ui.set_mixer_eq_on(on);
+    ui.set_mixer_eq_curve(curve(bands).into());
 }
 
-/// Apply `edit` to the strip being edited, then refresh the editor and the
-/// mixer. `save` is false while a handle is dragged (saved when it's let go).
-fn edit_eq(ui: &AppWindow, s: &mut Shared, rebuild: bool, save: bool, edit: impl FnOnce(&mut Effects)) {
-    let Some(target) = *EDITING_EQ.lock() else { return };
-    let Some(fx) = effects_mut(&mut s.preset.mixer, target) else { return };
-    edit(fx);
-    let fx = fx.clone();
-    push_eq(ui, &fx, rebuild);
+/// Apply `edit` to the EQ slot being edited (its on switch and bands), then
+/// refresh the editor and the mixer. `save` is false while a handle is
+/// dragged (saved when it's let go).
+fn edit_eq(ui: &AppWindow, s: &mut Shared, rebuild: bool, save: bool, edit: impl FnOnce(&mut bool, &mut Vec<EqBand>)) {
+    let Some((target, id)) = *EDITING_EQ.lock() else { return };
+    let Some(slot) = effects_mut(&mut s.preset.mixer, target).and_then(|fx| fx.slot_mut(id)) else { return };
+    let Fx::Eq { bands } = &mut slot.fx else { return };
+    edit(&mut slot.on, bands);
+    let (on, bands) = (slot.on, bands.clone());
+    push_eq(ui, on, &bands, rebuild);
     if save {
         commit(s);
     } else {
@@ -400,7 +461,6 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
             m.voice.level = (ui.get_mixer_voice_level() / 100.0).clamp(0.0, 1.0);
             m.voice.muted = ui.get_mixer_voice_muted();
             m.voice.to_monitor = ui.get_mixer_voice_monitor();
-            m.voice.fx.eq_on = ui.get_mixer_voice_eq_on();
             commit(&mut s);
             // Lists depend on each other (the silent output excludes the
             // Slidr Mic's cable) and the hint on the switch.
@@ -420,7 +480,6 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
                 "level" => c.level = (num / 100.0).clamp(0.0, 1.0),
                 "muted" => c.muted = num > 0.5,
                 "reroute" => c.reroute = num > 0.5,
-                "eq-on" => c.fx.eq_on = num > 0.5,
                 "send-on" => {
                     c.mic_send = (num > 0.5).then_some(1.0);
                     // Shows or hides the send fader.
@@ -511,21 +570,101 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
             let Some(target) = MixTarget::from_value(&which) else { return };
             let mut s = shared.lock();
             let title = format!("Effects – {}", s.preset.mixer.label(target));
-            let Some(fx) = effects_mut(&mut s.preset.mixer, target) else { return };
+            let Some(fx) = effects_mut(&mut s.preset.mixer, target).cloned() else { return };
             *EDITING_FX.lock() = Some(target);
             ui.set_mixer_fx_title(title.into());
-            ui.set_mixer_fx(fx_ui(fx));
+            ui.set_mixer_fx_preset_name("".into());
+            push_rack(&ui, &s, &fx);
             ui.set_mixer_fx_open(true);
         });
     }
     {
+        let weak = ui.as_weak();
         let shared = shared.clone();
-        ui.on_mixer_fx_set(move |field, v| {
+        ui.on_mixer_fx_param(move |id, n, v| {
+            let Some(ui) = weak.upgrade() else { return };
+            edit_rack(&ui, &mut shared.lock(), false, |fx| {
+                if let Some(slot) = fx.slot_mut(id as u32) {
+                    set_param(&mut slot.fx, n, v);
+                }
+            });
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_mixer_fx_toggle(move |id, on| {
+            let Some(ui) = weak.upgrade() else { return };
+            edit_rack(&ui, &mut shared.lock(), true, |fx| {
+                if let Some(slot) = fx.slot_mut(id as u32) {
+                    slot.on = on;
+                }
+            });
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_mixer_fx_move(move |id, dir| {
+            let Some(ui) = weak.upgrade() else { return };
+            edit_rack(&ui, &mut shared.lock(), true, |fx| {
+                let Some(i) = fx.chain.iter().position(|s| s.id == id as u32) else { return };
+                let j = i as i32 + dir;
+                if j >= 0 && (j as usize) < fx.chain.len() {
+                    fx.chain.swap(i, j as usize);
+                }
+            });
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_mixer_fx_remove(move |id| {
+            let Some(ui) = weak.upgrade() else { return };
+            edit_rack(&ui, &mut shared.lock(), true, |fx| fx.chain.retain(|s| s.id != id as u32));
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_mixer_fx_add(move |kind| {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(new) = Fx::catalog().into_iter().nth(kind as usize) else { return };
+            edit_rack(&ui, &mut shared.lock(), true, |fx| {
+                let id = fx.next_id();
+                fx.chain.push(FxSlot { id, on: true, fx: new });
+            });
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_mixer_fx_load_preset(move |i| {
+            let Some(ui) = weak.upgrade() else { return };
+            let mut s = shared.lock();
+            let Some(preset) = fx_presets(&s).into_iter().nth(i as usize) else { return };
+            edit_rack(&ui, &mut s, true, |fx| fx.chain = preset.chain);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_mixer_fx_save_preset(move |name| {
+            let Some(ui) = weak.upgrade() else { return };
+            let name = name.trim().to_string();
             let Some(target) = *EDITING_FX.lock() else { return };
             let mut s = shared.lock();
-            let Some(fx) = effects_mut(&mut s.preset.mixer, target) else { return };
-            set_fx(fx, &field, v);
+            let Some(fx) = effects_mut(&mut s.preset.mixer, target).cloned() else { return };
+            if name.is_empty() {
+                return;
+            }
+            // Same name again replaces the old one.
+            let presets = &mut s.settings.fx_presets;
+            presets.retain(|p| p.name != name);
+            presets.push(FxPreset { name: name.clone(), chain: fx.chain.clone() });
             commit(&mut s);
+            push_rack(&ui, &s, &fx);
+            crate::glue::toast(&ui, &format!("Saved preset \"{name}\""));
         });
     }
     {
@@ -536,7 +675,7 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
             // The strip buttons show how many effects are on.
             if let Some(ui) = weak.upgrade() {
                 let s = shared.lock();
-                ui.set_mixer_voice_fx_count(s.preset.mixer.voice.fx.dynamics_on() as i32);
+                ui.set_mixer_voice_fx_count(s.preset.mixer.voice.fx.active() as i32);
                 push_channels(&ui, &s.preset.mixer);
             }
         });
@@ -544,21 +683,20 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
     {
         let weak = ui.as_weak();
         let shared = shared.clone();
-        ui.on_mixer_edit_eq(move |which| {
+        ui.on_mixer_fx_edit_eq(move |id| {
             let Some(ui) = weak.upgrade() else { return };
-            let Some(target) = MixTarget::from_value(&which) else { return };
+            let Some(target) = *EDITING_FX.lock() else { return };
             let mut s = shared.lock();
             if s.preset.mixer.eq_presets.is_empty() {
                 s.preset.mixer.eq_presets = MixerConfig::default_eq_presets();
             }
             let m = &mut s.preset.mixer;
-            let title = format!("EQ – {}", m.label(target));
+            ui.set_mixer_eq_title(format!("EQ – {}", m.label(target)).into());
             ui.set_mixer_eq_preset_names(names("Load preset…", m.eq_presets.iter().map(|p| p.name.as_str())));
-            let Some(fx) = effects_mut(m, target) else { return };
-            let fx = fx.clone();
-            *EDITING_EQ.lock() = Some(target);
-            ui.set_mixer_eq_title(title.into());
-            push_eq(&ui, &fx, true);
+            let Some(slot) = effects_mut(m, target).and_then(|fx| fx.slot_mut(id as u32)) else { return };
+            let Fx::Eq { bands } = &slot.fx else { return };
+            *EDITING_EQ.lock() = Some((target, slot.id));
+            push_eq(&ui, slot.on, &bands.clone(), true);
             ui.set_mixer_eq_open(true);
         });
     }
@@ -567,7 +705,7 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         let shared = shared.clone();
         ui.on_mixer_eq_toggled(move |on| {
             let Some(ui) = weak.upgrade() else { return };
-            edit_eq(&ui, &mut shared.lock(), false, true, |fx| fx.eq_on = on);
+            edit_eq(&ui, &mut shared.lock(), false, true, |slot_on, _| *slot_on = on);
         });
     }
     {
@@ -575,8 +713,8 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         let shared = shared.clone();
         ui.on_mixer_eq_set(move |i, field, v| {
             let Some(ui) = weak.upgrade() else { return };
-            edit_eq(&ui, &mut shared.lock(), false, true, |fx| {
-                let Some(b) = fx.eq.get_mut(i as usize) else { return };
+            edit_eq(&ui, &mut shared.lock(), false, true, |on, bands| {
+                let Some(b) = bands.get_mut(i as usize) else { return };
                 match field.as_str() {
                     "kind" => b.kind = EQ_KINDS.get(v as usize).copied().unwrap_or(EqBandKind::Peak),
                     "freq" => b.freq = freq_from_pos(v),
@@ -585,7 +723,7 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
                     other => log::warn!("EQ editor: unknown field {other:?}"),
                 }
                 // Editing a band means wanting to hear it.
-                fx.eq_on = true;
+                *on = true;
             });
         });
     }
@@ -594,13 +732,13 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         let shared = shared.clone();
         ui.on_mixer_eq_drag(move |i, x, y| {
             let Some(ui) = weak.upgrade() else { return };
-            edit_eq(&ui, &mut shared.lock(), false, false, |fx| {
-                let Some(b) = fx.eq.get_mut(i as usize) else { return };
+            edit_eq(&ui, &mut shared.lock(), false, false, |on, bands| {
+                let Some(b) = bands.get_mut(i as usize) else { return };
                 b.freq = freq_from_pos(x);
                 if has_gain(b.kind) {
                     b.gain_db = ((0.5 - y.clamp(0.0, 1.0)) * 2.0 * EQ_RANGE_DB).clamp(-EQ_RANGE_DB, EQ_RANGE_DB);
                 }
-                fx.eq_on = true;
+                *on = true;
             });
         });
     }
@@ -609,7 +747,7 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         let shared = shared.clone();
         ui.on_mixer_eq_drag_end(move || {
             let Some(ui) = weak.upgrade() else { return };
-            edit_eq(&ui, &mut shared.lock(), true, true, |_| {});
+            edit_eq(&ui, &mut shared.lock(), true, true, |_, _| {});
         });
     }
     {
@@ -617,9 +755,9 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         let shared = shared.clone();
         ui.on_mixer_eq_add(move || {
             let Some(ui) = weak.upgrade() else { return };
-            edit_eq(&ui, &mut shared.lock(), true, true, |fx| {
-                fx.eq.push(EqBand { kind: EqBandKind::Peak, freq: 1000.0, gain_db: 0.0, q: 1.0 });
-                fx.eq_on = true;
+            edit_eq(&ui, &mut shared.lock(), true, true, |on, bands| {
+                bands.push(EqBand { kind: EqBandKind::Peak, freq: 1000.0, gain_db: 0.0, q: 1.0 });
+                *on = true;
             });
         });
     }
@@ -628,9 +766,9 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         let shared = shared.clone();
         ui.on_mixer_eq_delete(move |i| {
             let Some(ui) = weak.upgrade() else { return };
-            edit_eq(&ui, &mut shared.lock(), true, true, |fx| {
-                if (i as usize) < fx.eq.len() {
-                    fx.eq.remove(i as usize);
+            edit_eq(&ui, &mut shared.lock(), true, true, |_, bands| {
+                if (i as usize) < bands.len() {
+                    bands.remove(i as usize);
                 }
             });
         });
@@ -641,10 +779,10 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         ui.on_mixer_eq_load_preset(move |i| {
             let Some(ui) = weak.upgrade() else { return };
             let mut s = shared.lock();
-            let Some(bands) = s.preset.mixer.eq_presets.get(i as usize).map(|p| p.bands.clone()) else { return };
-            edit_eq(&ui, &mut s, true, true, |fx| {
-                fx.eq = bands;
-                fx.eq_on = true;
+            let Some(preset) = s.preset.mixer.eq_presets.get(i as usize).map(|p| p.bands.clone()) else { return };
+            edit_eq(&ui, &mut s, true, true, |on, bands| {
+                *bands = preset;
+                *on = true;
             });
         });
     }
@@ -653,11 +791,12 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         let shared = shared.clone();
         ui.on_mixer_eq_closed(move || {
             *EDITING_EQ.lock() = None;
-            // The strip rows show the EQ switch.
-            if let Some(ui) = weak.upgrade() {
-                let s = shared.lock();
-                ui.set_mixer_voice_eq_on(s.preset.mixer.voice.fx.eq_on);
-                push_channels(&ui, &s.preset.mixer);
+            // The rack shows the EQ's switch and band count.
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(target) = *EDITING_FX.lock() else { return };
+            let mut s = shared.lock();
+            if let Some(fx) = effects_mut(&mut s.preset.mixer, target).cloned() {
+                push_rack(&ui, &s, &fx);
             }
         });
     }

@@ -927,7 +927,7 @@ mod tests {
         // (what this process played, mic input, Slidr Mic bus) over `secs`.
         // Input and bus are compared block by block, so the room changing
         // between two measurements doesn't matter.
-        let mut measure = |io: &mut Audio, secs: u64| -> (f64, f64, f64) {
+        let measure = |io: &mut Audio, secs: u64| -> (f64, f64, f64) {
             let (mut tapped, mut n_tap, mut input, mut bus, mut n) = (0f64, 0usize, 0f64, 0f64, 0usize);
             let mut block = vec![0.0; BLOCK_SAMPLES];
             let end = Instant::now() + Duration::from_secs(secs);

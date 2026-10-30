@@ -519,6 +519,10 @@ pub struct Settings {
     /// so global rather than per profile.
     #[serde(default)]
     pub mixer_devices: MixerDevices,
+
+    /// Effect chains saved by the user, offered on every profile's strips.
+    #[serde(default)]
+    pub fx_presets: Vec<FxPreset>,
 }
 
 impl Default for Settings {
@@ -534,6 +538,7 @@ impl Default for Settings {
             update_check: true,
             active_preset: "Default".into(),
             mixer_devices: MixerDevices::default(),
+            fx_presets: Vec::new(),
         }
     }
 }
@@ -684,6 +689,27 @@ mod tests {
             "firefox"
         );
         assert_eq!(AudioStream::default().label(), "default output");
+    }
+
+    #[test]
+    fn effects_from_before_chains_become_a_chain() {
+        let old = r#"{"eq_on": true, "eq": [{"kind": "peak", "freq": 1000.0, "gain_db": 3.0}],
+            "gate": {"on": true, "threshold_db": -50.0, "release_ms": 150.0},
+            "comp": {"on": false, "threshold_db": -20.0},
+            "limit": {"on": true, "ceiling_db": -2.0}}"#;
+        let fx: Effects = serde_json::from_str(old).unwrap();
+        let kinds: Vec<&str> = fx.chain.iter().map(|s| s.fx.name()).collect();
+        assert_eq!(kinds, ["Noise gate", "EQ", "Limiter"], "only what was on, in the old order");
+        assert!(matches!(fx.chain[0].fx, Fx::Gate(Gate { threshold_db, .. }) if threshold_db == -50.0));
+        assert!(matches!(fx.chain[2].fx, Fx::Limiter(Limiter { ceiling_db }) if ceiling_db == -2.0));
+    }
+
+    #[test]
+    fn chain_round_trips() {
+        let fx = Effects { chain: FxPreset::built_in().remove(1).chain };
+        let json = serde_json::to_string(&fx).unwrap();
+        assert!(json.contains("\"type\":\"compressor\""), "{json}");
+        assert_eq!(serde_json::from_str::<Effects>(&json).unwrap(), fx);
     }
 }
 
@@ -838,52 +864,93 @@ impl Default for VoiceStrip {
     }
 }
 
-/// Processing on one strip, in signal order: gate → EQ → compressor →
-/// normalizer → limiter.
+/// A strip's effect chain, processed top to bottom. The same effect may
+/// appear more than once (two compressors, an EQ on each side of one).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(from = "EffectsFile")]
 pub struct Effects {
     #[serde(default)]
-    pub eq_on: bool,
-    /// The strip's own bands; presets only fill them.
-    #[serde(default)]
-    pub eq: Vec<EqBand>,
-    #[serde(default)]
-    pub gate: Gate,
-    #[serde(default)]
-    pub comp: Compressor,
-    #[serde(default)]
-    pub norm: Normalizer,
-    #[serde(default)]
-    pub limit: Limiter,
+    pub chain: Vec<FxSlot>,
 }
 
 impl Effects {
-    /// How many dynamics effects are on (the strip's "Effects" button shows
-    /// it; the EQ has its own switch).
-    pub fn dynamics_on(&self) -> usize {
-        [self.gate.on, self.comp.on, self.norm.on, self.limit.on].iter().filter(|on| **on).count()
+    /// How many effects are on (shown on the strip's button).
+    pub fn active(&self) -> usize {
+        self.chain.iter().filter(|s| s.on).count()
+    }
+
+    /// A free slot id within this chain.
+    pub fn next_id(&self) -> u32 {
+        self.chain.iter().map(|s| s.id).max().unwrap_or(0) + 1
+    }
+
+    pub fn slot_mut(&mut self, id: u32) -> Option<&mut FxSlot> {
+        self.chain.iter_mut().find(|s| s.id == id)
     }
 }
 
-/// Mutes the strip while it stays below `threshold_db` (room noise between words).
+/// One effect in a chain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FxSlot {
+    /// Unique within its chain; lets the running effect keep its state when
+    /// the chain is reordered or edited.
+    pub id: u32,
+    #[serde(default = "default_true")]
+    pub on: bool,
+    #[serde(flatten)]
+    pub fx: Fx,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Fx {
+    Gate(Gate),
+    Eq { bands: Vec<EqBand> },
+    Compressor(Compressor),
+    Normalizer(Normalizer),
+    Limiter(Limiter),
+}
+
+impl Fx {
+    /// Every effect the "Add effect" list offers, with default settings.
+    pub fn catalog() -> Vec<Fx> {
+        vec![
+            Fx::Gate(Gate::default()),
+            Fx::Eq { bands: Vec::new() },
+            Fx::Compressor(Compressor::default()),
+            Fx::Normalizer(Normalizer::default()),
+            Fx::Limiter(Limiter::default()),
+        ]
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Fx::Gate(_) => "Noise gate",
+            Fx::Eq { .. } => "EQ",
+            Fx::Compressor(_) => "Compressor",
+            Fx::Normalizer(_) => "Normalizer",
+            Fx::Limiter(_) => "Limiter",
+        }
+    }
+}
+
+/// Silences the strip while it stays below `threshold_db` (room noise between words).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Gate {
-    pub on: bool,
     pub threshold_db: f32,
     pub release_ms: f32,
 }
 
 impl Default for Gate {
     fn default() -> Self {
-        Self { on: false, threshold_db: -45.0, release_ms: 150.0 }
+        Self { threshold_db: -45.0, release_ms: 150.0 }
     }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Compressor {
-    pub on: bool,
     pub threshold_db: f32,
     pub ratio: f32,
     pub attack_ms: f32,
@@ -893,7 +960,7 @@ pub struct Compressor {
 
 impl Default for Compressor {
     fn default() -> Self {
-        Self { on: false, threshold_db: -20.0, ratio: 3.0, attack_ms: 10.0, release_ms: 150.0, makeup_db: 0.0 }
+        Self { threshold_db: -20.0, ratio: 3.0, attack_ms: 10.0, release_ms: 150.0, makeup_db: 0.0 }
     }
 }
 
@@ -901,14 +968,13 @@ impl Default for Compressor {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Normalizer {
-    pub on: bool,
     pub target_db: f32,
     pub max_gain_db: f32,
 }
 
 impl Default for Normalizer {
     fn default() -> Self {
-        Self { on: false, target_db: -18.0, max_gain_db: 12.0 }
+        Self { target_db: -18.0, max_gain_db: 12.0 }
     }
 }
 
@@ -916,13 +982,111 @@ impl Default for Normalizer {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Limiter {
-    pub on: bool,
     pub ceiling_db: f32,
 }
 
 impl Default for Limiter {
     fn default() -> Self {
-        Self { on: false, ceiling_db: -1.0 }
+        Self { ceiling_db: -1.0 }
+    }
+}
+
+/// On-disk form of [`Effects`]: the chain, or — in profiles written before
+/// chains existed — one fixed slot per effect, which is turned into a chain.
+#[derive(Deserialize)]
+struct EffectsFile {
+    #[serde(default)]
+    chain: Option<Vec<FxSlot>>,
+    #[serde(default)]
+    eq_on: bool,
+    #[serde(default)]
+    eq: Vec<EqBand>,
+    #[serde(default)]
+    gate: Option<OldSlot<Gate>>,
+    #[serde(default)]
+    comp: Option<OldSlot<Compressor>>,
+    #[serde(default)]
+    norm: Option<OldSlot<Normalizer>>,
+    #[serde(default)]
+    limit: Option<OldSlot<Limiter>>,
+}
+
+#[derive(Deserialize)]
+struct OldSlot<T> {
+    #[serde(default)]
+    on: bool,
+    #[serde(flatten)]
+    params: T,
+}
+
+impl From<EffectsFile> for Effects {
+    fn from(f: EffectsFile) -> Self {
+        if let Some(chain) = f.chain {
+            return Self { chain };
+        }
+        // Old fixed order: gate → EQ → compressor → normalizer → limiter.
+        // Only what was in use carries over.
+        let mut chain = Vec::new();
+        let mut push = |on: bool, fx: Fx| chain.push(FxSlot { id: chain.len() as u32 + 1, on, fx });
+        if let Some(g) = f.gate.filter(|g| g.on) {
+            push(true, Fx::Gate(g.params));
+        }
+        if f.eq_on || !f.eq.is_empty() {
+            push(f.eq_on, Fx::Eq { bands: f.eq });
+        }
+        if let Some(c) = f.comp.filter(|c| c.on) {
+            push(true, Fx::Compressor(c.params));
+        }
+        if let Some(n) = f.norm.filter(|n| n.on) {
+            push(true, Fx::Normalizer(n.params));
+        }
+        if let Some(l) = f.limit.filter(|l| l.on) {
+            push(true, Fx::Limiter(l.params));
+        }
+        Self { chain }
+    }
+}
+
+/// A saved effect chain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FxPreset {
+    pub name: String,
+    pub chain: Vec<FxSlot>,
+}
+
+impl FxPreset {
+    /// Chains that ship with Slidr.
+    pub fn built_in() -> Vec<FxPreset> {
+        use EqBandKind::*;
+        let q = default_q();
+        let b = |kind, freq, gain_db, q| EqBand { kind, freq, gain_db, q };
+        let preset = |name: &str, fx: Vec<Fx>| FxPreset {
+            name: name.into(),
+            chain: fx.into_iter().enumerate().map(|(i, fx)| FxSlot { id: i as u32 + 1, on: true, fx }).collect(),
+        };
+        vec![
+            preset("Voice – clean", vec![
+                Fx::Gate(Gate { threshold_db: -45.0, release_ms: 150.0 }),
+                Fx::Eq { bands: vec![b(HighPass, 80.0, 0.0, q), b(LowShelf, 200.0, -2.0, q), b(Peak, 3000.0, 3.0, 1.0)] },
+                Fx::Compressor(Compressor { threshold_db: -20.0, ratio: 3.0, ..Compressor::default() }),
+                Fx::Limiter(Limiter { ceiling_db: -1.0 }),
+            ]),
+            preset("Voice – broadcast", vec![
+                Fx::Gate(Gate { threshold_db: -50.0, release_ms: 200.0 }),
+                Fx::Eq { bands: vec![b(HighPass, 90.0, 0.0, q), b(Peak, 180.0, 2.5, 0.9), b(Peak, 4000.0, 3.0, 1.0), b(HighShelf, 10000.0, 2.0, q)] },
+                Fx::Compressor(Compressor { threshold_db: -24.0, ratio: 4.0, attack_ms: 5.0, release_ms: 120.0, makeup_db: 4.0 }),
+                Fx::Limiter(Limiter { ceiling_db: -1.0 }),
+            ]),
+            preset("Music – even loudness", vec![
+                Fx::Normalizer(Normalizer { target_db: -18.0, max_gain_db: 12.0 }),
+                Fx::Limiter(Limiter { ceiling_db: -1.0 }),
+            ]),
+            preset("Game – night mode", vec![
+                Fx::Compressor(Compressor { threshold_db: -30.0, ratio: 4.0, attack_ms: 5.0, release_ms: 250.0, makeup_db: 6.0 }),
+                Fx::Limiter(Limiter { ceiling_db: -3.0 }),
+            ]),
+            preset("Bass boost", vec![Fx::Eq { bands: vec![b(LowShelf, 120.0, 6.0, q)] }, Fx::Limiter(Limiter { ceiling_db: -1.0 })]),
+        ]
     }
 }
 

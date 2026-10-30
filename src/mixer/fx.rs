@@ -1,8 +1,8 @@
-//! Dynamics effects and the per-strip chain: noise gate → EQ → compressor →
-//! normalizer → limiter. Stereo-linked (both channels get the same gain, so
+//! Effects and the per-strip chain that runs them in the user's order.
+//! Stereo-linked (both channels get the same gain, so
 //! the image doesn't wander), sample by sample on interleaved `f32` blocks.
 
-use crate::model::{Compressor, Effects, EqBand, Gate, Limiter, Normalizer};
+use crate::model::{Compressor, Effects, EqBand, Fx, Gate, Limiter, Normalizer};
 
 use super::dsp::{Eq, RATE};
 
@@ -152,54 +152,80 @@ impl LimitFx {
     }
 }
 
-/// All effects of one strip. Parameter changes keep each effect's running
-/// state (envelopes, gains), so turning a knob doesn't click.
+/// A running effect.
+enum Proc {
+    Gate(GateFx),
+    Eq(Vec<EqBand>, Eq),
+    Comp(CompFx),
+    Norm(NormFx),
+    Limit(LimitFx),
+}
+
+impl Proc {
+    fn new(fx: &Fx) -> Self {
+        match fx {
+            Fx::Gate(p) => Proc::Gate(GateFx::new(*p)),
+            Fx::Eq { bands } => Proc::Eq(bands.clone(), Eq::new(bands)),
+            Fx::Compressor(p) => Proc::Comp(CompFx::new(*p)),
+            Fx::Normalizer(p) => Proc::Norm(NormFx::new(*p)),
+            Fx::Limiter(p) => Proc::Limit(LimitFx::new(*p)),
+        }
+    }
+
+    /// Take new settings, keeping the running state. `false` if `fx` is a
+    /// different kind of effect (the slot was replaced).
+    fn retune(&mut self, fx: &Fx) -> bool {
+        match (self, fx) {
+            (Proc::Gate(x), Fx::Gate(p)) => x.p = *p,
+            (Proc::Comp(x), Fx::Compressor(p)) => x.p = *p,
+            (Proc::Norm(x), Fx::Normalizer(p)) => x.p = *p,
+            (Proc::Limit(x), Fx::Limiter(p)) => x.p = *p,
+            (Proc::Eq(old, eq), Fx::Eq { bands }) => {
+                if old != bands {
+                    *eq = Eq::new(bands);
+                    *old = bands.clone();
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn process(&mut self, buf: &mut [f32]) {
+        match self {
+            Proc::Gate(x) => x.process(buf),
+            Proc::Eq(_, x) => x.process(buf),
+            Proc::Comp(x) => x.process(buf),
+            Proc::Norm(x) => x.process(buf),
+            Proc::Limit(x) => x.process(buf),
+        }
+    }
+}
+
+/// One strip's effects, in chain order. Each slot keeps its running state
+/// (envelopes, gains) across edits and reorders, so nothing clicks.
 #[derive(Default)]
 pub struct FxChain {
-    gate: Option<GateFx>,
-    bands: Vec<EqBand>,
-    eq: Option<Eq>,
-    comp: Option<CompFx>,
-    norm: Option<NormFx>,
-    limit: Option<LimitFx>,
+    /// (slot id, effect) for the slots that are on.
+    procs: Vec<(u32, Proc)>,
 }
 
 impl FxChain {
     pub fn update(&mut self, fx: &Effects) {
-        fn slot<T, P: Copy>(s: &mut Option<T>, on: bool, p: P, new: fn(P) -> T, set: fn(&mut T, P)) {
-            match (on, s.as_mut()) {
-                (false, _) => *s = None,
-                (true, Some(x)) => set(x, p),
-                (true, None) => *s = Some(new(p)),
-            }
+        let mut old: Vec<(u32, Proc)> = std::mem::take(&mut self.procs);
+        for slot in fx.chain.iter().filter(|s| s.on) {
+            let reused = old
+                .iter()
+                .position(|(id, _)| *id == slot.id)
+                .map(|i| old.swap_remove(i).1)
+                .and_then(|mut p| p.retune(&slot.fx).then_some(p));
+            self.procs.push((slot.id, reused.unwrap_or_else(|| Proc::new(&slot.fx))));
         }
-        slot(&mut self.gate, fx.gate.on, fx.gate, GateFx::new, |x, p| x.p = p);
-        slot(&mut self.comp, fx.comp.on, fx.comp, CompFx::new, |x, p| x.p = p);
-        slot(&mut self.norm, fx.norm.on, fx.norm, NormFx::new, |x, p| x.p = p);
-        slot(&mut self.limit, fx.limit.on, fx.limit, LimitFx::new, |x, p| x.p = p);
-        if !fx.eq_on {
-            self.eq = None;
-        } else if self.eq.is_none() || fx.eq != self.bands {
-            self.eq = Some(Eq::new(&fx.eq));
-        }
-        self.bands = fx.eq.clone();
     }
 
     pub fn process(&mut self, buf: &mut [f32]) {
-        if let Some(x) = &mut self.gate {
-            x.process(buf);
-        }
-        if let Some(x) = &mut self.eq {
-            x.process(buf);
-        }
-        if let Some(x) = &mut self.comp {
-            x.process(buf);
-        }
-        if let Some(x) = &mut self.norm {
-            x.process(buf);
-        }
-        if let Some(x) = &mut self.limit {
-            x.process(buf);
+        for (_, p) in &mut self.procs {
+            p.process(buf);
         }
     }
 }
@@ -207,6 +233,7 @@ impl FxChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::FxSlot;
 
     fn sine(amp: f32, secs: f32) -> Vec<f32> {
         (0..(RATE as f32 * secs) as usize)
@@ -225,9 +252,13 @@ mod tests {
         10.0 * (b.iter().map(|s| s * s).sum::<f32>() / b.len() as f32).log10()
     }
 
-    fn chain(fx: Effects) -> FxChain {
+    fn effects(fx: Vec<Fx>) -> Effects {
+        Effects { chain: fx.into_iter().enumerate().map(|(i, fx)| FxSlot { id: i as u32 + 1, on: true, fx }).collect() }
+    }
+
+    fn chain(fx: Vec<Fx>) -> FxChain {
         let mut c = FxChain::default();
-        c.update(&fx);
+        c.update(&effects(fx));
         c
     }
 
@@ -242,54 +273,76 @@ mod tests {
 
     #[test]
     fn gate_silences_noise_and_passes_speech() {
-        let mut c = chain(Effects { gate: Gate { on: true, threshold_db: -40.0, release_ms: 100.0 }, ..Default::default() });
+        let mut c = chain(vec![Fx::Gate(Gate { threshold_db: -40.0, release_ms: 100.0 })]);
         assert!(peak_db(&run(&mut c, 0.003, 1.0)) < -100.0, "-50 dB hum is gated");
         assert!((peak_db(&run(&mut c, 0.3, 1.0)) - lin_to_db(0.3)).abs() < 0.1, "speech level passes");
     }
 
     #[test]
     fn compressor_reduces_by_its_ratio_above_threshold() {
-        let comp = Compressor { on: true, threshold_db: -20.0, ratio: 4.0, attack_ms: 5.0, release_ms: 200.0, makeup_db: 0.0 };
-        let mut c = chain(Effects { comp, ..Default::default() });
+        let comp = Compressor { threshold_db: -20.0, ratio: 4.0, attack_ms: 5.0, release_ms: 200.0, makeup_db: 0.0 };
         // -6 dBFS is 14 dB over: 14 * (1 - 1/4) = 10.5 dB less.
-        let out = peak_db(&run(&mut c, 0.5, 1.0));
+        let out = peak_db(&run(&mut chain(vec![Fx::Compressor(comp)]), 0.5, 1.0));
         assert!((out - (-6.02 - 10.5)).abs() < 1.5, "{out}");
         // Below the threshold nothing changes.
-        let mut c = chain(Effects { comp, ..Default::default() });
-        assert!((peak_db(&run(&mut c, 0.05, 1.0)) - lin_to_db(0.05)).abs() < 0.1);
+        assert!((peak_db(&run(&mut chain(vec![Fx::Compressor(comp)]), 0.05, 1.0)) - lin_to_db(0.05)).abs() < 0.1);
     }
 
     #[test]
     fn normalizer_brings_quiet_audio_to_target_and_ignores_silence() {
-        let norm = Normalizer { on: true, target_db: -18.0, max_gain_db: 15.0 };
-        let mut c = chain(Effects { norm, ..Default::default() });
+        let norm = Normalizer { target_db: -18.0, max_gain_db: 15.0 };
         // Sine at 0.1 peak = -23 dB RMS; should end near -18.
-        let out = rms_db(&run(&mut c, 0.1, 12.0));
+        let out = rms_db(&run(&mut chain(vec![Fx::Normalizer(norm)]), 0.1, 12.0));
         assert!((out + 18.0).abs() < 1.0, "{out}");
-        let mut c = chain(Effects { norm, ..Default::default() });
-        assert!(peak_db(&run(&mut c, 0.0005, 5.0)) < -60.0, "silence is not lifted");
+        assert!(peak_db(&run(&mut chain(vec![Fx::Normalizer(norm)]), 0.0005, 5.0)) < -60.0, "silence is not lifted");
     }
 
     #[test]
     fn limiter_holds_the_ceiling() {
-        let mut c = chain(Effects { limit: Limiter { on: true, ceiling_db: -3.0 }, ..Default::default() });
-        let out = run(&mut c, 0.95, 1.0);
+        let out = run(&mut chain(vec![Fx::Limiter(Limiter { ceiling_db: -3.0 })]), 0.95, 1.0);
         assert!(peak_db(&out) <= -3.0 + 0.01);
         assert!(peak_db(&out) > -4.0, "doesn't squash more than needed");
     }
 
     #[test]
-    fn off_chain_is_transparent_and_updates_keep_state() {
-        let mut c = chain(Effects::default());
+    fn stacked_effects_run_in_chain_order() {
+        // Limit to -12, then boost 10 dB with a compressor's makeup → -2 dB.
+        let boost = Fx::Compressor(Compressor { threshold_db: 0.0, ratio: 1.0, makeup_db: 10.0, ..Compressor::default() });
+        let limit = Fx::Limiter(Limiter { ceiling_db: -12.0 });
+        let out = peak_db(&run(&mut chain(vec![limit.clone(), boost.clone()]), 0.9, 0.5));
+        assert!((out + 2.0).abs() < 0.3, "{out}");
+        // The other way round the limiter has the last word.
+        let out = peak_db(&run(&mut chain(vec![boost, limit]), 0.9, 0.5));
+        assert!(out <= -12.0 + 0.01, "{out}");
+    }
+
+    #[test]
+    fn empty_or_switched_off_chain_is_transparent() {
         let input = sine(0.4, 0.1);
-        let mut out = input.clone();
-        c.process(&mut out);
-        assert_eq!(input, out);
-        let comp = Compressor { on: true, ..Default::default() };
-        c.update(&Effects { comp, ..Default::default() });
+        let mut fx = effects(vec![Fx::Limiter(Limiter { ceiling_db: -20.0 })]);
+        fx.chain[0].on = false;
+        for e in [Effects::default(), fx] {
+            let mut c = FxChain::default();
+            c.update(&e);
+            let mut out = input.clone();
+            c.process(&mut out);
+            assert_eq!(input, out);
+        }
+    }
+
+    #[test]
+    fn edits_and_reorders_keep_running_state() {
+        let comp = Compressor::default();
+        let mut fx = effects(vec![Fx::Limiter(Limiter::default()), Fx::Compressor(comp)]);
+        let mut c = FxChain::default();
+        c.update(&fx);
         run(&mut c, 0.9, 0.5);
-        let env = c.comp.as_ref().unwrap().env_db;
-        c.update(&Effects { comp: Compressor { ratio: 6.0, ..comp }, ..Default::default() });
-        assert_eq!(c.comp.as_ref().unwrap().env_db, env, "a knob turn keeps the envelope");
+        let env = |c: &FxChain| c.procs.iter().find_map(|(_, p)| match p { Proc::Comp(x) => Some(x.env_db), _ => None });
+        let before = env(&c);
+        fx.chain.swap(0, 1);
+        fx.chain[0].fx = Fx::Compressor(Compressor { ratio: 6.0, ..comp });
+        c.update(&fx);
+        assert_eq!(env(&c), before, "a knob turn or move keeps the envelope");
+        assert!(matches!(c.procs[0].1, Proc::Comp(_)), "new order applies");
     }
 }

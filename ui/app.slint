@@ -2303,10 +2303,10 @@ component LedConfigPopup inherits Rectangle {
 // ──────────────────────────────────────────────────────────────────────────
 
 // One mixer channel as the Mixer page shows it. `level` / `send` are percent;
-// `eq-on` is the strip's EQ switch; its bands live in the EQ editor.
+// `fx-count` is how many effects of its chain are on.
 export struct MixChannelUI {
     id: int, name: string, programs: string, level: float, muted: bool,
-    eq-on: bool, fx-count: int, reroute: bool, send-on: bool, send: float,
+    fx-count: int, reroute: bool, send-on: bool, send: float,
 }
 
 // Fader + percent readout, the row control of the mixer.
@@ -2337,7 +2337,6 @@ component MixerPage inherits VerticalBox {
     in-out property <float> voice-level;
     in-out property <bool> voice-muted;
     in-out property <bool> voice-monitor;
-    in-out property <bool> voice-eq-on;
     in property <int> voice-fx-count;
     in property <[string]> monitor-names;
     in property <[string]> mic-names;
@@ -2358,8 +2357,6 @@ component MixerPage inherits VerticalBox {
     callback add-channel();
     callback delete-channel(int);
     callback choose-programs(int);
-    // Open the EQ editor for "voice" or "channel:<id>".
-    callback edit-eq(string);
     // Open the effects editor for "voice" or "channel:<id>".
     callback edit-fx(string);
 
@@ -2439,14 +2436,7 @@ component MixerPage inherits VerticalBox {
                             changed(v) => { root.voice-level = v; root.changed(); } }
                     }
                     HorizontalLayout { spacing: 24px; alignment: start;
-                        Labeled { label: "EQ";
-                            HorizontalLayout { spacing: 8px;
-                                VerticalLayout { alignment: center;
-                                    Toggle { checked <=> root.voice-eq-on; toggled => { root.changed(); } } }
-                                IconButton { label: "Edit"; clicked => { root.edit-eq("voice"); } }
-                            }
-                        }
-                        Labeled { label: "Effects";
+                        Labeled { label: "Effects & EQ";
                             IconButton { label: root.voice-fx-count > 0 ? "Edit (" + root.voice-fx-count + " on)" : "Edit";
                                 clicked => { root.edit-fx("voice"); } }
                         }
@@ -2483,15 +2473,7 @@ component MixerPage inherits VerticalBox {
                             changed(v) => { root.channel-set(ch.id, "level", v, ""); } }
                     }
                     HorizontalLayout { spacing: 24px; alignment: start;
-                        Labeled { label: "EQ";
-                            HorizontalLayout { spacing: 8px;
-                                VerticalLayout { alignment: center;
-                                    Toggle { checked: ch.eq-on;
-                                        toggled => { root.channel-set(ch.id, "eq-on", self.checked ? 1 : 0, ""); } } }
-                                IconButton { label: "Edit"; clicked => { root.edit-eq("channel:" + ch.id); } }
-                            }
-                        }
-                        Labeled { label: "Effects";
+                        Labeled { label: "Effects & EQ";
                             IconButton { label: ch.fx-count > 0 ? "Edit (" + ch.fx-count + " on)" : "Edit";
                                 clicked => { root.edit-fx("channel:" + ch.id); } }
                         }
@@ -2717,13 +2699,13 @@ component EqEditorPopup inherits Rectangle {
     }
 }
 
-// Dynamics settings of one mixer strip (the EQ has its own editor).
-export struct FxUI {
-    gate-on: bool, gate-threshold: float, gate-release: float,
-    comp-on: bool, comp-threshold: float, comp-ratio: float,
-    comp-attack: float, comp-release: float, comp-makeup: float,
-    norm-on: bool, norm-target: float, norm-max: float,
-    lim-on: bool, lim-ceiling: float,
+// One effect in a strip's chain. `kind`: 0 gate · 1 EQ · 2 compressor ·
+// 3 normalizer · 4 limiter; `p1`…`p5` are its parameters in the order the
+// rack shows them; `summary` describes an EQ.
+export struct FxSlotUI {
+    id: int, kind: int, name: string, on: bool,
+    p1: float, p2: float, p3: float, p4: float, p5: float,
+    summary: string,
 }
 
 // Label · slider · value with unit.
@@ -2746,32 +2728,37 @@ component ParamRow inherits HorizontalLayout {
         font-family: "Inter"; font-size: 12px; }
 }
 
-// A titled card with an on/off switch; its rows go below.
-component FxSection inherits Card {
-    in property <string> title;
-    in property <string> description;
-    in-out property <bool> on;
-    callback toggled(bool);
-    VerticalBox { padding: 14px; spacing: 8px;
-        HorizontalLayout { spacing: 10px;
-            VerticalLayout { horizontal-stretch: 1; spacing: 2px;
-                Text { text: root.title; font-weight: 700; font-family: "Inter"; font-size: 14px; }
-                Text { text: root.description; wrap: word-wrap; font-family: "Inter"; font-size: 11px;
-                    color: Palette.foreground.with-alpha(0.55); }
-            }
-            VerticalLayout { alignment: center;
-                Toggle { checked <=> root.on; toggled => { root.toggled(self.checked); } } }
-        }
-        VerticalLayout { spacing: 6px; opacity: root.on ? 1.0 : 0.45;
-            @children
-        }
-    }
+// Small text button for moving a slot up / down.
+component MoveButton {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+    min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px;
+    opacity: root.enabled ? 1.0 : 0.25;
+    Rectangle { border-radius: 6px;
+        background: (ta.has-hover && root.enabled) ? Palette.alternate-background.darker(0.06) : transparent; }
+    ta := TouchArea { enabled: root.enabled; mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); } }
+    Text { text: root.text; font-size: 15px; font-family: "Inter";
+        horizontal-alignment: center; vertical-alignment: center; }
 }
 
-component FxEditorPopup inherits Rectangle {
+// A strip's effect chain: effects run top to bottom; add from a list, stack,
+// reorder, switch off, or load / save a whole chain as a preset.
+component FxRackPopup inherits Rectangle {
     in property <string> title;
-    in property <FxUI> fx;
-    callback set(string, float);
+    in property <[FxSlotUI]> slots;
+    in property <[string]> add-names;
+    in property <[string]> preset-names;
+    in-out property <string> preset-name;
+    callback param(int, int, float);
+    callback toggle(int, bool);
+    callback move(int, int);
+    callback remove(int);
+    callback add(int);
+    callback load-preset(int);
+    callback save-preset(string);
+    callback edit-eq(int);
     callback close();
 
     background: #00000099;
@@ -2780,14 +2767,14 @@ component FxEditorPopup inherits Rectangle {
     Rectangle {
         x: parent.width / 2 - self.width / 2;
         y: parent.height / 2 - self.height / 2;
-        width: min(parent.width - 48px, 720px); height: min(parent.height - 48px, 700px);
+        width: min(parent.width - 48px, 740px); height: min(parent.height - 48px, 720px);
         background: Palette.background;
         border-radius: 14px; border-width: 1px; border-color: Palette.border;
         TouchArea {}
         VerticalBox {
             padding: 22px; spacing: 12px;
             Text { text: root.title; font-size: 20px; font-weight: 700; font-family: "Inter"; }
-            Text { text: "Order: noise gate → EQ → compressor → normalizer → limiter. The EQ has its own editor.";
+            Text { text: "Effects run top to bottom. Add the same one twice to stack it.";
                 font-family: "Inter"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
             ScrollView {
                 mouse-drag-pan-enabled: false;
@@ -2795,53 +2782,73 @@ component FxEditorPopup inherits Rectangle {
                 VerticalBox {
                     spacing: 10px; alignment: start;
                     width: parent.width - 18px;
-                    FxSection {
-                        title: "Noise gate";
-                        description: "Silences the strip while it stays below the threshold — room noise between words.";
-                        on: root.fx.gate-on;
-                        toggled(v) => { root.set("gate-on", v ? 1 : 0); }
-                        ParamRow { label: "Threshold"; minimum: -80; maximum: 0; unit: "dB";
-                            value: root.fx.gate-threshold; changed(v) => { root.set("gate-threshold", v); } }
-                        ParamRow { label: "Release"; minimum: 20; maximum: 1000; unit: "ms";
-                            value: root.fx.gate-release; changed(v) => { root.set("gate-release", v); } }
-                    }
-                    FxSection {
-                        title: "Compressor";
-                        description: "Turns loud parts down above the threshold, so quiet and loud come closer together.";
-                        on: root.fx.comp-on;
-                        toggled(v) => { root.set("comp-on", v ? 1 : 0); }
-                        ParamRow { label: "Threshold"; minimum: -60; maximum: 0; unit: "dB";
-                            value: root.fx.comp-threshold; changed(v) => { root.set("comp-threshold", v); } }
-                        ParamRow { label: "Ratio"; minimum: 1; maximum: 20; unit: ": 1"; fine: true;
-                            value: root.fx.comp-ratio; changed(v) => { root.set("comp-ratio", v); } }
-                        ParamRow { label: "Attack"; minimum: 0.5; maximum: 100; unit: "ms"; fine: true;
-                            value: root.fx.comp-attack; changed(v) => { root.set("comp-attack", v); } }
-                        ParamRow { label: "Release"; minimum: 20; maximum: 1000; unit: "ms";
-                            value: root.fx.comp-release; changed(v) => { root.set("comp-release", v); } }
-                        ParamRow { label: "Makeup"; minimum: 0; maximum: 24; unit: "dB"; fine: true;
-                            value: root.fx.comp-makeup; changed(v) => { root.set("comp-makeup", v); } }
-                    }
-                    FxSection {
-                        title: "Normalizer";
-                        description: "Slowly evens out loudness to a target — a quiet video next to a loud song. Silence stays silent.";
-                        on: root.fx.norm-on;
-                        toggled(v) => { root.set("norm-on", v ? 1 : 0); }
-                        ParamRow { label: "Target"; minimum: -40; maximum: -6; unit: "dB";
-                            value: root.fx.norm-target; changed(v) => { root.set("norm-target", v); } }
-                        ParamRow { label: "Max boost"; minimum: 0; maximum: 30; unit: "dB";
-                            value: root.fx.norm-max; changed(v) => { root.set("norm-max", v); } }
-                    }
-                    FxSection {
-                        title: "Limiter";
-                        description: "Keeps peaks under the ceiling, so nothing distorts.";
-                        on: root.fx.lim-on;
-                        toggled(v) => { root.set("lim-on", v ? 1 : 0); }
-                        ParamRow { label: "Ceiling"; minimum: -12; maximum: 0; unit: "dB"; fine: true;
-                            value: root.fx.lim-ceiling; changed(v) => { root.set("lim-ceiling", v); } }
+                    if root.slots.length == 0: Text {
+                        text: "No effects yet — add one below or load a preset.";
+                        font-family: "Inter"; color: Palette.foreground.with-alpha(0.6); }
+                    for sl[i] in root.slots: Card {
+                        VerticalBox { padding: 12px; spacing: 8px;
+                            HorizontalLayout { spacing: 8px;
+                                Text { text: (i + 1) + "."; min-width: 20px; vertical-alignment: center;
+                                    font-family: "Inter"; color: Palette.foreground.with-alpha(0.6); }
+                                Text { text: sl.name; font-weight: 700; font-family: "Inter"; font-size: 14px;
+                                    vertical-alignment: center; horizontal-stretch: 1; }
+                                MoveButton { text: "↑"; enabled: i > 0; clicked => { root.move(sl.id, -1); } }
+                                MoveButton { text: "↓"; enabled: i < root.slots.length - 1;
+                                    clicked => { root.move(sl.id, 1); } }
+                                VerticalLayout { alignment: center;
+                                    Toggle { checked: sl.on; toggled => { root.toggle(sl.id, self.checked); } } }
+                                SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
+                                    clicked => { root.remove(sl.id); } }
+                            }
+                            VerticalLayout { spacing: 6px; opacity: sl.on ? 1.0 : 0.45;
+                                if sl.kind == 0: VerticalLayout { spacing: 6px;
+                                    ParamRow { label: "Threshold"; minimum: -80; maximum: 0; unit: "dB";
+                                        value: sl.p1; changed(v) => { root.param(sl.id, 1, v); } }
+                                    ParamRow { label: "Release"; minimum: 20; maximum: 1000; unit: "ms";
+                                        value: sl.p2; changed(v) => { root.param(sl.id, 2, v); } }
+                                }
+                                if sl.kind == 1: HorizontalLayout { spacing: 10px;
+                                    Text { text: sl.summary; horizontal-stretch: 1; vertical-alignment: center;
+                                        font-family: "Inter"; font-size: 12px; }
+                                    IconButton { label: "Edit curve"; clicked => { root.edit-eq(sl.id); } }
+                                }
+                                if sl.kind == 2: VerticalLayout { spacing: 6px;
+                                    ParamRow { label: "Threshold"; minimum: -60; maximum: 0; unit: "dB";
+                                        value: sl.p1; changed(v) => { root.param(sl.id, 1, v); } }
+                                    ParamRow { label: "Ratio"; minimum: 1; maximum: 20; unit: ": 1"; fine: true;
+                                        value: sl.p2; changed(v) => { root.param(sl.id, 2, v); } }
+                                    ParamRow { label: "Attack"; minimum: 0.5; maximum: 100; unit: "ms"; fine: true;
+                                        value: sl.p3; changed(v) => { root.param(sl.id, 3, v); } }
+                                    ParamRow { label: "Release"; minimum: 20; maximum: 1000; unit: "ms";
+                                        value: sl.p4; changed(v) => { root.param(sl.id, 4, v); } }
+                                    ParamRow { label: "Makeup"; minimum: 0; maximum: 24; unit: "dB"; fine: true;
+                                        value: sl.p5; changed(v) => { root.param(sl.id, 5, v); } }
+                                }
+                                if sl.kind == 3: VerticalLayout { spacing: 6px;
+                                    ParamRow { label: "Target"; minimum: -40; maximum: -6; unit: "dB";
+                                        value: sl.p1; changed(v) => { root.param(sl.id, 1, v); } }
+                                    ParamRow { label: "Max boost"; minimum: 0; maximum: 30; unit: "dB";
+                                        value: sl.p2; changed(v) => { root.param(sl.id, 2, v); } }
+                                }
+                                if sl.kind == 4: ParamRow { label: "Ceiling"; minimum: -12; maximum: 0; unit: "dB";
+                                    fine: true; value: sl.p1; changed(v) => { root.param(sl.id, 1, v); } }
+                            }
+                        }
                     }
                 }
             }
-            HorizontalLayout { alignment: end;
+            HorizontalLayout { spacing: 10px;
+                Select { field-width: 170px; model: root.add-names; current-index: 0;
+                    selected(i) => { if (i > 0) { root.add(i - 1); } self.current-index = 0; } }
+                Select { field-width: 210px; model: root.preset-names; current-index: 0;
+                    selected(i) => { if (i > 0) { root.load-preset(i - 1); } self.current-index = 0; } }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            HorizontalLayout { spacing: 10px;
+                LineEdit { height: 36px; horizontal-stretch: 1; placeholder-text: "Name for this chain…";
+                    text <=> root.preset-name; }
+                IconButton { label: "Save as preset"; enabled: root.preset-name != "";
+                    clicked => { root.save-preset(root.preset-name); root.preset-name = ""; } }
                 IconButton { label: "Done"; primary: true; clicked => { root.close(); } }
             }
         }
@@ -2913,13 +2920,22 @@ export component AppWindow inherits Window {
     in-out property <float> mixer-voice-level;
     in-out property <bool> mixer-voice-muted;
     in-out property <bool> mixer-voice-monitor;
-    in-out property <bool> mixer-voice-eq-on;
     in property <int> mixer-voice-fx-count;
     in-out property <bool> mixer-fx-open: false;
     in property <string> mixer-fx-title;
-    in property <FxUI> mixer-fx;
+    in property <[FxSlotUI]> mixer-fx-slots;
+    in property <[string]> mixer-fx-add-names;
+    in property <[string]> mixer-fx-preset-names;
+    in-out property <string> mixer-fx-preset-name;
     callback mixer-edit-fx(string);
-    callback mixer-fx-set(string, float);
+    callback mixer-fx-param(int, int, float);
+    callback mixer-fx-toggle(int, bool);
+    callback mixer-fx-move(int, int);
+    callback mixer-fx-remove(int);
+    callback mixer-fx-add(int);
+    callback mixer-fx-load-preset(int);
+    callback mixer-fx-save-preset(string);
+    callback mixer-fx-edit-eq(int);
     callback mixer-fx-closed();
     in-out property <bool> mixer-eq-open: false;
     in property <string> mixer-eq-title;
@@ -2927,7 +2943,6 @@ export component AppWindow inherits Window {
     in property <[EqBandUI]> mixer-eq-bands;
     in property <string> mixer-eq-curve;
     in property <[string]> mixer-eq-preset-names;
-    callback mixer-edit-eq(string);
     callback mixer-eq-toggled(bool);
     callback mixer-eq-set(int, string, float);
     callback mixer-eq-drag(int, float, float);
@@ -3333,8 +3348,6 @@ export component AppWindow inherits Window {
                     voice-level <=> root.mixer-voice-level;
                     voice-muted <=> root.mixer-voice-muted;
                     voice-monitor <=> root.mixer-voice-monitor;
-                    voice-eq-on <=> root.mixer-voice-eq-on;
-                    edit-eq(t) => { root.mixer-edit-eq(t); }
                     voice-fx-count: root.mixer-voice-fx-count;
                     edit-fx(t) => { root.mixer-edit-fx(t); }
                     monitor-names: root.mixer-monitor-names;
@@ -3552,10 +3565,20 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.mixer-fx-open: FxEditorPopup {
+    if root.mixer-fx-open: FxRackPopup {
         title: root.mixer-fx-title;
-        fx: root.mixer-fx;
-        set(f, v) => { root.mixer-fx-set(f, v); }
+        slots: root.mixer-fx-slots;
+        add-names: root.mixer-fx-add-names;
+        preset-names: root.mixer-fx-preset-names;
+        preset-name <=> root.mixer-fx-preset-name;
+        param(id, n, v) => { root.mixer-fx-param(id, n, v); }
+        toggle(id, on) => { root.mixer-fx-toggle(id, on); }
+        move(id, d) => { root.mixer-fx-move(id, d); }
+        remove(id) => { root.mixer-fx-remove(id); }
+        add(k) => { root.mixer-fx-add(k); }
+        load-preset(i) => { root.mixer-fx-load-preset(i); }
+        save-preset(n) => { root.mixer-fx-save-preset(n); }
+        edit-eq(id) => { root.mixer-fx-edit-eq(id); }
         close => { root.mixer-fx-open = false; root.mixer-fx-closed(); }
     }
     if root.mixer-eq-open: EqEditorPopup {

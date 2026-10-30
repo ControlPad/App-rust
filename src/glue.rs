@@ -2114,7 +2114,7 @@ fn spawn_update_check(ui: &AppWindow) {
     });
 }
 
-fn toast(ui: &AppWindow, msg: &str) {
+pub(crate) fn toast(ui: &AppWindow, msg: &str) {
     ui.set_toast_text(msg.into());
     let weak = ui.as_weak();
     let timer = slint::Timer::default();

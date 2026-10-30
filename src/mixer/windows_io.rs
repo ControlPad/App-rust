@@ -38,10 +38,11 @@ use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, WaitF
 
 use crate::model::{MixTarget, MixerConfig, MixerDevices};
 
-use super::dsp::{BLOCK_FRAMES, BLOCK_SAMPLES, RATE};
+use super::dsp::{Fade, BLOCK_FRAMES, BLOCK_SAMPLES, RATE};
 use super::engine::Engine;
 use super::ring::Ring;
 use super::route::Router;
+use super::sfx::{self, Library, Player, Sounds};
 use super::Cmd;
 
 const CHANNELS: u16 = 2;
@@ -410,6 +411,8 @@ enum AudioCmd {
     Capture(HashMap<u32, u32>),
     /// Channels whose programs are rerouted (and so belong on the monitor).
     Monitored(Vec<(u32, bool)>),
+    /// The feedback sounds, after the folder changed.
+    Sounds(Sounds),
     Stop(crossbeam_channel::Sender<()>),
 }
 
@@ -430,6 +433,13 @@ struct Audio {
     /// Whether devices are open and mixing — the control thread only starts
     /// captures and reroutes while this is set.
     running_flag: Arc<AtomicBool>,
+    sounds: Sounds,
+    sfx_on: bool,
+    player: Player,
+    /// Master gain of both buses: fades in on power-on, out on power-off.
+    bus: Fade,
+    /// Switched off and fading out; devices close at this moment.
+    closing: Option<Instant>,
     stats: Stats,
     tmp: Vec<f32>,
     voice_buf: Vec<f32>,
@@ -451,6 +461,11 @@ impl Audio {
             voice: None,
             captures: HashMap::new(),
             running_flag,
+            sounds: Sounds::new(),
+            sfx_on: true,
+            player: Player::default(),
+            bus: Fade::new(1.0),
+            closing: None,
             stats: Stats::new(),
             tmp: vec![0.0; BLOCK_SAMPLES],
             voice_buf: vec![0.0; BLOCK_SAMPLES],
@@ -460,7 +475,21 @@ impl Audio {
     }
 
     fn running(&self) -> bool {
-        self.cfg.enabled && (self.monitor.is_some() || self.mic_out.is_some())
+        (self.cfg.enabled || self.closing.is_some()) && (self.monitor.is_some() || self.mic_out.is_some())
+    }
+
+    /// Start the named feedback sound (if sounds are on); its length in
+    /// frames either way, since the switch fades that long (0 if missing).
+    fn play(&mut self, name: &str) -> u32 {
+        match self.sounds.get(name) {
+            Some(s) => {
+                if self.sfx_on {
+                    self.player.play(s.clone());
+                }
+                s.len() as u32
+            }
+            None => 0,
+        }
     }
 
     fn handle(&mut self, cmd: Cmd) {
@@ -472,41 +501,92 @@ impl Audio {
             }
             Cmd::SetMute(t, m) => {
                 self.live_mutes.insert(t, m);
-                self.engine.set_mute(t, m);
+                self.engine.set_mute(t, m, BLOCK_FRAMES as u32);
             }
             Cmd::ToggleMute(t) => {
                 if let Some(m) = self.engine.muted(t) {
                     self.live_mutes.insert(t, !m);
-                    self.engine.set_mute(t, !m);
+                    let len = self.play(&sfx::switch_sound("mute", !m)).max(BLOCK_FRAMES as u32);
+                    self.engine.set_mute(t, !m, len);
                 }
+            }
+            Cmd::SoundPrefs(on, volume) => {
+                self.sfx_on = on;
+                self.player.gain = volume.clamp(0.0, 1.0);
             }
             Cmd::Shutdown(_) => unreachable!("the control thread handles shutdown"),
         }
     }
 
     fn configure(&mut self, cfg: MixerConfig, devices: MixerDevices) {
-        let reopen = devices != self.devices || cfg.enabled != self.cfg.enabled;
+        let was_running = self.running();
+        let old = std::mem::take(&mut self.cfg);
         // A board move stays until the page changes that same level (the
         // page then shows the truth); editing anything else keeps it.
-        let old = &self.cfg;
-        self.live_levels.retain(|t, _| level_of(old, *t) == level_of(&cfg, *t));
-        self.live_mutes.retain(|t, _| muted_of(old, *t) == muted_of(&cfg, *t));
-        self.engine.configure(&cfg);
+        self.live_levels.retain(|t, _| level_of(&old, *t) == level_of(&cfg, *t));
+        self.live_mutes.retain(|t, _| muted_of(&old, *t) == muted_of(&cfg, *t));
+
+        // What got switched: its sound plays, and it fades as long.
+        let live = was_running && cfg.enabled;
+        let none = Sounds::new();
+        let engine = &self.engine;
+        let live_mutes = &self.live_mutes;
+        let (sounds, fades) = sfx::diff(
+            &old,
+            &cfg,
+            &|t| engine.muted(t),
+            &|t| live_mutes.get(&t).copied().or_else(|| muted_of(&cfg, t)),
+            if live { &self.sounds } else { &none },
+        );
+        if self.sfx_on {
+            for s in sounds {
+                self.player.play(s);
+            }
+        }
+        self.engine.configure(&cfg, &fades);
         for (t, v) in &self.live_levels {
             self.engine.set_level(*t, *v);
         }
         for (t, m) in &self.live_mutes {
-            self.engine.set_mute(*t, *m);
+            self.engine.set_mute(*t, *m, fades.gain(*t));
         }
+
+        let reopen = devices != self.devices;
+        let (was_on, now_on) = (old.enabled, cfg.enabled);
         self.cfg = cfg;
         self.devices = devices;
-        if reopen {
+        if reopen || (now_on && !was_on) {
             self.close_devices();
-            if self.cfg.enabled {
+            if now_on {
                 self.open_devices();
+                if !was_on {
+                    // Power-on: the mix rises with its sound. (A device change
+                    // just reopens, quietly.)
+                    self.bus = Fade::new(0.0);
+                    let len = self.play("power_on");
+                    self.bus.set_over(1.0, len.max(BLOCK_FRAMES as u32));
+                }
             }
+        } else if was_on && !now_on && self.running() {
+            // Power-off: keep playing while the mix sinks with its sound.
+            let len = self.play("power_off").max(BLOCK_FRAMES as u32);
+            self.bus.set_over(0.0, len);
+            self.closing = Some(Instant::now() + Duration::from_secs_f32(len as f32 / RATE as f32));
+        } else if now_on {
+            self.closing = None;
+            self.bus.set_over(1.0, BLOCK_FRAMES as u32);
         }
         self.running_flag.store(self.running(), Ordering::Relaxed);
+    }
+
+    /// Finish a power-off once its fade is over.
+    fn finish_closing(&mut self) {
+        if self.closing.is_some_and(|t| Instant::now() >= t) {
+            self.closing = None;
+            self.close_devices();
+            self.bus = Fade::new(1.0);
+            self.running_flag.store(self.running(), Ordering::Relaxed);
+        }
     }
 
     fn open_devices(&mut self) {
@@ -599,6 +679,16 @@ impl Audio {
             None => None,
         };
         self.engine.process(&mut channels, voice, &mut self.monitor_buf, &mut self.mic_buf);
+        if !self.bus.is_at(1.0) {
+            for (m, k) in self.monitor_buf.chunks_exact_mut(2).zip(self.mic_buf.chunks_exact_mut(2)) {
+                let g = self.bus.next();
+                m[0] *= g;
+                m[1] *= g;
+                k[0] *= g;
+                k[1] *= g;
+            }
+        }
+        self.player.mix_into(&mut self.monitor_buf);
         if let Some(m) = &self.monitor {
             if let Err(e) = m.write(&self.monitor_buf) {
                 log::warn!("mixer: monitor write failed ({e}); reopening devices");
@@ -664,12 +754,15 @@ fn audio_thread(rx: Receiver<AudioCmd>, running_flag: Arc<AtomicBool>) {
         for cmd in first.into_iter().chain(rx.try_iter()) {
             match cmd {
                 AudioCmd::Mixer(c) => audio.handle(c),
+                // While powering off, keep what plays until the fade is over.
+                AudioCmd::Capture(_) | AudioCmd::Monitored(_) if audio.closing.is_some() => {}
                 AudioCmd::Capture(wanted) => audio.set_captures(wanted),
                 AudioCmd::Monitored(list) => {
                     for (ch, on) in list {
                         audio.engine.set_monitored(ch, on);
                     }
                 }
+                AudioCmd::Sounds(s) => audio.sounds = s,
                 AudioCmd::Stop(ack) => {
                     audio.close_devices();
                     audio.running_flag.store(false, Ordering::Relaxed);
@@ -682,6 +775,7 @@ fn audio_thread(rx: Receiver<AudioCmd>, running_flag: Arc<AtomicBool>) {
             audio.pump();
             audio.stats.report();
         }
+        audio.finish_closing();
     }
     audio.close_devices();
 }
@@ -698,6 +792,9 @@ struct Control {
     sink: Option<IMMDevice>,
     /// What the audio thread was last told to capture (to log changes only).
     capturing: HashMap<u32, u32>,
+    library: Library,
+    /// Switched off: rerouted programs go back when the power-off sound ends.
+    restore_at: Option<Instant>,
 }
 
 impl Control {
@@ -724,14 +821,32 @@ impl Control {
             }
             log::info!("mixer: silent output {:?}", self.sink.as_ref().map(friendly_name));
         }
-        if !cfg.enabled {
-            if let Some(r) = &mut self.router {
-                r.clear_all();
-            }
+        self.refresh_sounds();
+        if self.cfg.enabled && !cfg.enabled {
+            let fade = self.library.sounds().get("power_off").map_or(0, |s| s.len());
+            self.restore_at = Some(Instant::now() + Duration::from_secs_f32(fade as f32 / RATE as f32));
+        } else if cfg.enabled {
+            self.restore_at = None;
         }
         self.cfg = cfg.clone();
         self.devices = devices.clone();
         let _ = self.audio.send(AudioCmd::Mixer(Cmd::Configure(cfg, devices)));
+    }
+
+    /// Hand the audio thread the sounds again if a file changed.
+    fn refresh_sounds(&mut self) {
+        if self.library.refresh() {
+            let _ = self.audio.send(AudioCmd::Sounds(self.library.sounds()));
+        }
+    }
+
+    fn restore_if_due(&mut self) {
+        if self.restore_at.is_some_and(|t| Instant::now() >= t) {
+            self.restore_at = None;
+            if let Some(r) = &mut self.router {
+                r.clear_all();
+            }
+        }
     }
 
     /// Match running programs to channels; update captures and routes.
@@ -829,10 +944,17 @@ pub fn run(rx: Receiver<Cmd>) {
         devices: MixerDevices::default(),
         sink: None,
         capturing: HashMap::new(),
+        library: Library::default(),
+        restore_at: None,
     };
+    if let Some(dir) = sfx::sound_dir() {
+        log::info!("mixer: feedback sounds from {}", dir.display());
+    }
+    control.refresh_sounds();
     let mut next_scan = Instant::now();
     loop {
-        let wait = next_scan.saturating_duration_since(Instant::now());
+        let due = control.restore_at.map_or(next_scan, |t| t.min(next_scan));
+        let wait = due.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
             Ok(Cmd::Shutdown(ack)) => {
                 control.shutdown();
@@ -847,7 +969,10 @@ pub fn run(rx: Receiver<Cmd>) {
             Ok(cmd) => {
                 let _ = control.audio.send(AudioCmd::Mixer(cmd));
             }
+            Err(RecvTimeoutError::Timeout) if Instant::now() < next_scan => control.restore_if_due(),
             Err(RecvTimeoutError::Timeout) => {
+                control.restore_if_due();
+                control.refresh_sounds();
                 let t = Instant::now();
                 control.scan();
                 if t.elapsed() > Duration::from_millis(250) {

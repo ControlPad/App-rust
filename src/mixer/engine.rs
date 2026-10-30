@@ -5,8 +5,9 @@ use std::collections::HashMap;
 
 use crate::model::{MixTarget, MixerConfig};
 
-use super::dsp::{fader_gain, soft_clip, Ramp, BLOCK_SAMPLES};
+use super::dsp::{fader_gain, soft_clip, Ramp, BLOCK_FRAMES};
 use super::fx::FxChain;
+use super::sfx::Fades;
 
 struct Strip {
     level: f32,
@@ -38,52 +39,54 @@ impl Strip {
     }
 
 
-    fn update_gains(&mut self, is_voice: bool) {
+    /// Point the ramps at the current settings, arriving within `frames`.
+    fn update_gains(&mut self, is_voice: bool, frames: u32) {
         let live = if self.muted { 0.0 } else { 1.0 };
         let level = fader_gain(self.level) * live;
-        self.monitor.set(if self.to_monitor { level } else { 0.0 });
-        self.send.set(if is_voice { level } else { self.mic_send.map_or(0.0, fader_gain) * live });
+        self.monitor.set_over(if self.to_monitor { level } else { 0.0 }, frames);
+        self.send.set_over(if is_voice { level } else { self.mic_send.map_or(0.0, fader_gain) * live }, frames);
     }
 }
 
 pub struct Engine {
     channels: HashMap<u32, Strip>,
     voice: Strip,
-    scratch: Vec<f32>,
 }
 
 impl Default for Engine {
     fn default() -> Self {
-        Self { channels: HashMap::new(), voice: Strip::new(), scratch: vec![0.0; BLOCK_SAMPLES] }
+        Self { channels: HashMap::new(), voice: Strip::new() }
     }
 }
 
 impl Engine {
     /// Adopt a (new) layout. Strips that already exist keep their ramps and
-    /// filter state, so editing one channel doesn't click the others.
-    pub fn configure(&mut self, cfg: &MixerConfig) {
+    /// filter state, so editing one channel doesn't click the others; what
+    /// was switched fades as long as `fades` says.
+    pub fn configure(&mut self, cfg: &MixerConfig, fades: &Fades) {
         self.channels.retain(|id, _| cfg.channels.iter().any(|c| c.id == *id));
         for c in &cfg.channels {
             let s = self.channels.entry(c.id).or_insert_with(Strip::new);
             s.level = c.level;
             s.muted = c.muted;
             s.mic_send = c.mic_send;
-            s.fx.update(&c.fx);
-            s.update_gains(false);
+            let strip = MixTarget::Channel(c.id);
+            s.fx.update(&c.fx, &|id| fades.slot(strip, id));
+            s.update_gains(false, fades.gain(strip));
         }
         let v = &mut self.voice;
         v.level = cfg.voice.level;
         v.muted = cfg.voice.muted;
         v.to_monitor = cfg.voice.to_monitor;
-        v.fx.update(&cfg.voice.fx);
-        v.update_gains(true);
+        v.fx.update(&cfg.voice.fx, &|id| fades.slot(MixTarget::Voice, id));
+        v.update_gains(true, fades.gain(MixTarget::Voice));
     }
 
     /// Whether a channel's programs were moved to the sink (see `Strip::to_monitor`).
     pub fn set_monitored(&mut self, channel: u32, on: bool) {
         if let Some(s) = self.channels.get_mut(&channel) {
             s.to_monitor = on;
-            s.update_gains(false);
+            s.update_gains(false, BLOCK_FRAMES as u32);
         }
     }
 
@@ -92,18 +95,18 @@ impl Engine {
         match target {
             MixTarget::Voice => {
                 self.voice.level = value;
-                self.voice.update_gains(true);
+                self.voice.update_gains(true, BLOCK_FRAMES as u32);
             }
             MixTarget::Channel(id) => {
                 if let Some(s) = self.channels.get_mut(&id) {
                     s.level = value;
-                    s.update_gains(false);
+                    s.update_gains(false, BLOCK_FRAMES as u32);
                 }
             }
             MixTarget::Send(id) => {
                 if let Some(s) = self.channels.get_mut(&id) {
                     s.mic_send = Some(value);
-                    s.update_gains(false);
+                    s.update_gains(false, BLOCK_FRAMES as u32);
                 }
             }
         }
@@ -117,16 +120,17 @@ impl Engine {
         }
     }
 
-    pub fn set_mute(&mut self, target: MixTarget, muted: bool) {
+    /// Mute or unmute, fading over `frames`.
+    pub fn set_mute(&mut self, target: MixTarget, muted: bool, frames: u32) {
         match target {
             MixTarget::Voice => {
                 self.voice.muted = muted;
-                self.voice.update_gains(true);
+                self.voice.update_gains(true, frames);
             }
             MixTarget::Channel(id) | MixTarget::Send(id) => {
                 if let Some(s) = self.channels.get_mut(&id) {
                     s.muted = muted;
-                    s.update_gains(false);
+                    s.update_gains(false, frames);
                 }
             }
         }
@@ -152,9 +156,8 @@ impl Engine {
                 }
                 None => {
                     // No input this block: still let the ramps arrive.
-                    self.scratch.fill(0.0);
-                    strip.monitor.mix_into(&self.scratch, monitor);
-                    strip.send.mix_into(&self.scratch, mic);
+                    strip.monitor.skip(BLOCK_FRAMES);
+                    strip.send.skip(BLOCK_FRAMES);
                 }
             }
         }
@@ -172,6 +175,7 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::model::{Effects, MixChannel, VoiceStrip};
+    use crate::mixer::dsp::BLOCK_SAMPLES;
 
     fn channel(id: u32, mic_send: Option<f32>) -> MixChannel {
         MixChannel {
@@ -188,7 +192,7 @@ mod tests {
 
     fn engine(channels: Vec<MixChannel>, voice: VoiceStrip) -> Engine {
         let mut e = Engine::default();
-        e.configure(&MixerConfig { enabled: true, channels, voice, eq_presets: vec![] });
+        e.configure(&MixerConfig { enabled: true, channels, voice, eq_presets: vec![] }, &Fades::default());
         e
     }
 
@@ -221,7 +225,7 @@ mod tests {
         e.set_monitored(1, true);
         e.set_level(MixTarget::Channel(1), 0.0);
         assert_eq!(run(&mut e, &[1], false), (0.0, 0.25));
-        e.set_mute(MixTarget::Send(1), true);
+        e.set_mute(MixTarget::Send(1), true, BLOCK_FRAMES as u32);
         assert_eq!(run(&mut e, &[1], false), (0.0, 0.0));
         assert_eq!(e.muted(MixTarget::Channel(1)), Some(true));
     }
@@ -233,7 +237,7 @@ mod tests {
         e.set_level(MixTarget::Voice, 0.5);
         let (_, mic) = run(&mut e, &[], true);
         assert!((mic - 0.0625).abs() < 1e-6);
-        e.set_mute(MixTarget::Voice, true);
+        e.set_mute(MixTarget::Voice, true, BLOCK_FRAMES as u32);
         assert_eq!(run(&mut e, &[], true), (0.0, 0.0));
     }
 
@@ -251,7 +255,7 @@ mod tests {
             channels: vec![channel(2, Some(1.0))],
             voice: VoiceStrip::default(),
             eq_presets: vec![],
-        });
+        }, &Fades::default());
         assert_eq!(e.muted(MixTarget::Channel(1)), None);
         assert_eq!(run(&mut e, &[1, 2], false), (0.0, 0.25));
     }

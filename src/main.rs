@@ -28,6 +28,7 @@ mod mixer_ui;
 mod model;
 mod protocol;
 mod serial;
+mod sidebar;
 mod storage;
 mod update;
 mod version;
@@ -165,6 +166,7 @@ fn main() -> anyhow::Result<()> {
     let ui = AppWindow::new()?;
     glue::wire(&ui, shared.clone(), rx, BUILD_STAMP);
     mixer_ui::wire(&ui, shared.clone());
+    sidebar::wire(&ui, shared.clone());
 
     if demo {
         use slint::{ModelRc, SharedString, VecModel};

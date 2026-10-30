@@ -77,6 +77,27 @@ pub fn push(ui: &AppWindow, s: &mut Shared) {
         }
     }
     let mut cables = cables(&all_mics, &outputs);
+    // Sensible defaults the first time: the only cable is the Slidr Mic, and
+    // Steam's streaming speakers (installed with Steam, silent unless
+    // streaming) are the silent output.
+    let mut picked = false;
+    {
+        let d = &mut s.settings.mixer_devices;
+        if d.mic_out.is_none() && cables.len() == 1 {
+            d.mic_out = Some(cables[0].1.clone());
+            picked = true;
+        }
+        if d.sink.is_none() {
+            if let Some(steam) = outputs.iter().find(|o| o.to_lowercase().contains("steam streaming speakers")) {
+                d.sink = Some(steam.clone());
+                picked = true;
+            }
+        }
+    }
+    if picked {
+        commit(s);
+    }
+    let d = &s.settings.mixer_devices;
     if let Some(out) = &d.mic_out {
         if !cables.iter().any(|(_, o)| o == out) {
             cables.push((out.clone(), out.clone()));
@@ -115,15 +136,16 @@ pub fn push(ui: &AppWindow, s: &mut Shared) {
     ui.set_mixer_voice_muted(m.voice.muted);
     ui.set_mixer_voice_monitor(m.voice.to_monitor);
     ui.set_mixer_voice_fx_count(m.voice.fx.active() as i32);
+    ui.set_mixer_voice_fx_on(m.voice.fx.on);
     push_channels(ui, m);
 
     let no_cable = cables.is_empty();
     ui.set_mixer_hint_download(no_cable);
     ui.set_mixer_hint(
         if no_cable {
-            "No virtual cable found. Slidr needs one for the Slidr Mic: install VB-CABLE (free), then pick \"CABLE Output\" here and in Discord."
+            "No virtual cable found. Slidr needs one for the Slidr Mic: install VB-CABLE (free), then choose \"CABLE Output\" as the microphone in your voice chat app."
         } else if m.enabled && d.mic_out.is_none() {
-            "Choose the Slidr Mic below so Discord can hear your voice through Slidr."
+            "Choose the Slidr Mic under Advanced so other apps can hear your voice through Slidr."
         } else {
             ""
         }
@@ -148,6 +170,7 @@ fn push_channels(ui: &AppWindow, m: &MixerConfig) {
             level: c.level * 100.0,
             muted: c.muted,
             fx_count: c.fx.active() as i32,
+            fx_on: c.fx.on,
             reroute: c.reroute,
             send_on: c.mic_send.is_some(),
             send: c.mic_send.unwrap_or(1.0) * 100.0,
@@ -461,6 +484,7 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
             m.voice.level = (ui.get_mixer_voice_level() / 100.0).clamp(0.0, 1.0);
             m.voice.muted = ui.get_mixer_voice_muted();
             m.voice.to_monitor = ui.get_mixer_voice_monitor();
+            m.voice.fx.on = ui.get_mixer_voice_fx_on();
             commit(&mut s);
             // Lists depend on each other (the silent output excludes the
             // Slidr Mic's cable) and the hint on the switch.
@@ -469,31 +493,21 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         });
     }
     {
-        let weak = ui.as_weak();
         let shared = shared.clone();
         ui.on_mixer_channel_set(move |id, field, num, text| {
             let mut s = shared.lock();
             let Some(c) = s.preset.mixer.channels.iter_mut().find(|c| c.id as i32 == id) else { return };
-            let mut repush = false;
             match field.as_str() {
                 "name" => c.name = text.to_string(),
                 "level" => c.level = (num / 100.0).clamp(0.0, 1.0),
                 "muted" => c.muted = num > 0.5,
                 "reroute" => c.reroute = num > 0.5,
-                "send-on" => {
-                    c.mic_send = (num > 0.5).then_some(1.0);
-                    // Shows or hides the send fader.
-                    repush = true;
-                }
+                "fx-on" => c.fx.on = num > 0.5,
+                "send-on" => c.mic_send = (num > 0.5).then_some(c.mic_send.unwrap_or(1.0)),
                 "send" => c.mic_send = Some((num / 100.0).clamp(0.0, 1.0)),
                 other => log::warn!("mixer page: unknown channel field {other:?}"),
             }
             commit(&mut s);
-            if repush {
-                if let Some(ui) = weak.upgrade() {
-                    push_channels(&ui, &s.preset.mixer);
-                }
-            }
         });
     }
     {

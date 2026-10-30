@@ -19,43 +19,77 @@ pub fn fader_gain(level: f32) -> f32 {
     l * l
 }
 
-/// A gain that moves to its target over one block instead of jumping, so
-/// fader moves don't click.
+/// A value moving linearly to a target over a number of frames. Setting the
+/// target it already heads for changes nothing, so an unrelated update can't
+/// cut a running fade short.
 #[derive(Debug, Clone, Copy)]
-pub struct Ramp {
+pub struct Fade {
     current: f32,
     target: f32,
+    step: f32,
+    left: u32,
 }
+
+impl Fade {
+    pub fn new(v: f32) -> Self {
+        Self { current: v, target: v, step: 0.0, left: 0 }
+    }
+
+    pub fn set_over(&mut self, target: f32, frames: u32) {
+        if target == self.target {
+            return;
+        }
+        self.target = target;
+        self.left = frames.max(1);
+        self.step = (target - self.current) / self.left as f32;
+    }
+
+    /// This frame's value, then advance.
+    pub fn next(&mut self) -> f32 {
+        let v = self.current;
+        if self.left > 0 {
+            self.left -= 1;
+            self.current = if self.left == 0 { self.target } else { self.current + self.step };
+        }
+        v
+    }
+
+    /// Resting at `v` (no fade running).
+    pub fn is_at(&self, v: f32) -> bool {
+        self.left == 0 && self.current == v
+    }
+}
+
+/// A gain applied while mixing: moves to a new value over a block (so fader
+/// moves don't click) or longer for a switch (see `sfx`).
+#[derive(Debug, Clone, Copy)]
+pub struct Ramp(Fade);
 
 impl Ramp {
     pub fn new(gain: f32) -> Self {
-        Self { current: gain, target: gain }
+        Self(Fade::new(gain))
     }
 
-    pub fn set(&mut self, gain: f32) {
-        self.target = gain;
-    }
-
-    /// Next block's per-frame gains: `f(frame) = current + step * frame`.
-    /// Returns (start, step) and advances to the target.
-    fn advance(&mut self, frames: usize) -> (f32, f32) {
-        let start = self.current;
-        let step = (self.target - start) / frames.max(1) as f32;
-        self.current = self.target;
-        (start, step)
+    pub fn set_over(&mut self, gain: f32, frames: u32) {
+        self.0.set_over(gain, frames);
     }
 
     /// `out += input * gain`, ramping the gain across the block.
     pub fn mix_into(&mut self, input: &[f32], out: &mut [f32]) {
-        let frames = input.len() / 2;
-        let (start, step) = self.advance(frames);
-        if start == 0.0 && step == 0.0 {
+        if self.0.is_at(0.0) {
             return;
         }
-        for (f, (i, o)) in input.chunks_exact(2).zip(out.chunks_exact_mut(2)).enumerate() {
-            let g = start + step * f as f32;
+        for (i, o) in input.chunks_exact(2).zip(out.chunks_exact_mut(2)) {
+            let g = self.0.next();
             o[0] += i[0] * g;
             o[1] += i[1] * g;
+        }
+    }
+
+    /// Advance as if a block had been mixed (no input this block).
+    pub fn skip(&mut self, frames: usize) {
+        for _ in 0..frames {
+            self.0.next();
         }
     }
 }
@@ -266,7 +300,7 @@ mod tests {
     #[test]
     fn ramp_reaches_target_without_jumping() {
         let mut r = Ramp::new(0.0);
-        r.set(1.0);
+        r.set_over(1.0, BLOCK_FRAMES as u32);
         let input = vec![1.0; BLOCK_SAMPLES];
         let mut out = vec![0.0; BLOCK_SAMPLES];
         r.mix_into(&input, &mut out);
@@ -275,6 +309,22 @@ mod tests {
         let mut out2 = vec![0.0; BLOCK_SAMPLES];
         r.mix_into(&input, &mut out2);
         assert!(out2.iter().all(|&s| (s - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn long_fade_spans_blocks_and_isnt_cut_short() {
+        let mut f = Fade::new(1.0);
+        f.set_over(0.0, 1000);
+        for _ in 0..500 {
+            f.next();
+        }
+        f.set_over(0.0, 10); // same target again: keeps going at the old pace
+        let v = f.next();
+        assert!((v - 0.5).abs() < 0.01, "{v}");
+        for _ in 0..499 {
+            f.next();
+        }
+        assert!(f.is_at(0.0));
     }
 
     #[test]

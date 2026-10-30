@@ -9,6 +9,7 @@
 pub mod dsp;
 mod engine;
 mod fx;
+mod sfx;
 mod ring;
 #[cfg(target_os = "windows")]
 mod route;
@@ -38,6 +39,8 @@ pub enum Cmd {
     SetLevel(MixTarget, f32),
     SetMute(MixTarget, bool),
     ToggleMute(MixTarget),
+    /// Switch sounds on/off, and their volume (0..1).
+    SoundPrefs(bool, f32),
     /// Restore rerouted programs and stop; acknowledged on the sender.
     Shutdown(Sender<()>),
 }
@@ -91,6 +94,14 @@ pub fn set_mute(target: MixTarget, muted: bool) {
 
 pub fn toggle_mute(target: MixTarget) {
     send(Cmd::ToggleMute(target));
+}
+
+/// Switch sounds on/off and their volume. Only reaches a mixer that is
+/// already running (one that isn't has nothing to click).
+pub fn sound_prefs(on: bool, volume: f32) {
+    if let Some(Some(tx)) = TX.get() {
+        let _ = tx.send(Cmd::SoundPrefs(on, volume));
+    }
 }
 
 /// Hand rerouted programs back to their normal output before the app exits.

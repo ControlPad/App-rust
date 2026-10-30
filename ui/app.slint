@@ -26,6 +26,8 @@ export struct ButtonCell { pressed: bool, category: string, assigned: bool }
 export struct LineItem { id: int, primary: string, secondary: string, icon-kind: int }
 export struct CategorySummary { id: int, name: string, count: int, collapsed: bool, lines: [LineItem] }
 export struct AssignPick { id: int, name: string }
+// A sidebar tab in Settings: `page` is its page index, `fixed` = can't be hidden.
+export struct NavRow { page: int, label: string, visible: bool, fixed: bool }
 // A row in the wizard's picker. `name` is what the user reads; `value` is what
 // gets stored (a process name, an executable path, or an "@group:<id>" reference
 // for a curated program category — `is-group` marks the latter).
@@ -110,10 +112,12 @@ component Select {
     in property <[string]> model;
     in-out property <int> current-index: 0;
     in property <length> field-width: 260px;
+    in property <bool> enabled: true;
     callback selected(int);
 
     min-width: root.field-width; max-width: root.field-width;
     min-height: 36px; max-height: 36px;
+    opacity: root.enabled ? 1.0 : 0.55;
 
     Rectangle {
         background: Palette.alternate-background;
@@ -138,7 +142,8 @@ component Select {
         }
     }
     ta := TouchArea {
-        mouse-cursor: pointer;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
         clicked => { popup.show(); }
     }
     popup := PopupWindow {
@@ -579,6 +584,21 @@ component SquareIconButton {
         Icon { x: parent.width / 2 - self.width / 2; y: parent.height / 2 - self.height / 2;
             source: root.icon; size: 16px; tint: root.tint; }
     }
+}
+
+// Small text button for moving something up / down a list.
+component MoveButton {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+    min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px;
+    opacity: root.enabled ? 1.0 : 0.25;
+    Rectangle { border-radius: 6px;
+        background: (ta.has-hover && root.enabled) ? Palette.alternate-background.darker(0.06) : transparent; }
+    ta := TouchArea { enabled: root.enabled; mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); } }
+    Text { text: root.text; font-size: 15px; font-family: "Inter";
+        horizontal-alignment: center; vertical-alignment: center; }
 }
 
 // Row used in settings: label on the far left, control on the far right.
@@ -1084,6 +1104,11 @@ component SettingsPage inherits VerticalBox {
     // "", "checking", "up-to-date", "available", "failed"
     in property <string> update-state;
     in property <string> update-latest;
+    in property <[NavRow]> nav-rows;
+    in-out property <bool> sounds-on;
+    in-out property <float> sound-volume;
+    callback nav-move(int, int);
+    callback nav-visible(int, bool);
 
     callback theme-changed(int);
     callback check-for-updates();
@@ -1152,6 +1177,52 @@ component SettingsPage inherits VerticalBox {
                                                  root.dirty(); }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
+                    Text { text: "Sidebar"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
+                    Text { text: "Order and visibility of the tabs on the left. Settings always stays.";
+                        font-family: "Inter"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
+                    Rectangle { height: 6px; }
+                    for r[i] in root.nav-rows: HorizontalLayout {
+                        spacing: 8px; height: 36px;
+                        Text { text: r.label; horizontal-stretch: 1; vertical-alignment: center;
+                            font-family: "Inter"; font-size: 13px; font-weight: 500;
+                            color: r.visible ? Palette.foreground : Palette.foreground.with-alpha(0.45); }
+                        VerticalLayout { alignment: center;
+                            MoveButton { text: "↑"; enabled: i > 0; clicked => { root.nav-move(r.page, -1); } } }
+                        VerticalLayout { alignment: center;
+                            MoveButton { text: "↓"; enabled: i < root.nav-rows.length - 1;
+                                clicked => { root.nav-move(r.page, 1); } } }
+                        VerticalLayout { alignment: center;
+                            Toggle { checked: r.visible; enabled: !r.fixed;
+                                toggled => { root.nav-visible(r.page, self.checked); } } }
+                    }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
+                    Text { text: "Mixer sounds"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
+                    Rectangle { height: 6px; }
+                    SettingRow {
+                        label: "Switch sounds";
+                        description: "Short sounds on your output when you mute, switch an effect or turn the mixer on or off. Never sent to the Slidr Mic.";
+                        Toggle { checked <=> root.sounds-on; toggled => { root.dirty(); } }
+                    }
+                    SettingRow {
+                        label: "Volume";
+                        HorizontalLayout {
+                            width: root.control-w; spacing: 10px;
+                            AccentSlider { minimum: 0; maximum: 100; value: root.sound-volume;
+                                changed(v) => { root.sound-volume = v; root.dirty(); }
+                                horizontal-stretch: 1; }
+                            Text { text: Math.round(root.sound-volume) + " %"; min-width: 40px;
+                                horizontal-alignment: right; font-family: "Inter"; vertical-alignment: center; }
                         }
                     }
                 }
@@ -2303,10 +2374,10 @@ component LedConfigPopup inherits Rectangle {
 // ──────────────────────────────────────────────────────────────────────────
 
 // One mixer channel as the Mixer page shows it. `level` / `send` are percent;
-// `fx-count` is how many effects of its chain are on.
+// `fx-count` is how many effects of its chain are on; `fx-on` is the chain's master switch.
 export struct MixChannelUI {
     id: int, name: string, programs: string, level: float, muted: bool,
-    fx-count: int, reroute: bool, send-on: bool, send: float,
+    fx-count: int, fx-on: bool, reroute: bool, send-on: bool, send: float,
 }
 
 // Fader + percent readout, the row control of the mixer.
@@ -2320,6 +2391,18 @@ component LevelRow inherits HorizontalLayout {
     Text { text: Math.round(root.value) + " %"; min-width: 42px;
         horizontal-alignment: right; vertical-alignment: center;
         font-family: "Inter"; font-size: 12px; }
+}
+
+// Caption over a switch, the switch at its natural width.
+component LabeledToggle inherits VerticalLayout {
+    in property <string> label;
+    in-out property <bool> checked;
+    callback toggled(bool);
+    spacing: 4px;
+    Text { text: root.label; font-family: "Inter"; font-size: 11px;
+        color: Palette.foreground.with-alpha(0.6); }
+    HorizontalLayout { alignment: start;
+        Toggle { checked <=> root.checked; toggled => { root.toggled(self.checked); } } }
 }
 
 // Small caption + control, stacked.
@@ -2338,6 +2421,7 @@ component MixerPage inherits VerticalBox {
     in-out property <bool> voice-muted;
     in-out property <bool> voice-monitor;
     in property <int> voice-fx-count;
+    in-out property <bool> voice-fx-on;
     in property <[string]> monitor-names;
     in property <[string]> mic-names;
     in property <[string]> spare-names;
@@ -2362,6 +2446,7 @@ component MixerPage inherits VerticalBox {
 
     spacing: 14px;
     property <length> control-w: 260px;
+    property <bool> show-advanced: false;
 
     HorizontalBox {
         Text { text: "Mixer"; font-size: 26px; font-weight: 700; font-family: "Inter";
@@ -2394,7 +2479,7 @@ component MixerPage inherits VerticalBox {
                     Text { text: "Devices"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
                     Rectangle { height: 6px; }
                     SettingRow {
-                        label: "Headphones";
+                        label: "Output";
                         description: "Where you hear the mix";
                         Select { field-width: root.control-w; model: root.monitor-names;
                             current-index <=> root.monitor-idx;
@@ -2407,14 +2492,30 @@ component MixerPage inherits VerticalBox {
                             current-index <=> root.mic-idx;
                             selected => { root.changed(); } }
                     }
-                    SettingRow {
+                    adv-ta := TouchArea {
+                        height: 30px; mouse-cursor: pointer;
+                        clicked => { root.show-advanced = !root.show-advanced; }
+                        HorizontalLayout { spacing: 6px; alignment: start;
+                            Image { source: root.show-advanced ? @image-url("../assets/icons/chevron-down.svg")
+                                                              : @image-url("../assets/icons/chevron-right.svg");
+                                colorize: Palette.foreground.with-alpha(0.7); width: 16px; height: 16px;
+                                y: (parent.height - self.height) / 2; }
+                            Text { text: "Advanced"; font-family: "Inter"; font-size: 12px; font-weight: 600;
+                                vertical-alignment: center;
+                                color: adv-ta.has-hover ? Palette.foreground : Palette.foreground.with-alpha(0.7); }
+                        }
+                    }
+                    if root.show-advanced: SettingRow {
                         label: "Slidr Mic";
-                        description: "Virtual cable Slidr sends your voice and mix into. Pick the same one as the microphone in Discord.";
+                        description: root.cable-names.length > 2
+                            ? "Virtual cable your voice and mix go into. Choose it as the microphone in your voice chat app."
+                            : "Your virtual cable. Choose it as the microphone in your voice chat app.";
                         Select { field-width: root.control-w; model: root.cable-names;
+                            enabled: root.cable-names.length > 2;
                             current-index <=> root.cable-idx;
                             selected => { root.changed(); } }
                     }
-                    SettingRow {
+                    if root.show-advanced: SettingRow {
                         label: "Silent output";
                         description: "An output nobody listens to. Channel programs are moved there so you only hear Slidr's mix.";
                         Select { field-width: root.control-w; model: root.spare-names;
@@ -2437,15 +2538,17 @@ component MixerPage inherits VerticalBox {
                     }
                     HorizontalLayout { spacing: 24px; alignment: start;
                         Labeled { label: "Effects & EQ";
-                            IconButton { label: root.voice-fx-count > 0 ? "Edit (" + root.voice-fx-count + " on)" : "Edit";
-                                clicked => { root.edit-fx("voice"); } }
+                            HorizontalLayout { spacing: 8px;
+                                VerticalLayout { alignment: center;
+                                    Toggle { checked <=> root.voice-fx-on; toggled => { root.changed(); } } }
+                                IconButton { label: root.voice-fx-count > 0 ? "Edit (" + root.voice-fx-count + " on)" : "Edit";
+                                    clicked => { root.edit-fx("voice"); } }
+                            }
                         }
-                        Labeled { label: "Muted";
-                            Toggle { checked <=> root.voice-muted; toggled => { root.changed(); } }
-                        }
-                        Labeled { label: "Hear yourself";
-                            Toggle { checked <=> root.voice-monitor; toggled => { root.changed(); } }
-                        }
+                        LabeledToggle { label: "Muted"; checked <=> root.voice-muted;
+                            toggled => { root.changed(); } }
+                        LabeledToggle { label: "Hear yourself"; checked <=> root.voice-monitor;
+                            toggled => { root.changed(); } }
                     }
                 }
             }
@@ -2474,23 +2577,23 @@ component MixerPage inherits VerticalBox {
                     }
                     HorizontalLayout { spacing: 24px; alignment: start;
                         Labeled { label: "Effects & EQ";
-                            IconButton { label: ch.fx-count > 0 ? "Edit (" + ch.fx-count + " on)" : "Edit";
-                                clicked => { root.edit-fx("channel:" + ch.id); } }
+                            HorizontalLayout { spacing: 8px;
+                                VerticalLayout { alignment: center;
+                                    Toggle { checked: ch.fx-on;
+                                        toggled => { root.channel-set(ch.id, "fx-on", self.checked ? 1 : 0, ""); } } }
+                                IconButton { label: ch.fx-count > 0 ? "Edit (" + ch.fx-count + " on)" : "Edit";
+                                    clicked => { root.edit-fx("channel:" + ch.id); } }
+                            }
                         }
-                        Labeled { label: "Muted";
-                            Toggle { checked: ch.muted;
-                                toggled => { root.channel-set(ch.id, "muted", self.checked ? 1 : 0, ""); } }
-                        }
-                        Labeled { label: "Replace original";
-                            Toggle { checked: ch.reroute;
-                                toggled => { root.channel-set(ch.id, "reroute", self.checked ? 1 : 0, ""); } }
-                        }
-                        Labeled { label: "Into Slidr Mic";
-                            Toggle { checked: ch.send-on;
-                                toggled => { root.channel-set(ch.id, "send-on", self.checked ? 1 : 0, ""); } }
-                        }
+                        LabeledToggle { label: "Muted"; checked: ch.muted;
+                            toggled(on) => { root.channel-set(ch.id, "muted", on ? 1 : 0, ""); } }
+                        LabeledToggle { label: "Replace original"; checked: ch.reroute;
+                            toggled(on) => { root.channel-set(ch.id, "reroute", on ? 1 : 0, ""); } }
+                        send := LabeledToggle { label: "Into Slidr Mic"; checked: ch.send-on;
+                            toggled(on) => { root.channel-set(ch.id, "send-on", on ? 1 : 0, ""); } }
                     }
-                    if ch.send-on: Labeled { label: "Level in the Slidr Mic";
+                    // Follows the switch itself, so flipping it doesn't rebuild the card.
+                    if send.checked: Labeled { label: "Level in the Slidr Mic";
                         LevelRow { value: ch.send;
                             changed(v) => { root.channel-set(ch.id, "send", v, ""); } }
                     }
@@ -2728,21 +2831,6 @@ component ParamRow inherits HorizontalLayout {
         font-family: "Inter"; font-size: 12px; }
 }
 
-// Small text button for moving a slot up / down.
-component MoveButton {
-    in property <string> text;
-    in property <bool> enabled: true;
-    callback clicked();
-    min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px;
-    opacity: root.enabled ? 1.0 : 0.25;
-    Rectangle { border-radius: 6px;
-        background: (ta.has-hover && root.enabled) ? Palette.alternate-background.darker(0.06) : transparent; }
-    ta := TouchArea { enabled: root.enabled; mouse-cursor: root.enabled ? pointer : default;
-        clicked => { root.clicked(); } }
-    Text { text: root.text; font-size: 15px; font-family: "Inter";
-        horizontal-alignment: center; vertical-alignment: center; }
-}
-
 // A strip's effect chain: effects run top to bottom; add from a list, stack,
 // reorder, switch off, or load / save a whole chain as a preset.
 component FxRackPopup inherits Rectangle {
@@ -2913,6 +3001,12 @@ export component AppWindow inherits Window {
 
     in-out property <int> current-page: 0;
     in-out property <bool> edit-mode: false;
+    in property <[int]> nav-pages: [0, 1, 2, 4, 3];
+    in property <[NavRow]> nav-rows;
+    callback nav-move(int, int);
+    callback nav-visible(int, bool);
+    in-out property <bool> sounds-on: true;
+    in-out property <float> sound-volume: 80;
 
     // ── Mixer page ──
     in-out property <bool> mixer-enabled;
@@ -2921,6 +3015,7 @@ export component AppWindow inherits Window {
     in-out property <bool> mixer-voice-muted;
     in-out property <bool> mixer-voice-monitor;
     in property <int> mixer-voice-fx-count;
+    in-out property <bool> mixer-voice-fx-on;
     in-out property <bool> mixer-fx-open: false;
     in property <string> mixer-fx-title;
     in property <[FxSlotUI]> mixer-fx-slots;
@@ -3170,26 +3265,23 @@ export component AppWindow inherits Window {
                     }
                 }
                 Rectangle { height: 8px; }
-                NavItem { label: "Home"; compact: root.sidebar-collapsed;
-                    icon: @image-url("../assets/icons/home.svg");
-                    active: root.current-page == 0;
-                    clicked => { root.current-page = 0; root.page-changed(0); } }
-                NavItem { label: "Sliders"; compact: root.sidebar-collapsed;
-                    icon: @image-url("../assets/icons/adjustments-horizontal.svg");
-                    active: root.current-page == 1;
-                    clicked => { root.current-page = 1; root.edit-mode = false; root.page-changed(1); } }
-                NavItem { label: "Buttons"; compact: root.sidebar-collapsed;
-                    icon: @image-url("../assets/icons/grid-dots.svg");
-                    active: root.current-page == 2;
-                    clicked => { root.current-page = 2; root.edit-mode = false; root.page-changed(2); } }
-                NavItem { label: "Mixer"; compact: root.sidebar-collapsed;
-                    icon: @image-url("../assets/icons/volume.svg");
-                    active: root.current-page == 4;
-                    clicked => { root.current-page = 4; root.edit-mode = false; root.page-changed(4); } }
-                NavItem { label: "Settings"; compact: root.sidebar-collapsed;
-                    icon: @image-url("../assets/icons/settings.svg");
-                    active: root.current-page == 3;
-                    clicked => { root.current-page = 3; root.edit-mode = false; root.page-changed(3); } }
+                // Order and visibility come from Settings (see src/sidebar.rs).
+                for pg in root.nav-pages: NavItem {
+                    compact: root.sidebar-collapsed;
+                    label: pg == 0 ? "Home" : pg == 1 ? "Sliders" : pg == 2 ? "Buttons"
+                         : pg == 4 ? "Mixer" : "Settings";
+                    icon: pg == 0 ? @image-url("../assets/icons/home.svg")
+                        : pg == 1 ? @image-url("../assets/icons/adjustments-horizontal.svg")
+                        : pg == 2 ? @image-url("../assets/icons/grid-dots.svg")
+                        : pg == 4 ? @image-url("../assets/icons/volume.svg")
+                        : @image-url("../assets/icons/settings.svg");
+                    active: root.current-page == pg;
+                    clicked => {
+                        root.current-page = pg;
+                        if (pg != 0) { root.edit-mode = false; }
+                        root.page-changed(pg);
+                    }
+                }
 
                 Rectangle { vertical-stretch: 1; }
 
@@ -3349,6 +3441,7 @@ export component AppWindow inherits Window {
                     voice-muted <=> root.mixer-voice-muted;
                     voice-monitor <=> root.mixer-voice-monitor;
                     voice-fx-count: root.mixer-voice-fx-count;
+                    voice-fx-on <=> root.mixer-voice-fx-on;
                     edit-fx(t) => { root.mixer-edit-fx(t); }
                     monitor-names: root.mixer-monitor-names;
                     mic-names: root.mixer-mic-names;
@@ -3394,6 +3487,11 @@ export component AppWindow inherits Window {
                     update-check <=> root.update-check;
                     update-state: root.update-state;
                     update-latest: root.update-latest;
+                    nav-rows: root.nav-rows;
+                    nav-move(p, d) => { root.nav-move(p, d); }
+                    nav-visible(p, v) => { root.nav-visible(p, v); }
+                    sounds-on <=> root.sounds-on;
+                    sound-volume <=> root.sound-volume;
                     check-for-updates => { root.check-for-updates(); }
                     open-releases => { root.open-releases(); }
                     theme-changed(i) => { root.theme-changed(i); }

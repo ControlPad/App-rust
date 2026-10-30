@@ -4,7 +4,7 @@
 
 use crate::model::{Compressor, Effects, EqBand, Fx, Gate, Limiter, Normalizer};
 
-use super::dsp::{Eq, RATE};
+use super::dsp::{Eq, Fade, RATE};
 
 fn db_to_lin(db: f32) -> f32 {
     10f32.powf(db / 20.0)
@@ -202,30 +202,57 @@ impl Proc {
     }
 }
 
+struct Slot {
+    id: u32,
+    proc: Proc,
+    /// 0 = bypassed, 1 = fully applied; fades when the slot is switched.
+    wet: Fade,
+}
+
 /// One strip's effects, in chain order. Each slot keeps its running state
-/// (envelopes, gains) across edits and reorders, so nothing clicks.
+/// (envelopes, gains) across edits and reorders, so nothing clicks; switching
+/// one crossfades between the dry and the processed signal.
 #[derive(Default)]
 pub struct FxChain {
-    /// (slot id, effect) for the slots that are on.
-    procs: Vec<(u32, Proc)>,
+    slots: Vec<Slot>,
+    dry: Vec<f32>,
 }
 
 impl FxChain {
-    pub fn update(&mut self, fx: &Effects) {
-        let mut old: Vec<(u32, Proc)> = std::mem::take(&mut self.procs);
-        for slot in fx.chain.iter().filter(|s| s.on) {
-            let reused = old
+    /// Adopt `fx`. A slot that changes between on and off fades over
+    /// `fade(slot id)` frames.
+    pub fn update(&mut self, fx: &Effects, fade: &dyn Fn(u32) -> u32) {
+        let mut old = std::mem::take(&mut self.slots);
+        for s in &fx.chain {
+            let on = if s.on && fx.on { 1.0 } else { 0.0 };
+            let kept = old
                 .iter()
-                .position(|(id, _)| *id == slot.id)
-                .map(|i| old.swap_remove(i).1)
-                .and_then(|mut p| p.retune(&slot.fx).then_some(p));
-            self.procs.push((slot.id, reused.unwrap_or_else(|| Proc::new(&slot.fx))));
+                .position(|o| o.id == s.id)
+                .map(|i| old.swap_remove(i))
+                .and_then(|mut o| o.proc.retune(&s.fx).then_some(o));
+            let mut slot = kept.unwrap_or_else(|| Slot { id: s.id, proc: Proc::new(&s.fx), wet: Fade::new(0.0) });
+            slot.wet.set_over(on, fade(s.id));
+            self.slots.push(slot);
         }
     }
 
     pub fn process(&mut self, buf: &mut [f32]) {
-        for (_, p) in &mut self.procs {
-            p.process(buf);
+        for slot in &mut self.slots {
+            if slot.wet.is_at(0.0) {
+                continue;
+            }
+            if slot.wet.is_at(1.0) {
+                slot.proc.process(buf);
+                continue;
+            }
+            self.dry.clear();
+            self.dry.extend_from_slice(buf);
+            slot.proc.process(buf);
+            for (out, dry) in buf.chunks_exact_mut(2).zip(self.dry.chunks_exact(2)) {
+                let w = slot.wet.next();
+                out[0] = dry[0] + (out[0] - dry[0]) * w;
+                out[1] = dry[1] + (out[1] - dry[1]) * w;
+            }
         }
     }
 }
@@ -253,12 +280,18 @@ mod tests {
     }
 
     fn effects(fx: Vec<Fx>) -> Effects {
-        Effects { chain: fx.into_iter().enumerate().map(|(i, fx)| FxSlot { id: i as u32 + 1, on: true, fx }).collect() }
+        Effects {
+            on: true,
+            chain: fx.into_iter().enumerate().map(|(i, fx)| FxSlot { id: i as u32 + 1, on: true, fx }).collect(),
+        }
     }
+
+    /// Switches settle within a block; "instant" for the sake of the tests.
+    const QUICK: &dyn Fn(u32) -> u32 = &|_| 1;
 
     fn chain(fx: Vec<Fx>) -> FxChain {
         let mut c = FxChain::default();
-        c.update(&effects(fx));
+        c.update(&effects(fx), QUICK);
         c
     }
 
@@ -319,11 +352,13 @@ mod tests {
     #[test]
     fn empty_or_switched_off_chain_is_transparent() {
         let input = sine(0.4, 0.1);
-        let mut fx = effects(vec![Fx::Limiter(Limiter { ceiling_db: -20.0 })]);
-        fx.chain[0].on = false;
-        for e in [Effects::default(), fx] {
+        let mut slot_off = effects(vec![Fx::Limiter(Limiter { ceiling_db: -20.0 })]);
+        slot_off.chain[0].on = false;
+        let mut master_off = effects(vec![Fx::Limiter(Limiter { ceiling_db: -20.0 })]);
+        master_off.on = false;
+        for e in [Effects::default(), slot_off, master_off] {
             let mut c = FxChain::default();
-            c.update(&e);
+            c.update(&e, QUICK);
             let mut out = input.clone();
             c.process(&mut out);
             assert_eq!(input, out);
@@ -335,14 +370,31 @@ mod tests {
         let comp = Compressor::default();
         let mut fx = effects(vec![Fx::Limiter(Limiter::default()), Fx::Compressor(comp)]);
         let mut c = FxChain::default();
-        c.update(&fx);
+        c.update(&fx, QUICK);
         run(&mut c, 0.9, 0.5);
-        let env = |c: &FxChain| c.procs.iter().find_map(|(_, p)| match p { Proc::Comp(x) => Some(x.env_db), _ => None });
+        let env = |c: &FxChain| c.slots.iter().find_map(|s| match &s.proc { Proc::Comp(x) => Some(x.env_db), _ => None });
         let before = env(&c);
         fx.chain.swap(0, 1);
         fx.chain[0].fx = Fx::Compressor(Compressor { ratio: 6.0, ..comp });
-        c.update(&fx);
+        c.update(&fx, QUICK);
         assert_eq!(env(&c), before, "a knob turn or move keeps the envelope");
-        assert!(matches!(c.procs[0].1, Proc::Comp(_)), "new order applies");
+        assert!(matches!(c.slots[0].proc, Proc::Comp(_)), "new order applies");
+    }
+
+    #[test]
+    fn switching_an_effect_crossfades_over_the_given_length() {
+        let mut fx = effects(vec![Fx::Limiter(Limiter { ceiling_db: -20.0 })]);
+        let mut c = FxChain::default();
+        c.update(&fx, QUICK);
+        run(&mut c, 0.5, 0.2);
+        fx.chain[0].on = false;
+        c.update(&fx, &|_| 4800); // 100 ms
+        let mut b = sine(0.5, 0.2);
+        c.process(&mut b);
+        // Halfway through the fade the level sits between limited and dry.
+        let mid = peak_db(&b[4000..5600]);
+        assert!(mid > -19.0 && mid < -6.5, "{mid}");
+        // After it, dry.
+        assert!((peak_db(&b[12000..]) - lin_to_db(0.5)).abs() < 0.1);
     }
 }

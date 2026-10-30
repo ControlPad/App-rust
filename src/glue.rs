@@ -133,6 +133,7 @@ impl Shared {
     /// Call wherever `push_leds` is called (profile load/switch, settings).
     pub fn push_mixer(&self) {
         crate::mixer::configure(self.preset.mixer.clone(), self.settings.mixer_devices.clone());
+        crate::mixer::sound_prefs(self.settings.mixer_sounds, self.settings.mixer_sound_volume);
     }
 }
 
@@ -1508,6 +1509,8 @@ fn push_settings_to_ui(ui: &AppWindow, global: &Settings, profile: &crate::model
     ui.set_minimize_to_tray(global.minimize_to_tray);
     ui.set_led_experimental(global.led_experimental);
     ui.set_update_check(global.update_check);
+    ui.set_sounds_on(global.mixer_sounds);
+    ui.set_sound_volume(global.mixer_sound_volume * 100.0);
     ui.set_discord_client_id(global.discord_client_id.clone().into());
     ui.set_discord_client_secret(global.discord_client_secret.clone().into());
     ui.set_discord_status(discord_hint(global).into());
@@ -1542,6 +1545,8 @@ fn pull_global_from_ui(ui: &AppWindow, g: &mut Settings) {
     g.update_check = ui.get_update_check();
     g.discord_client_id = ui.get_discord_client_id().to_string();
     g.discord_client_secret = ui.get_discord_client_secret().to_string();
+    g.mixer_sounds = ui.get_sounds_on();
+    g.mixer_sound_volume = (ui.get_sound_volume() / 100.0).clamp(0.0, 1.0);
 }
 
 fn pull_profile_from_ui(ui: &AppWindow, p: &mut crate::model::ProfileSettings) {

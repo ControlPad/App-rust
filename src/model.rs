@@ -523,6 +523,24 @@ pub struct Settings {
     /// Effect chains saved by the user, offered on every profile's strips.
     #[serde(default)]
     pub fx_presets: Vec<FxPreset>,
+
+    /// Short sounds when mixer things are switched (see `mixer::sfx`).
+    #[serde(default = "default_true")]
+    pub mixer_sounds: bool,
+    /// Their volume, 0..1.
+    #[serde(default = "default_sound_volume")]
+    pub mixer_sound_volume: f32,
+
+    /// Sidebar tabs in display order, by name (see `crate::sidebar`).
+    #[serde(default)]
+    pub nav_order: Vec<String>,
+    /// Tabs hidden from the sidebar. Settings can't be hidden.
+    #[serde(default)]
+    pub nav_hidden: Vec<String>,
+}
+
+fn default_sound_volume() -> f32 {
+    0.8
 }
 
 impl Default for Settings {
@@ -539,6 +557,10 @@ impl Default for Settings {
             active_preset: "Default".into(),
             mixer_devices: MixerDevices::default(),
             fx_presets: Vec::new(),
+            mixer_sounds: true,
+            mixer_sound_volume: default_sound_volume(),
+            nav_order: Vec::new(),
+            nav_hidden: Vec::new(),
         }
     }
 }
@@ -706,7 +728,7 @@ mod tests {
 
     #[test]
     fn chain_round_trips() {
-        let fx = Effects { chain: FxPreset::built_in().remove(1).chain };
+        let fx = Effects { on: false, chain: FxPreset::built_in().remove(1).chain };
         let json = serde_json::to_string(&fx).unwrap();
         assert!(json.contains("\"type\":\"compressor\""), "{json}");
         assert_eq!(serde_json::from_str::<Effects>(&json).unwrap(), fx);
@@ -866,11 +888,20 @@ impl Default for VoiceStrip {
 
 /// A strip's effect chain, processed top to bottom. The same effect may
 /// appear more than once (two compressors, an EQ on each side of one).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(from = "EffectsFile")]
 pub struct Effects {
+    /// Master switch: off bypasses the whole chain, keeping every setting.
+    #[serde(default = "default_true")]
+    pub on: bool,
     #[serde(default)]
     pub chain: Vec<FxSlot>,
+}
+
+impl Default for Effects {
+    fn default() -> Self {
+        Self { on: true, chain: Vec::new() }
+    }
 }
 
 impl Effects {
@@ -995,6 +1026,8 @@ impl Default for Limiter {
 /// chains existed — one fixed slot per effect, which is turned into a chain.
 #[derive(Deserialize)]
 struct EffectsFile {
+    #[serde(default = "default_true")]
+    on: bool,
     #[serde(default)]
     chain: Option<Vec<FxSlot>>,
     #[serde(default)]
@@ -1022,7 +1055,7 @@ struct OldSlot<T> {
 impl From<EffectsFile> for Effects {
     fn from(f: EffectsFile) -> Self {
         if let Some(chain) = f.chain {
-            return Self { chain };
+            return Self { on: f.on, chain };
         }
         // Old fixed order: gate → EQ → compressor → normalizer → limiter.
         // Only what was in use carries over.
@@ -1043,7 +1076,7 @@ impl From<EffectsFile> for Effects {
         if let Some(l) = f.limit.filter(|l| l.on) {
             push(true, Fx::Limiter(l.params));
         }
-        Self { chain }
+        Self { on: true, chain }
     }
 }
 
@@ -1086,6 +1119,30 @@ impl FxPreset {
                 Fx::Limiter(Limiter { ceiling_db: -3.0 }),
             ]),
             preset("Bass boost", vec![Fx::Eq { bands: vec![b(LowShelf, 120.0, 6.0, q)] }, Fx::Limiter(Limiter { ceiling_db: -1.0 })]),
+            // Dialogue forward, impact kept: lifts the speech range, then a
+            // gentle, slow compressor brings quiet lines up against loud scenes
+            // without pumping the score.
+            preset("Movies & series", vec![
+                Fx::Eq { bands: vec![
+                    b(LowShelf, 80.0, 3.0, q),
+                    b(Peak, 300.0, -1.5, 0.8),
+                    b(Peak, 2500.0, 3.5, 1.0),
+                    b(HighShelf, 10000.0, 1.5, q),
+                ] },
+                Fx::Compressor(Compressor { threshold_db: -28.0, ratio: 2.5, attack_ms: 15.0, release_ms: 300.0, makeup_db: 4.0 }),
+                Fx::Limiter(Limiter { ceiling_db: -1.0 }),
+            ]),
+            // An approximation of the consumer JBL voicing (not an official
+            // profile): warm, forward bass, slightly recessed mids, crisp top.
+            preset("JBL-style", vec![
+                Fx::Eq { bands: vec![
+                    b(LowShelf, 105.0, 6.0, q),
+                    b(Peak, 60.0, 1.5, 1.2),
+                    b(Peak, 1500.0, -1.5, 0.9),
+                    b(HighShelf, 8000.0, 3.0, q),
+                ] },
+                Fx::Limiter(Limiter { ceiling_db: -1.0 }),
+            ]),
         ]
     }
 }

@@ -131,6 +131,16 @@ impl Biquad {
         Self { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0, z: [[0.0; 2]; 2] }
     }
 
+    /// Gain in dB this section applies at `freq`.
+    pub fn response_db(&self, freq: f32) -> f32 {
+        let w = 2.0 * std::f32::consts::PI * freq / RATE as f32;
+        let (s1, c1) = w.sin_cos();
+        let (s2, c2) = (2.0 * w).sin_cos();
+        let num = (self.b0 + self.b1 * c1 + self.b2 * c2).powi(2) + (self.b1 * s1 + self.b2 * s2).powi(2);
+        let den = (1.0 + self.a1 * c1 + self.a2 * c2).powi(2) + (self.a1 * s1 + self.a2 * s2).powi(2);
+        10.0 * (num / den).log10()
+    }
+
     /// Filter an interleaved stereo block in place.
     pub fn process(&mut self, buf: &mut [f32]) {
         for frame in buf.chunks_exact_mut(2) {
@@ -160,6 +170,11 @@ impl Eq {
         for f in &mut self.filters {
             f.process(buf);
         }
+    }
+
+    /// Combined gain in dB at `freq` (what the editor draws).
+    pub fn response_db(&self, freq: f32) -> f32 {
+        self.filters.iter().map(|f| f.response_db(freq)).sum()
     }
 }
 
@@ -212,6 +227,15 @@ mod tests {
         assert!((eq_gain_db(&b, 1000.0) - 6.0).abs() < 0.3);
         assert!(eq_gain_db(&b, 50.0).abs() < 0.3);
         assert!(eq_gain_db(&b, 15000.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn drawn_response_matches_what_the_filter_does() {
+        let b = [EqBand { q: 1.0, ..band(EqBandKind::Peak, 1000.0, 6.0) }, band(EqBandKind::HighPass, 100.0, 0.0)];
+        let eq = Eq::new(&b);
+        for f in [40.0, 300.0, 1000.0, 5000.0] {
+            assert!((eq.response_db(f) - eq_gain_db(&b, f)).abs() < 0.3, "{f} Hz");
+        }
     }
 
     #[test]

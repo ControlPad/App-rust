@@ -2303,10 +2303,10 @@ component LedConfigPopup inherits Rectangle {
 // ──────────────────────────────────────────────────────────────────────────
 
 // One mixer channel as the Mixer page shows it. `level` / `send` are percent;
-// `eq` indexes `eq-names` (0 = off).
+// `eq-on` is the strip's EQ switch; its bands live in the EQ editor.
 export struct MixChannelUI {
     id: int, name: string, programs: string, level: float, muted: bool,
-    eq: int, reroute: bool, send-on: bool, send: float,
+    eq-on: bool, reroute: bool, send-on: bool, send: float,
 }
 
 // Fader + percent readout, the row control of the mixer.
@@ -2337,8 +2337,7 @@ component MixerPage inherits VerticalBox {
     in-out property <float> voice-level;
     in-out property <bool> voice-muted;
     in-out property <bool> voice-monitor;
-    in-out property <int> voice-eq;
-    in property <[string]> eq-names;
+    in-out property <bool> voice-eq-on;
     in property <[string]> monitor-names;
     in property <[string]> mic-names;
     in property <[string]> spare-names;
@@ -2358,6 +2357,8 @@ component MixerPage inherits VerticalBox {
     callback add-channel();
     callback delete-channel(int);
     callback choose-programs(int);
+    // Open the EQ editor for "voice" or "channel:<id>".
+    callback edit-eq(string);
 
     spacing: 14px;
     property <length> control-w: 260px;
@@ -2436,9 +2437,11 @@ component MixerPage inherits VerticalBox {
                     }
                     HorizontalLayout { spacing: 24px; alignment: start;
                         Labeled { label: "EQ";
-                            Select { field-width: 200px; model: root.eq-names;
-                                current-index <=> root.voice-eq;
-                                selected => { root.changed(); } }
+                            HorizontalLayout { spacing: 8px;
+                                VerticalLayout { alignment: center;
+                                    Toggle { checked <=> root.voice-eq-on; toggled => { root.changed(); } } }
+                                IconButton { label: "Edit"; clicked => { root.edit-eq("voice"); } }
+                            }
                         }
                         Labeled { label: "Muted";
                             Toggle { checked <=> root.voice-muted; toggled => { root.changed(); } }
@@ -2474,9 +2477,12 @@ component MixerPage inherits VerticalBox {
                     }
                     HorizontalLayout { spacing: 24px; alignment: start;
                         Labeled { label: "EQ";
-                            Select { field-width: 200px; model: root.eq-names;
-                                current-index: ch.eq;
-                                selected(i) => { root.channel-set(ch.id, "eq", i, ""); } }
+                            HorizontalLayout { spacing: 8px;
+                                VerticalLayout { alignment: center;
+                                    Toggle { checked: ch.eq-on;
+                                        toggled => { root.channel-set(ch.id, "eq-on", self.checked ? 1 : 0, ""); } } }
+                                IconButton { label: "Edit"; clicked => { root.edit-eq("channel:" + ch.id); } }
+                            }
                         }
                         Labeled { label: "Muted";
                             Toggle { checked: ch.muted;
@@ -2564,6 +2570,142 @@ component ProgramPickerPopup inherits Rectangle {
     }
 }
 
+// One EQ band as the editor shows it. `freq-pos` / `q-pos` are 0..1 on a log
+// scale, `gain` is dB; `x` / `y` place the band's handle on the curve (0..1).
+export struct EqBandUI {
+    kind: int, freq-pos: float, gain: float, q-pos: float,
+    freq-text: string, gain-text: string, q-text: string,
+    x: float, y: float,
+}
+
+// Parametric EQ for one mixer strip: the response curve with draggable band
+// handles, and one row of controls per band.
+component EqEditorPopup inherits Rectangle {
+    in property <string> title;
+    in-out property <bool> on;
+    in property <[EqBandUI]> bands;
+    // SVG path of the response, in a 1000 × 300 box (±15 dB).
+    in property <string> curve;
+    in property <[string]> preset-names;
+    callback toggled(bool);
+    callback set(int, string, float);
+    callback drag(int, float, float);
+    callback drag-end();
+    callback add();
+    callback delete(int);
+    callback load-preset(int);
+    callback close();
+
+    background: #00000099;
+    TouchArea { clicked => { root.close(); } }
+
+    Rectangle {
+        x: parent.width / 2 - self.width / 2;
+        y: parent.height / 2 - self.height / 2;
+        width: min(parent.width - 48px, 820px); height: min(parent.height - 48px, 660px);
+        background: Palette.background;
+        border-radius: 14px; border-width: 1px; border-color: Palette.border;
+        TouchArea {}
+        VerticalBox {
+            padding: 22px; spacing: 12px;
+            HorizontalLayout { spacing: 10px;
+                Text { text: root.title; font-size: 20px; font-weight: 700; font-family: "Inter";
+                    vertical-alignment: center; horizontal-stretch: 1; }
+                Text { text: root.on ? "On" : "Off"; font-family: "Inter"; vertical-alignment: center;
+                    color: Palette.foreground.with-alpha(0.7); }
+                Toggle { checked <=> root.on; toggled => { root.toggled(self.checked); } }
+            }
+
+            graph := Rectangle {
+                height: 220px;
+                background: Palette.alternate-background;
+                border-radius: 10px; border-width: 1px; border-color: Palette.border;
+                clip: true;
+                opacity: root.on ? 1.0 : 0.5;
+                for db in [12, 6, 0, -6, -12]: Rectangle {
+                    x: 0; width: parent.width; height: 1px;
+                    y: (15 - db) / 30 * parent.height;
+                    background: db == 0 ? Palette.foreground.with-alpha(0.35) : Palette.border;
+                }
+                for m in [{ p: 0.233, t: "100 Hz" }, { p: 0.566, t: "1 kHz" }, { p: 0.9, t: "10 kHz" }]: Rectangle {
+                    x: m.p * parent.width; y: 0; width: 1px; height: parent.height;
+                    background: Palette.border;
+                    Text { x: 4px; y: parent.height - 18px; text: m.t; font-size: 10px;
+                        font-family: "Inter"; color: Palette.foreground.with-alpha(0.5); }
+                }
+                Path {
+                    x: 0; y: 0; width: parent.width; height: parent.height;
+                    viewbox-width: 1000; viewbox-height: 300;
+                    commands: root.curve;
+                    stroke: Theme.accent-bg; stroke-width: 2px;
+                }
+                for b[i] in root.bands: dot := Rectangle {
+                    x: b.x * graph.width - 9px; y: b.y * graph.height - 9px;
+                    width: 18px; height: 18px; border-radius: 9px;
+                    background: Theme.accent-bg; border-width: 2px; border-color: white;
+                    Text { text: i + 1; color: white; font-size: 10px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        mouse-cursor: move;
+                        moved => {
+                            if (self.pressed) {
+                                root.drag(i, (dot.x + self.mouse-x) / graph.width, (dot.y + self.mouse-y) / graph.height);
+                            }
+                        }
+                        pointer-event(e) => {
+                            if (e.kind == PointerEventKind.up) { root.drag-end(); }
+                        }
+                    }
+                }
+            }
+
+            ScrollView {
+                mouse-drag-pan-enabled: false;
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 8px; alignment: start;
+                    width: parent.width - 18px;
+                    if root.bands.length == 0: Text { text: "No bands yet — add one or load a preset.";
+                        font-family: "Inter"; color: Palette.foreground.with-alpha(0.6); }
+                    for b[i] in root.bands: Card {
+                        HorizontalBox { padding: 10px; spacing: 14px;
+                            Text { text: i + 1; min-width: 14px; font-weight: 700; font-family: "Inter";
+                                vertical-alignment: center; }
+                            VerticalLayout { alignment: center;
+                                Select { field-width: 130px;
+                                    model: ["Peak", "Low shelf", "High shelf", "High pass", "Low pass"];
+                                    current-index: b.kind;
+                                    selected(k) => { root.set(i, "kind", k); } }
+                            }
+                            Labeled { label: "Frequency  " + b.freq-text; horizontal-stretch: 1;
+                                AccentSlider { minimum: 0; maximum: 1; value: b.freq-pos;
+                                    changed(v) => { root.set(i, "freq", v); } } }
+                            Labeled { label: "Gain  " + b.gain-text; horizontal-stretch: 1;
+                                AccentSlider { minimum: -15; maximum: 15; value: b.gain;
+                                    changed(v) => { root.set(i, "gain", v); } } }
+                            Labeled { label: "Q  " + b.q-text; horizontal-stretch: 1;
+                                AccentSlider { minimum: 0; maximum: 1; value: b.q-pos;
+                                    changed(v) => { root.set(i, "q", v); } } }
+                            VerticalLayout { alignment: center;
+                                SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
+                                    clicked => { root.delete(i); } } }
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout { spacing: 10px;
+                IconButton { icon: @image-url("../assets/icons/plus.svg"); label: "Add band";
+                    clicked => { root.add(); } }
+                Select { field-width: 200px; model: root.preset-names; current-index: 0;
+                    selected(i) => { if (i > 0) { root.load-preset(i - 1); } self.current-index = 0; } }
+                Rectangle { horizontal-stretch: 1; }
+                IconButton { label: "Done"; primary: true; clicked => { root.close(); } }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Slidr";
     icon: @image-url("../assets/logo-128.png");
@@ -2629,8 +2771,22 @@ export component AppWindow inherits Window {
     in-out property <float> mixer-voice-level;
     in-out property <bool> mixer-voice-muted;
     in-out property <bool> mixer-voice-monitor;
-    in-out property <int> mixer-voice-eq;
-    in property <[string]> mixer-eq-names;
+    in-out property <bool> mixer-voice-eq-on;
+    in-out property <bool> mixer-eq-open: false;
+    in property <string> mixer-eq-title;
+    in-out property <bool> mixer-eq-on;
+    in property <[EqBandUI]> mixer-eq-bands;
+    in property <string> mixer-eq-curve;
+    in property <[string]> mixer-eq-preset-names;
+    callback mixer-edit-eq(string);
+    callback mixer-eq-toggled(bool);
+    callback mixer-eq-set(int, string, float);
+    callback mixer-eq-drag(int, float, float);
+    callback mixer-eq-drag-end();
+    callback mixer-eq-add();
+    callback mixer-eq-delete(int);
+    callback mixer-eq-load-preset(int);
+    callback mixer-eq-closed();
     in property <[string]> mixer-monitor-names;
     in property <[string]> mixer-mic-names;
     in property <[string]> mixer-spare-names;
@@ -3028,8 +3184,8 @@ export component AppWindow inherits Window {
                     voice-level <=> root.mixer-voice-level;
                     voice-muted <=> root.mixer-voice-muted;
                     voice-monitor <=> root.mixer-voice-monitor;
-                    voice-eq <=> root.mixer-voice-eq;
-                    eq-names: root.mixer-eq-names;
+                    voice-eq-on <=> root.mixer-voice-eq-on;
+                    edit-eq(t) => { root.mixer-edit-eq(t); }
                     monitor-names: root.mixer-monitor-names;
                     mic-names: root.mixer-mic-names;
                     spare-names: root.mixer-spare-names;
@@ -3245,6 +3401,21 @@ export component AppWindow inherits Window {
         }
     }
 
+    if root.mixer-eq-open: EqEditorPopup {
+        title: root.mixer-eq-title;
+        on <=> root.mixer-eq-on;
+        bands: root.mixer-eq-bands;
+        curve: root.mixer-eq-curve;
+        preset-names: root.mixer-eq-preset-names;
+        toggled(v) => { root.mixer-eq-toggled(v); }
+        set(i, f, v) => { root.mixer-eq-set(i, f, v); }
+        drag(i, x, y) => { root.mixer-eq-drag(i, x, y); }
+        drag-end => { root.mixer-eq-drag-end(); }
+        add => { root.mixer-eq-add(); }
+        delete(i) => { root.mixer-eq-delete(i); }
+        load-preset(i) => { root.mixer-eq-load-preset(i); }
+        close => { root.mixer-eq-open = false; root.mixer-eq-closed(); }
+    }
     if root.mixer-picker-open: ProgramPickerPopup {
         title: root.mixer-picker-title;
         options: root.mixer-picker-options;

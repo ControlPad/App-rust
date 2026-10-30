@@ -752,8 +752,7 @@ impl MixerConfig {
         }
     }
 
-    /// Starting EQ presets, so the EQ selector isn't empty before a preset
-    /// editor exists.
+    /// Built-in EQ starting points, offered by the EQ editor.
     pub fn default_eq_presets() -> Vec<EqPreset> {
         use EqBandKind::*;
         let b = |kind, freq, gain_db, q| EqBand { kind, freq, gain_db, q };
@@ -808,11 +807,8 @@ pub struct MixChannel {
     pub level: f32,
     #[serde(default)]
     pub muted: bool,
-    /// `EqPreset::id` applied while `eq_enabled`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eq: Option<u32>,
     #[serde(default)]
-    pub eq_enabled: bool,
+    pub fx: Effects,
     /// Move the programs to the sink so only Slidr's mix is heard. Off = the
     /// program keeps playing normally and is only copied into the Slidr Mic.
     #[serde(default = "default_true")]
@@ -829,10 +825,8 @@ pub struct VoiceStrip {
     pub level: f32,
     #[serde(default)]
     pub muted: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eq: Option<u32>,
     #[serde(default)]
-    pub eq_enabled: bool,
+    pub fx: Effects,
     /// Also play the voice on the monitor (hear yourself).
     #[serde(default)]
     pub to_monitor: bool,
@@ -840,10 +834,22 @@ pub struct VoiceStrip {
 
 impl Default for VoiceStrip {
     fn default() -> Self {
-        Self { level: default_level(), muted: false, eq: None, eq_enabled: false, to_monitor: false }
+        Self { level: default_level(), muted: false, fx: Effects::default(), to_monitor: false }
     }
 }
 
+/// Processing on one strip, in signal order. Grows with the planned
+/// compressor, normalizer and gate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Effects {
+    #[serde(default)]
+    pub eq_on: bool,
+    /// The strip's own bands; presets only fill them.
+    #[serde(default)]
+    pub eq: Vec<EqBand>,
+}
+
+/// A starting point for a strip's EQ.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EqPreset {
     pub id: u32,

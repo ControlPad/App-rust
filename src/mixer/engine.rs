@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::model::{EqBand, MixTarget, MixerConfig};
+use crate::model::{Effects, EqBand, MixTarget, MixerConfig};
 
 use super::dsp::{fader_gain, soft_clip, Eq, Ramp, BLOCK_SAMPLES};
 
@@ -70,24 +70,21 @@ impl Engine {
     /// Adopt a (new) layout. Strips that already exist keep their ramps and
     /// filter state, so editing one channel doesn't click the others.
     pub fn configure(&mut self, cfg: &MixerConfig) {
-        let bands_of = |id: Option<u32>, on: bool| -> Option<Vec<EqBand>> {
-            let id = id.filter(|_| on)?;
-            cfg.eq_presets.iter().find(|p| p.id == id).map(|p| p.bands.clone())
-        };
+        let bands_of = |fx: &Effects| fx.eq_on.then(|| fx.eq.clone());
         self.channels.retain(|id, _| cfg.channels.iter().any(|c| c.id == *id));
         for c in &cfg.channels {
             let s = self.channels.entry(c.id).or_insert_with(Strip::new);
             s.level = c.level;
             s.muted = c.muted;
             s.mic_send = c.mic_send;
-            s.set_bands(bands_of(c.eq, c.eq_enabled));
+            s.set_bands(bands_of(&c.fx));
             s.update_gains(false);
         }
         let v = &mut self.voice;
         v.level = cfg.voice.level;
         v.muted = cfg.voice.muted;
         v.to_monitor = cfg.voice.to_monitor;
-        v.set_bands(bands_of(cfg.voice.eq, cfg.voice.eq_enabled));
+        v.set_bands(bands_of(&cfg.voice.fx));
         v.update_gains(true);
     }
 
@@ -192,8 +189,7 @@ mod tests {
             programs: vec![],
             level: 1.0,
             muted: false,
-            eq: None,
-            eq_enabled: false,
+            fx: Effects::default(),
             reroute: true,
             mic_send,
         }

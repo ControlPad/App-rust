@@ -486,11 +486,11 @@ impl Audio {
 
     fn configure(&mut self, cfg: MixerConfig, devices: MixerDevices) {
         let reopen = devices != self.devices || cfg.enabled != self.cfg.enabled;
-        if cfg != self.cfg {
-            // Board moves were relative to the old layout.
-            self.live_levels.clear();
-            self.live_mutes.clear();
-        }
+        // A board move stays until the page changes that same level (the
+        // page then shows the truth); editing anything else keeps it.
+        let old = &self.cfg;
+        self.live_levels.retain(|t, _| level_of(old, *t) == level_of(&cfg, *t));
+        self.live_mutes.retain(|t, _| muted_of(old, *t) == muted_of(&cfg, *t));
         self.engine.configure(&cfg);
         for (t, v) in &self.live_levels {
             self.engine.set_level(*t, *v);
@@ -621,6 +621,21 @@ impl Audio {
         self.close_devices();
         self.open_devices();
         self.running_flag.store(self.running(), Ordering::Relaxed);
+    }
+}
+
+fn level_of(cfg: &MixerConfig, t: MixTarget) -> Option<f32> {
+    match t {
+        MixTarget::Voice => Some(cfg.voice.level),
+        MixTarget::Channel(id) => cfg.channels.iter().find(|c| c.id == id).map(|c| c.level),
+        MixTarget::Send(id) => cfg.channels.iter().find(|c| c.id == id).and_then(|c| c.mic_send),
+    }
+}
+
+fn muted_of(cfg: &MixerConfig, t: MixTarget) -> Option<bool> {
+    match t {
+        MixTarget::Voice => Some(cfg.voice.muted),
+        MixTarget::Channel(id) | MixTarget::Send(id) => cfg.channels.iter().find(|c| c.id == id).map(|c| c.muted),
     }
 }
 

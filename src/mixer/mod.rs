@@ -8,6 +8,7 @@
 
 pub mod dsp;
 mod engine;
+mod fx;
 mod ring;
 #[cfg(target_os = "windows")]
 mod route;

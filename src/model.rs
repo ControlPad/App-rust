@@ -838,8 +838,8 @@ impl Default for VoiceStrip {
     }
 }
 
-/// Processing on one strip, in signal order. Grows with the planned
-/// compressor, normalizer and gate.
+/// Processing on one strip, in signal order: gate → EQ → compressor →
+/// normalizer → limiter.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Effects {
     #[serde(default)]
@@ -847,6 +847,83 @@ pub struct Effects {
     /// The strip's own bands; presets only fill them.
     #[serde(default)]
     pub eq: Vec<EqBand>,
+    #[serde(default)]
+    pub gate: Gate,
+    #[serde(default)]
+    pub comp: Compressor,
+    #[serde(default)]
+    pub norm: Normalizer,
+    #[serde(default)]
+    pub limit: Limiter,
+}
+
+impl Effects {
+    /// How many dynamics effects are on (the strip's "Effects" button shows
+    /// it; the EQ has its own switch).
+    pub fn dynamics_on(&self) -> usize {
+        [self.gate.on, self.comp.on, self.norm.on, self.limit.on].iter().filter(|on| **on).count()
+    }
+}
+
+/// Mutes the strip while it stays below `threshold_db` (room noise between words).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Gate {
+    pub on: bool,
+    pub threshold_db: f32,
+    pub release_ms: f32,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self { on: false, threshold_db: -45.0, release_ms: 150.0 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Compressor {
+    pub on: bool,
+    pub threshold_db: f32,
+    pub ratio: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub makeup_db: f32,
+}
+
+impl Default for Compressor {
+    fn default() -> Self {
+        Self { on: false, threshold_db: -20.0, ratio: 3.0, attack_ms: 10.0, release_ms: 150.0, makeup_db: 0.0 }
+    }
+}
+
+/// Slowly steers the average loudness to `target_db` (RMS), by at most `max_gain_db`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Normalizer {
+    pub on: bool,
+    pub target_db: f32,
+    pub max_gain_db: f32,
+}
+
+impl Default for Normalizer {
+    fn default() -> Self {
+        Self { on: false, target_db: -18.0, max_gain_db: 12.0 }
+    }
+}
+
+/// Keeps peaks under `ceiling_db`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Limiter {
+    pub on: bool,
+    pub ceiling_db: f32,
+}
+
+impl Default for Limiter {
+    fn default() -> Self {
+        Self { on: false, ceiling_db: -1.0 }
+    }
 }
 
 /// A starting point for a strip's EQ.

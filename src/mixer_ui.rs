@@ -9,7 +9,7 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::glue::Shared;
 use crate::model::{Effects, EqBand, EqBandKind, MixChannel, MixTarget, MixerConfig};
-use crate::{AppWindow, EqBandUI, MixChannelUI, PickerEntry};
+use crate::{AppWindow, EqBandUI, FxUI, MixChannelUI, PickerEntry};
 
 /// Device names behind the page's selectors, as last shown — an index from
 /// the UI is resolved against exactly the list it was picked from.
@@ -30,6 +30,9 @@ static LISTS: Mutex<Lists> =
 
 /// Where VB-CABLE comes from; opened by the hint's download button.
 const CABLE_DOWNLOAD: &str = "https://vb-audio.com/Cable/";
+
+/// Strip whose effects the effects popup is editing.
+static EDITING_FX: Mutex<Option<MixTarget>> = Mutex::new(None);
 
 /// Strip whose EQ the editor popup is editing.
 static EDITING_EQ: Mutex<Option<MixTarget>> = Mutex::new(None);
@@ -112,6 +115,7 @@ pub fn push(ui: &AppWindow, s: &mut Shared) {
     ui.set_mixer_voice_muted(m.voice.muted);
     ui.set_mixer_voice_monitor(m.voice.to_monitor);
     ui.set_mixer_voice_eq_on(m.voice.fx.eq_on);
+    ui.set_mixer_voice_fx_count(m.voice.fx.dynamics_on() as i32);
     push_channels(ui, m);
 
     let no_cable = cables.is_empty();
@@ -145,12 +149,56 @@ fn push_channels(ui: &AppWindow, m: &MixerConfig) {
             level: c.level * 100.0,
             muted: c.muted,
             eq_on: c.fx.eq_on,
+            fx_count: c.fx.dynamics_on() as i32,
             reroute: c.reroute,
             send_on: c.mic_send.is_some(),
             send: c.mic_send.unwrap_or(1.0) * 100.0,
         })
         .collect();
     ui.set_mixer_channels(ModelRc::new(VecModel::from(rows)));
+}
+
+// ── Effects editor ──────────────────────────────────────────────────────────
+
+fn fx_ui(fx: &Effects) -> FxUI {
+    FxUI {
+        gate_on: fx.gate.on,
+        gate_threshold: fx.gate.threshold_db,
+        gate_release: fx.gate.release_ms,
+        comp_on: fx.comp.on,
+        comp_threshold: fx.comp.threshold_db,
+        comp_ratio: fx.comp.ratio,
+        comp_attack: fx.comp.attack_ms,
+        comp_release: fx.comp.release_ms,
+        comp_makeup: fx.comp.makeup_db,
+        norm_on: fx.norm.on,
+        norm_target: fx.norm.target_db,
+        norm_max: fx.norm.max_gain_db,
+        lim_on: fx.limit.on,
+        lim_ceiling: fx.limit.ceiling_db,
+    }
+}
+
+/// Apply one field from the effects popup (`on` switches arrive as 0 / 1).
+fn set_fx(fx: &mut Effects, field: &str, v: f32) {
+    let on = v > 0.5;
+    match field {
+        "gate-on" => fx.gate.on = on,
+        "gate-threshold" => fx.gate.threshold_db = v,
+        "gate-release" => fx.gate.release_ms = v,
+        "comp-on" => fx.comp.on = on,
+        "comp-threshold" => fx.comp.threshold_db = v,
+        "comp-ratio" => fx.comp.ratio = v.max(1.0),
+        "comp-attack" => fx.comp.attack_ms = v,
+        "comp-release" => fx.comp.release_ms = v,
+        "comp-makeup" => fx.comp.makeup_db = v,
+        "norm-on" => fx.norm.on = on,
+        "norm-target" => fx.norm.target_db = v,
+        "norm-max" => fx.norm.max_gain_db = v,
+        "lim-on" => fx.limit.on = on,
+        "lim-ceiling" => fx.limit.ceiling_db = v.min(0.0),
+        other => log::warn!("effects editor: unknown field {other:?}"),
+    }
 }
 
 // ── EQ editor ──────────────────────────────────────────────────────────────
@@ -455,6 +503,44 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         });
     }
     ui.on_mixer_picker_closed(|| *PICKING.lock() = None);
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_mixer_edit_fx(move |which| {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(target) = MixTarget::from_value(&which) else { return };
+            let mut s = shared.lock();
+            let title = format!("Effects – {}", s.preset.mixer.label(target));
+            let Some(fx) = effects_mut(&mut s.preset.mixer, target) else { return };
+            *EDITING_FX.lock() = Some(target);
+            ui.set_mixer_fx_title(title.into());
+            ui.set_mixer_fx(fx_ui(fx));
+            ui.set_mixer_fx_open(true);
+        });
+    }
+    {
+        let shared = shared.clone();
+        ui.on_mixer_fx_set(move |field, v| {
+            let Some(target) = *EDITING_FX.lock() else { return };
+            let mut s = shared.lock();
+            let Some(fx) = effects_mut(&mut s.preset.mixer, target) else { return };
+            set_fx(fx, &field, v);
+            commit(&mut s);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_mixer_fx_closed(move || {
+            *EDITING_FX.lock() = None;
+            // The strip buttons show how many effects are on.
+            if let Some(ui) = weak.upgrade() {
+                let s = shared.lock();
+                ui.set_mixer_voice_fx_count(s.preset.mixer.voice.fx.dynamics_on() as i32);
+                push_channels(&ui, &s.preset.mixer);
+            }
+        });
+    }
     {
         let weak = ui.as_weak();
         let shared = shared.clone();

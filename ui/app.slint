@@ -2306,7 +2306,7 @@ component LedConfigPopup inherits Rectangle {
 // `eq-on` is the strip's EQ switch; its bands live in the EQ editor.
 export struct MixChannelUI {
     id: int, name: string, programs: string, level: float, muted: bool,
-    eq-on: bool, reroute: bool, send-on: bool, send: float,
+    eq-on: bool, fx-count: int, reroute: bool, send-on: bool, send: float,
 }
 
 // Fader + percent readout, the row control of the mixer.
@@ -2338,6 +2338,7 @@ component MixerPage inherits VerticalBox {
     in-out property <bool> voice-muted;
     in-out property <bool> voice-monitor;
     in-out property <bool> voice-eq-on;
+    in property <int> voice-fx-count;
     in property <[string]> monitor-names;
     in property <[string]> mic-names;
     in property <[string]> spare-names;
@@ -2359,6 +2360,8 @@ component MixerPage inherits VerticalBox {
     callback choose-programs(int);
     // Open the EQ editor for "voice" or "channel:<id>".
     callback edit-eq(string);
+    // Open the effects editor for "voice" or "channel:<id>".
+    callback edit-fx(string);
 
     spacing: 14px;
     property <length> control-w: 260px;
@@ -2443,6 +2446,10 @@ component MixerPage inherits VerticalBox {
                                 IconButton { label: "Edit"; clicked => { root.edit-eq("voice"); } }
                             }
                         }
+                        Labeled { label: "Effects";
+                            IconButton { label: root.voice-fx-count > 0 ? "Edit (" + root.voice-fx-count + " on)" : "Edit";
+                                clicked => { root.edit-fx("voice"); } }
+                        }
                         Labeled { label: "Muted";
                             Toggle { checked <=> root.voice-muted; toggled => { root.changed(); } }
                         }
@@ -2483,6 +2490,10 @@ component MixerPage inherits VerticalBox {
                                         toggled => { root.channel-set(ch.id, "eq-on", self.checked ? 1 : 0, ""); } } }
                                 IconButton { label: "Edit"; clicked => { root.edit-eq("channel:" + ch.id); } }
                             }
+                        }
+                        Labeled { label: "Effects";
+                            IconButton { label: ch.fx-count > 0 ? "Edit (" + ch.fx-count + " on)" : "Edit";
+                                clicked => { root.edit-fx("channel:" + ch.id); } }
                         }
                         Labeled { label: "Muted";
                             Toggle { checked: ch.muted;
@@ -2706,6 +2717,137 @@ component EqEditorPopup inherits Rectangle {
     }
 }
 
+// Dynamics settings of one mixer strip (the EQ has its own editor).
+export struct FxUI {
+    gate-on: bool, gate-threshold: float, gate-release: float,
+    comp-on: bool, comp-threshold: float, comp-ratio: float,
+    comp-attack: float, comp-release: float, comp-makeup: float,
+    norm-on: bool, norm-target: float, norm-max: float,
+    lim-on: bool, lim-ceiling: float,
+}
+
+// Label · slider · value with unit.
+component ParamRow inherits HorizontalLayout {
+    in property <string> label;
+    in-out property <float> value;
+    in property <float> minimum;
+    in property <float> maximum;
+    in property <string> unit;
+    in property <bool> fine: false;   // one decimal instead of none
+    callback changed(float);
+    spacing: 12px;
+    Text { text: root.label; min-width: 90px; vertical-alignment: center;
+        font-family: "Inter"; font-size: 12px; }
+    AccentSlider { minimum: root.minimum; maximum: root.maximum; value: root.value;
+        horizontal-stretch: 1;
+        changed(v) => { root.value = v; root.changed(v); } }
+    Text { text: (root.fine ? Math.round(root.value * 10) / 10 : Math.round(root.value)) + " " + root.unit;
+        min-width: 70px; horizontal-alignment: right; vertical-alignment: center;
+        font-family: "Inter"; font-size: 12px; }
+}
+
+// A titled card with an on/off switch; its rows go below.
+component FxSection inherits Card {
+    in property <string> title;
+    in property <string> description;
+    in-out property <bool> on;
+    callback toggled(bool);
+    VerticalBox { padding: 14px; spacing: 8px;
+        HorizontalLayout { spacing: 10px;
+            VerticalLayout { horizontal-stretch: 1; spacing: 2px;
+                Text { text: root.title; font-weight: 700; font-family: "Inter"; font-size: 14px; }
+                Text { text: root.description; wrap: word-wrap; font-family: "Inter"; font-size: 11px;
+                    color: Palette.foreground.with-alpha(0.55); }
+            }
+            VerticalLayout { alignment: center;
+                Toggle { checked <=> root.on; toggled => { root.toggled(self.checked); } } }
+        }
+        VerticalLayout { spacing: 6px; opacity: root.on ? 1.0 : 0.45;
+            @children
+        }
+    }
+}
+
+component FxEditorPopup inherits Rectangle {
+    in property <string> title;
+    in property <FxUI> fx;
+    callback set(string, float);
+    callback close();
+
+    background: #00000099;
+    TouchArea { clicked => { root.close(); } }
+
+    Rectangle {
+        x: parent.width / 2 - self.width / 2;
+        y: parent.height / 2 - self.height / 2;
+        width: min(parent.width - 48px, 720px); height: min(parent.height - 48px, 700px);
+        background: Palette.background;
+        border-radius: 14px; border-width: 1px; border-color: Palette.border;
+        TouchArea {}
+        VerticalBox {
+            padding: 22px; spacing: 12px;
+            Text { text: root.title; font-size: 20px; font-weight: 700; font-family: "Inter"; }
+            Text { text: "Order: noise gate → EQ → compressor → normalizer → limiter. The EQ has its own editor.";
+                font-family: "Inter"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
+            ScrollView {
+                mouse-drag-pan-enabled: false;
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 10px; alignment: start;
+                    width: parent.width - 18px;
+                    FxSection {
+                        title: "Noise gate";
+                        description: "Silences the strip while it stays below the threshold — room noise between words.";
+                        on: root.fx.gate-on;
+                        toggled(v) => { root.set("gate-on", v ? 1 : 0); }
+                        ParamRow { label: "Threshold"; minimum: -80; maximum: 0; unit: "dB";
+                            value: root.fx.gate-threshold; changed(v) => { root.set("gate-threshold", v); } }
+                        ParamRow { label: "Release"; minimum: 20; maximum: 1000; unit: "ms";
+                            value: root.fx.gate-release; changed(v) => { root.set("gate-release", v); } }
+                    }
+                    FxSection {
+                        title: "Compressor";
+                        description: "Turns loud parts down above the threshold, so quiet and loud come closer together.";
+                        on: root.fx.comp-on;
+                        toggled(v) => { root.set("comp-on", v ? 1 : 0); }
+                        ParamRow { label: "Threshold"; minimum: -60; maximum: 0; unit: "dB";
+                            value: root.fx.comp-threshold; changed(v) => { root.set("comp-threshold", v); } }
+                        ParamRow { label: "Ratio"; minimum: 1; maximum: 20; unit: ": 1"; fine: true;
+                            value: root.fx.comp-ratio; changed(v) => { root.set("comp-ratio", v); } }
+                        ParamRow { label: "Attack"; minimum: 0.5; maximum: 100; unit: "ms"; fine: true;
+                            value: root.fx.comp-attack; changed(v) => { root.set("comp-attack", v); } }
+                        ParamRow { label: "Release"; minimum: 20; maximum: 1000; unit: "ms";
+                            value: root.fx.comp-release; changed(v) => { root.set("comp-release", v); } }
+                        ParamRow { label: "Makeup"; minimum: 0; maximum: 24; unit: "dB"; fine: true;
+                            value: root.fx.comp-makeup; changed(v) => { root.set("comp-makeup", v); } }
+                    }
+                    FxSection {
+                        title: "Normalizer";
+                        description: "Slowly evens out loudness to a target — a quiet video next to a loud song. Silence stays silent.";
+                        on: root.fx.norm-on;
+                        toggled(v) => { root.set("norm-on", v ? 1 : 0); }
+                        ParamRow { label: "Target"; minimum: -40; maximum: -6; unit: "dB";
+                            value: root.fx.norm-target; changed(v) => { root.set("norm-target", v); } }
+                        ParamRow { label: "Max boost"; minimum: 0; maximum: 30; unit: "dB";
+                            value: root.fx.norm-max; changed(v) => { root.set("norm-max", v); } }
+                    }
+                    FxSection {
+                        title: "Limiter";
+                        description: "Keeps peaks under the ceiling, so nothing distorts.";
+                        on: root.fx.lim-on;
+                        toggled(v) => { root.set("lim-on", v ? 1 : 0); }
+                        ParamRow { label: "Ceiling"; minimum: -12; maximum: 0; unit: "dB"; fine: true;
+                            value: root.fx.lim-ceiling; changed(v) => { root.set("lim-ceiling", v); } }
+                    }
+                }
+            }
+            HorizontalLayout { alignment: end;
+                IconButton { label: "Done"; primary: true; clicked => { root.close(); } }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Slidr";
     icon: @image-url("../assets/logo-128.png");
@@ -2772,6 +2914,13 @@ export component AppWindow inherits Window {
     in-out property <bool> mixer-voice-muted;
     in-out property <bool> mixer-voice-monitor;
     in-out property <bool> mixer-voice-eq-on;
+    in property <int> mixer-voice-fx-count;
+    in-out property <bool> mixer-fx-open: false;
+    in property <string> mixer-fx-title;
+    in property <FxUI> mixer-fx;
+    callback mixer-edit-fx(string);
+    callback mixer-fx-set(string, float);
+    callback mixer-fx-closed();
     in-out property <bool> mixer-eq-open: false;
     in property <string> mixer-eq-title;
     in-out property <bool> mixer-eq-on;
@@ -3186,6 +3335,8 @@ export component AppWindow inherits Window {
                     voice-monitor <=> root.mixer-voice-monitor;
                     voice-eq-on <=> root.mixer-voice-eq-on;
                     edit-eq(t) => { root.mixer-edit-eq(t); }
+                    voice-fx-count: root.mixer-voice-fx-count;
+                    edit-fx(t) => { root.mixer-edit-fx(t); }
                     monitor-names: root.mixer-monitor-names;
                     mic-names: root.mixer-mic-names;
                     spare-names: root.mixer-spare-names;
@@ -3401,6 +3552,12 @@ export component AppWindow inherits Window {
         }
     }
 
+    if root.mixer-fx-open: FxEditorPopup {
+        title: root.mixer-fx-title;
+        fx: root.mixer-fx;
+        set(f, v) => { root.mixer-fx-set(f, v); }
+        close => { root.mixer-fx-open = false; root.mixer-fx-closed(); }
+    }
     if root.mixer-eq-open: EqEditorPopup {
         title: root.mixer-eq-title;
         on <=> root.mixer-eq-on;

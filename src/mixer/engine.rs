@@ -3,16 +3,15 @@
 
 use std::collections::HashMap;
 
-use crate::model::{Effects, EqBand, MixTarget, MixerConfig};
+use crate::model::{MixTarget, MixerConfig};
 
-use super::dsp::{fader_gain, soft_clip, Eq, Ramp, BLOCK_SAMPLES};
+use super::dsp::{fader_gain, soft_clip, Ramp, BLOCK_SAMPLES};
+use super::fx::FxChain;
 
 struct Strip {
     level: f32,
     muted: bool,
-    /// Bands in effect (`None` = EQ off), kept to notice changes.
-    bands: Option<Vec<EqBand>>,
-    eq: Eq,
+    fx: FxChain,
     /// Gain onto the monitor bus.
     monitor: Ramp,
     /// Gain onto the mic bus.
@@ -30,8 +29,7 @@ impl Strip {
         Self {
             level: 1.0,
             muted: false,
-            bands: None,
-            eq: Eq::default(),
+            fx: FxChain::default(),
             monitor: Ramp::new(0.0),
             send: Ramp::new(0.0),
             mic_send: None,
@@ -39,12 +37,6 @@ impl Strip {
         }
     }
 
-    fn set_bands(&mut self, bands: Option<Vec<EqBand>>) {
-        if bands != self.bands {
-            self.eq = Eq::new(bands.as_deref().unwrap_or(&[]));
-            self.bands = bands;
-        }
-    }
 
     fn update_gains(&mut self, is_voice: bool) {
         let live = if self.muted { 0.0 } else { 1.0 };
@@ -70,21 +62,20 @@ impl Engine {
     /// Adopt a (new) layout. Strips that already exist keep their ramps and
     /// filter state, so editing one channel doesn't click the others.
     pub fn configure(&mut self, cfg: &MixerConfig) {
-        let bands_of = |fx: &Effects| fx.eq_on.then(|| fx.eq.clone());
         self.channels.retain(|id, _| cfg.channels.iter().any(|c| c.id == *id));
         for c in &cfg.channels {
             let s = self.channels.entry(c.id).or_insert_with(Strip::new);
             s.level = c.level;
             s.muted = c.muted;
             s.mic_send = c.mic_send;
-            s.set_bands(bands_of(&c.fx));
+            s.fx.update(&c.fx);
             s.update_gains(false);
         }
         let v = &mut self.voice;
         v.level = cfg.voice.level;
         v.muted = cfg.voice.muted;
         v.to_monitor = cfg.voice.to_monitor;
-        v.set_bands(bands_of(&cfg.voice.fx));
+        v.fx.update(&cfg.voice.fx);
         v.update_gains(true);
     }
 
@@ -155,7 +146,7 @@ impl Engine {
         for (id, strip) in &mut self.channels {
             match channels.get_mut(id) {
                 Some(buf) => {
-                    strip.eq.process(buf);
+                    strip.fx.process(buf);
                     strip.monitor.mix_into(buf, monitor);
                     strip.send.mix_into(buf, mic);
                 }
@@ -168,7 +159,7 @@ impl Engine {
             }
         }
         if let Some(v) = voice {
-            self.voice.eq.process(v);
+            self.voice.fx.process(v);
             self.voice.monitor.mix_into(v, monitor);
             self.voice.send.mix_into(v, mic);
         }
@@ -180,7 +171,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MixChannel, VoiceStrip};
+    use crate::model::{Effects, MixChannel, VoiceStrip};
 
     fn channel(id: u32, mic_send: Option<f32>) -> MixChannel {
         MixChannel {

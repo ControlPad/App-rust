@@ -111,7 +111,8 @@ const OUTPUT_REAPPLY_DELAYS: [Duration; 2] =
 /// which is the jump the user sees. Mute state is deliberately left alone: the
 /// switch shouldn't un-mute anything the user muted on purpose.
 fn reapply_volumes(audio: &dyn AudioBackend, applied: &HashMap<String, (Target, f32)>) {
-    for (target, value) in applied.values() {
+    // Mixer levels live in Slidr and don't move with the output device.
+    for (target, value) in applied.values().filter(|(t, _)| !matches!(t, Target::Mixer(_))) {
         audio.set_volume(vol_target(target), *value);
     }
 }
@@ -142,6 +143,7 @@ fn target_key(t: &Target) -> String {
         Target::Process(p) => format!("p:{p}"),
         Target::Mic(m) => format!("m:{m}"),
         Target::System(d) => format!("s:{}", d.as_deref().unwrap_or("")),
+        Target::Mixer(m) => format!("x:{}", m.key()),
     }
 }
 
@@ -159,6 +161,13 @@ fn apply(
         Cmd::SerialConnected => led.on_connected(),
         Cmd::LedSaveState => led.save_state(),
         Cmd::LedClearSaved => led.clear_and_save(),
+        Cmd::SetVolume { target: Target::Mixer(m), value, unmute } => {
+            if unmute {
+                crate::mixer::set_mute(m, false);
+            }
+            crate::mixer::set_level(m, value);
+        }
+        Cmd::ToggleMute(Target::Mixer(m)) => crate::mixer::toggle_mute(m),
         Cmd::SetVolume { target, value, unmute } => {
             if unmute {
                 audio.set_mute(mute_target(&target), false);
@@ -236,6 +245,7 @@ fn vol_target(t: &Target) -> VolumeTarget<'_> {
         Target::Process(p) => VolumeTarget::Process(p),
         Target::Mic(m) => VolumeTarget::Mic(m),
         Target::System(d) => VolumeTarget::System(d.as_deref()),
+        Target::Mixer(_) => unreachable!("mixer targets are handled before the audio backend"),
     }
 }
 
@@ -244,5 +254,6 @@ fn mute_target(t: &Target) -> MuteTarget<'_> {
         Target::Process(p) => MuteTarget::Process(p),
         Target::Mic(m) => MuteTarget::Mic(m),
         Target::System(d) => MuteTarget::System(d.as_deref()),
+        Target::Mixer(_) => unreachable!("mixer targets are handled before the audio backend"),
     }
 }

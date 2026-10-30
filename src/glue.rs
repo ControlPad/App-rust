@@ -128,6 +128,12 @@ impl Shared {
             .cmd_tx
             .send(crate::events::Cmd::SetLeds(Box::new(self.preset.leds.clone())));
     }
+
+    /// Hand the profile's mixer layout and the mixer devices to the mixer.
+    /// Call wherever `push_leds` is called (profile load/switch, settings).
+    pub fn push_mixer(&self) {
+        crate::mixer::configure(self.preset.mixer.clone(), self.settings.mixer_devices.clone());
+    }
 }
 
 pub fn wire(
@@ -146,6 +152,7 @@ pub fn wire(
         push_preset_to_ui(ui, &s.preset);
         apply_appearance(ui, &s.preset.settings);
         s.push_leds();
+        s.push_mixer();
     }
 
     // Warn if the active profile was written by a newer Slidr (and block
@@ -281,6 +288,7 @@ pub fn wire(
                     push_settings_to_ui(&ui, &s.settings, &s.preset.settings);
                     apply_appearance(&ui, &s.preset.settings);
                     s.push_leds();
+                    s.push_mixer();
                     refresh_home(&ui, &s);
                     toast(&ui, &format!("Created profile: {name}"));
                 }
@@ -445,6 +453,7 @@ pub fn wire(
                     let Some(c) = s.preset.slider_categories.iter().find(|c| c.id == cat_id) else { return };
                     let Some(stream) = c.streams.get(idx) else { return };
                     if let Some(api) = &stream.api { (3, String::new(), String::new(), Some(api.clone())) }
+                    else if let Some(m) = stream.mixer { (4, m.to_value(), s.preset.mixer.label(m), None) }
                     else if let Some(p) = &stream.process { (0, p.clone(), p.clone(), None) }
                     else if let Some(m) = &stream.mic_name { (1, m.clone(), m.clone(), None) }
                     else { (2, stream.device_name.clone().unwrap_or_default(),
@@ -453,7 +462,10 @@ pub fn wire(
                     let Some(c) = s.preset.button_categories.iter().find(|c| c.id == cat_id) else { return };
                     let Some(a) = c.actions.get(idx) else { return };
                     let k = action_kind_index(a.kind);
-                    let prop = a.property.clone().unwrap_or_default();
+                    let prop = match a.mixer {
+                        Some(m) => m.to_value(),
+                        None => a.property.clone().unwrap_or_default(),
+                    };
                     // For KeyPress, show the friendly name in the picker.
                     let shown = if a.kind == ActionKind::KeyPress {
                         prop.parse::<u32>().ok()
@@ -550,6 +562,10 @@ pub fn wire(
                         0 => AudioStream { process: Some(result.property.into()), ..Default::default() },
                         1 => AudioStream { mic_name: Some(result.property.into()), ..Default::default() },
                         2 => AudioStream { device_name: Some(result.property.into()), ..Default::default() },
+                        4 => AudioStream {
+                            mixer: crate::model::MixTarget::from_value(&result.property),
+                            ..Default::default()
+                        },
                         _ => AudioStream { api: Some(api_from_result(&result)), ..Default::default() },
                     };
                     match editing {
@@ -562,7 +578,7 @@ pub fn wire(
                 if kind == ActionKind::ApiCall {
                     let action = ButtonAction {
                         kind, property: None, display: None,
-                        api: Some(api_from_result(&result)),
+                        api: Some(api_from_result(&result)), mixer: None,
                     };
                     match editing {
                         Some(i) if i < c.actions.len() => c.actions[i] = action,
@@ -595,7 +611,12 @@ pub fn wire(
                     let disp = if result.display.is_empty() { None } else { Some(result.display.to_string()) };
                     (prop, disp)
                 };
-                let action = ButtonAction { kind, property: prop, display: disp, api: None };
+                // A mixer action keeps its strip in `mixer`, not in the string property.
+                let mixer = (kind == ActionKind::MuteMixer)
+                    .then(|| crate::model::MixTarget::from_value(&result.property))
+                    .flatten();
+                let prop = if mixer.is_some() { None } else { prop };
+                let action = ButtonAction { kind, property: prop, display: disp, api: None, mixer };
                 match editing {
                     Some(i) if i < c.actions.len() => c.actions[i] = action,
                     _ => c.actions.push(action),
@@ -807,6 +828,7 @@ pub fn wire(
             apply_appearance(&ui, &s.preset.settings);
             // LED brightness / experimental flag may have changed.
             s.push_leds();
+            s.push_mixer();
             // Re-point the Discord worker if the application changed (a blank id
             // stops it). Cheap and idempotent when nothing moved.
             crate::discord::configure(&s.settings.discord_client_id, &s.settings.discord_client_secret);
@@ -856,6 +878,7 @@ pub fn wire(
                 push_settings_to_ui(&ui, &s.settings, &s.preset.settings);
                 apply_appearance(&ui, &s.preset.settings);
                 s.push_leds();
+                s.push_mixer();
                 // Refresh Home immediately with the new assignments using the
                 // last live readings — no board input required.
                 refresh_home(&ui, &s);
@@ -977,6 +1000,7 @@ pub fn wire(
             s.preset.leds[led] = Some(cfg);
             s.save_preset();
             s.push_leds();
+            s.push_mixer();
             drop(s);
             ui.set_led_popup_open(false);
             toast(&ui, "LED saved.");
@@ -1147,6 +1171,7 @@ pub fn wire(
                     ui.set_retry_eta_secs(-1.0);
                     // Board reset on connect; re-push all desired LED state.
                     s.push_leds();
+                    s.push_mixer();
                     changed = true;
                 }
                 SerialEvent::Disconnected { reason, retrying_in } => {
@@ -1368,7 +1393,10 @@ fn push_preset_to_ui(ui: &AppWindow, preset: &Preset) {
             lines: ModelRc::new(VecModel::from(
                 c.streams.iter().enumerate().map(|(i, s)| LineItem {
                     id: i as i32,
-                    primary: s.label().into(),
+                    primary: match s.mixer {
+                        Some(m) => preset.mixer.label(m).into(),
+                        None => s.label().into(),
+                    },
                     secondary: stream_secondary(s).into(),
                     icon_kind: stream_icon_kind(s),
                 }).collect::<Vec<_>>(),
@@ -1403,6 +1431,7 @@ fn push_preset_to_ui(ui: &AppWindow, preset: &Preset) {
 
 fn stream_icon_kind(s: &AudioStream) -> i32 {
     if s.api.is_some() { 3 }
+    else if s.mixer.is_some() { 5 }
     else if s.process.as_deref().is_some_and(|p| crate::app_groups::parse_ref(p).is_some()) { 6 }
     else if s.process.is_some() { 0 }
     else if s.mic_name.is_some() { 1 }
@@ -1444,12 +1473,15 @@ fn action_icon_kind(k: ActionKind) -> i32 {
     match k {
         MuteProcess => 0, MuteMic => 1, MuteMainAudio => 5,
         OpenProcess => 0, OpenWebsite => 3, KeyPress => 4, CycleOutput => 2, ApiCall => 3,
+        MuteMixer => 5,
     }
 }
 
 fn stream_secondary(s: &AudioStream) -> String {
     if s.api.is_some() {
         "API call".into()
+    } else if s.mixer.is_some() {
+        "Slidr mixer".into()
     } else if let Some(p) = &s.process {
         match crate::app_groups::parse_ref(p) {
             Some(_) => "program category".into(),
@@ -1578,6 +1610,7 @@ fn action_kind_index(k: ActionKind) -> i32 {
     match k {
         MuteProcess => 0, MuteMainAudio => 1, MuteMic => 2,
         OpenProcess => 3, OpenWebsite => 4, KeyPress => 5, CycleOutput => 6, ApiCall => 7,
+        MuteMixer => 8,
     }
 }
 
@@ -1585,7 +1618,8 @@ fn button_kind_from_index(i: i32) -> ActionKind {
     use ActionKind::*;
     match i {
         0 => MuteProcess, 1 => MuteMainAudio, 2 => MuteMic,
-        3 => OpenProcess, 4 => OpenWebsite, 6 => CycleOutput, 7 => ApiCall, _ => KeyPress,
+        3 => OpenProcess, 4 => OpenWebsite, 6 => CycleOutput, 7 => ApiCall, 8 => MuteMixer,
+        _ => KeyPress,
     }
 }
 
@@ -1603,6 +1637,37 @@ fn push_wizard_picker(ui: &AppWindow, shared: Arc<Mutex<Shared>>) {
     let target_kind = ui.get_wizard_target_kind();
     let kind = ui.get_wizard_kind();
     let filter = ui.get_wizard_filter().to_string().to_lowercase();
+
+    // Mixer strips: fixed list from the profile, labelled by channel name.
+    if (target_kind, kind) == (0, 4) || (target_kind, kind) == (1, 8) {
+        use crate::model::MixTarget;
+        let s = shared.lock();
+        let m = &s.preset.mixer;
+        let mut targets = vec![MixTarget::Voice];
+        for c in &m.channels {
+            targets.push(MixTarget::Channel(c.id));
+            // A button mutes a whole channel; only a slider can drive the send.
+            if target_kind == 0 {
+                targets.push(MixTarget::Send(c.id));
+            }
+        }
+        let current = ui.get_wizard_property().to_string();
+        let rows: Vec<crate::PickerEntry> = targets
+            .into_iter()
+            .map(|t| (m.label(t), t.to_value()))
+            .filter(|(name, _)| filter.is_empty() || name.to_lowercase().contains(filter.trim()))
+            .map(|(name, value)| crate::PickerEntry {
+                selected: value == current,
+                name: name.into(),
+                value: value.into(),
+                icon_kind: 5,
+                is_group: false,
+            })
+            .collect();
+        drop(s);
+        ui.set_wizard_picker_source(ModelRc::new(VecModel::from(rows)));
+        return;
+    }
 
     let s = shared.lock();
     let source: Vec<String> = match (target_kind, kind) {
@@ -1719,7 +1784,7 @@ fn is_program_kind(target_kind: i32, kind: i32) -> bool {
 
 /// Merge sessions-with-audio with all running processes, so the picker isn't
 /// empty when no audio is playing yet.
-fn merged_processes(audio: &dyn AudioBackend) -> Vec<String> {
+pub(crate) fn merged_processes(audio: &dyn AudioBackend) -> Vec<String> {
     let mut out = audio.list_processes();
     out.extend(list_running_processes());
     out

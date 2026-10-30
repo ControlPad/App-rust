@@ -125,8 +125,6 @@ impl WasapiBackend {
         mut visit: F,
     ) {
         let _guard = self.lock.lock().unwrap();
-        let group = crate::app_groups::parse_ref(process);
-        let needle = strip_exe(&process.to_lowercase());
         unsafe {
             let Ok(dev) = self.default_device(0) else { return };
             let Ok(mgr) = self.session_manager(&dev) else { return };
@@ -145,23 +143,27 @@ impl WasapiBackend {
                     continue;
                 }
                 let Some(name) = process_name(pid) else { continue };
-                let hit = match group {
-                    // Group membership also considers where the program lives
-                    // (game libraries), so it needs the full image path.
-                    Some(id) => crate::app_groups::matches(
-                        id,
-                        &name,
-                        crate::app_groups::process_path(pid).as_deref(),
-                    ),
-                    None => {
-                        strip_exe(&name.to_lowercase()).contains(&needle)
-                            || needle.contains(&strip_exe(&name.to_lowercase()))
-                    }
-                };
-                if hit {
+                if program_matches(process, pid, &name) {
                     visit(&ctl2, pid);
                 }
             }
+        }
+    }
+}
+
+/// Does the running program `pid` (image name `exe`) belong to `program`?
+///
+/// `program` is either a plain executable name (matched loosely, so "chrome"
+/// finds "chrome.exe") or a program-group reference such as `@group:games`.
+pub(crate) fn program_matches(program: &str, pid: u32, exe: &str) -> bool {
+    match crate::app_groups::parse_ref(program) {
+        // Group membership also considers where the program lives (game
+        // libraries), so it needs the full image path.
+        Some(id) => crate::app_groups::matches(id, exe, crate::app_groups::process_path(pid).as_deref()),
+        None => {
+            let needle = strip_exe(&program.to_lowercase());
+            let name = strip_exe(&exe.to_lowercase());
+            name.contains(&needle) || needle.contains(&name)
         }
     }
 }
@@ -515,7 +517,7 @@ unsafe trait IPolicyConfig: IUnknown {
     fn SetEndpointVisibility(&self) -> HRESULT;
 }
 
-fn process_name(pid: u32) -> Option<String> {
+pub(crate) fn process_name(pid: u32) -> Option<String> {
     use windows::core::PWSTR;
     use windows::Win32::System::Threading::QueryFullProcessImageNameW;
     use windows::Win32::System::Threading::PROCESS_NAME_WIN32;

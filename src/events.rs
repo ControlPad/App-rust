@@ -15,6 +15,8 @@ pub enum Target {
     Process(String),
     Mic(String),
     System(Option<String>),
+    /// A strip of Slidr's own mixer.
+    Mixer(crate::model::MixTarget),
 }
 
 /// A side-effect emitted by the engine, executed off the UI thread by the
@@ -291,7 +293,9 @@ fn api_cmd(api: &crate::model::ApiCall, percent: Option<i32>) -> Cmd {
 }
 
 fn stream_target(s: &crate::model::AudioStream) -> Target {
-    if let Some(p) = &s.process {
+    if let Some(m) = s.mixer {
+        Target::Mixer(m)
+    } else if let Some(p) = &s.process {
         Target::Process(p.clone())
     } else if let Some(m) = &s.mic_name {
         Target::Mic(m.clone())
@@ -357,6 +361,13 @@ fn push_button_cmds(
             if just_pressed {
                 if let Some(m) = &action.property {
                     out.push(Cmd::ToggleMute(Target::Mic(m.clone())));
+                }
+            }
+        }
+        ActionKind::MuteMixer => {
+            if just_pressed {
+                if let Some(m) = action.mixer {
+                    out.push(Cmd::ToggleMute(Target::Mixer(m)));
                 }
             }
         }

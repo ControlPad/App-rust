@@ -23,6 +23,8 @@ mod keys_library;
 mod keys_vk;
 mod led;
 mod media;
+mod mixer;
+mod mixer_ui;
 mod model;
 mod protocol;
 mod serial;
@@ -162,6 +164,7 @@ fn main() -> anyhow::Result<()> {
 
     let ui = AppWindow::new()?;
     glue::wire(&ui, shared.clone(), rx, BUILD_STAMP);
+    mixer_ui::wire(&ui, shared.clone());
 
     if demo {
         use slint::{ModelRc, SharedString, VecModel};
@@ -347,5 +350,7 @@ fn main() -> anyhow::Result<()> {
     let mut s = shared.lock();
     let _ = storage::save_settings(&s.settings);
     s.save_preset();
+    drop(s);
+    mixer::shutdown();
     Ok(())
 }

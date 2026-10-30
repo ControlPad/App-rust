@@ -1,0 +1,797 @@
+//! Windows side of the mixer: device I/O, per-program capture, routing, and
+//! the thread that clocks the engine off the monitor device.
+//!
+//! Every device runs 16-bit stereo at 48 kHz with Windows converting
+//! (`AUTOCONVERTPCM`) — the format the process-loopback proof of concept was
+//! verified with; the engine works in `f32` in between.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Context};
+use crossbeam_channel::{Receiver, RecvTimeoutError};
+use windows::core::{implement, Interface, IUnknown, HRESULT, PCWSTR};
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Media::Audio::{
+    eCapture, eConsole, eRender, ActivateAudioInterfaceAsync, EDataFlow,
+    IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
+    IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient, IAudioClient,
+    IAudioRenderClient, IAudioSessionControl2, IAudioSessionManager2, IMMDevice,
+    IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+    DEVICE_STATE_ACTIVE, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+    VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX,
+};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
+};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, WaitForSingleObject};
+
+use crate::model::{MixTarget, MixerConfig, MixerDevices};
+
+use super::dsp::{BLOCK_FRAMES, BLOCK_SAMPLES, RATE};
+use super::engine::Engine;
+use super::ring::Ring;
+use super::route::Router;
+use super::Cmd;
+
+const CHANNELS: u16 = 2;
+const BYTES_PER_FRAME: usize = 4;
+/// Device buffer: 100 ms in REFERENCE_TIME (100 ns) units.
+const BUFFER_100MS: i64 = 1_000_000;
+const SCAN_EVERY: Duration = Duration::from_secs(1);
+/// Audio the engine keeps queued on the monitor: 30 ms.
+const MONITOR_QUEUE: u32 = (BLOCK_FRAMES * 3) as u32;
+/// Above this the Slidr Mic skips a block instead of growing latency: 60 ms.
+const MIC_QUEUE_MAX: u32 = (BLOCK_FRAMES * 6) as u32;
+
+fn pcm_format() -> WAVEFORMATEX {
+    WAVEFORMATEX {
+        wFormatTag: 1, // WAVE_FORMAT_PCM
+        nChannels: CHANNELS,
+        nSamplesPerSec: RATE,
+        nAvgBytesPerSec: RATE * BYTES_PER_FRAME as u32,
+        nBlockAlign: BYTES_PER_FRAME as u16,
+        wBitsPerSample: 16,
+        cbSize: 0,
+    }
+}
+
+// ── Devices ──────────────────────────────────────────────────────────────────
+
+fn friendly_name(dev: &IMMDevice) -> String {
+    unsafe {
+        dev.OpenPropertyStore(STGM_READ)
+            .and_then(|s| s.GetValue(&PKEY_Device_FriendlyName))
+            .map(|v| v.to_string())
+            .unwrap_or_default()
+    }
+}
+
+fn device_id(dev: &IMMDevice) -> Option<String> {
+    unsafe {
+        let id = dev.GetId().ok()?;
+        let s = id.to_string().ok();
+        CoTaskMemFree(Some(id.0 as _));
+        s
+    }
+}
+
+/// Endpoint by friendly name (exact, then substring, case-insensitive), or
+/// the default for `flow` when `name` is `None`.
+fn find_device(en: &IMMDeviceEnumerator, flow: EDataFlow, name: Option<&str>) -> Option<IMMDevice> {
+    unsafe {
+        let Some(name) = name else {
+            return en.GetDefaultAudioEndpoint(flow, eConsole).ok();
+        };
+        let needle = name.to_lowercase();
+        let coll = en.EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE).ok()?;
+        let devs: Vec<IMMDevice> = (0..coll.GetCount().ok()?).filter_map(|i| coll.Item(i).ok()).collect();
+        let named: Vec<(IMMDevice, String)> =
+            devs.into_iter().map(|d| { let n = friendly_name(&d).to_lowercase(); (d, n) }).collect();
+        named
+            .iter()
+            .find(|(_, n)| *n == needle)
+            .or_else(|| named.iter().find(|(_, n)| n.contains(&needle)))
+            .map(|(d, _)| d.clone())
+    }
+}
+
+/// pid → image name of every program with an audio session on any output.
+fn session_programs(en: &IMMDeviceEnumerator) -> HashMap<u32, String> {
+    let own = unsafe { GetCurrentProcessId() };
+    let mut out = HashMap::new();
+    unsafe {
+        let Ok(coll) = en.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else { return out };
+        for i in 0..coll.GetCount().unwrap_or(0) {
+            let Ok(dev) = coll.Item(i) else { continue };
+            let Ok(mgr) = dev.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else { continue };
+            let Ok(list) = mgr.GetSessionEnumerator() else { continue };
+            for j in 0..list.GetCount().unwrap_or(0) {
+                let Ok(ctl) = list.GetSession(j) else { continue };
+                let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
+                let pid = ctl2.GetProcessId().unwrap_or(0);
+                if pid == 0 || pid == own || out.contains_key(&pid) {
+                    continue;
+                }
+                if let Some(name) = crate::audio::wasapi::process_name(pid) {
+                    out.insert(pid, name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// pid → parent pid of every running process.
+fn parent_pids() -> HashMap<u32, u32> {
+    let mut out = HashMap::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
+        let mut e = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                out.insert(e.th32ProcessID, e.th32ParentProcessID);
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    out
+}
+
+/// Whether one of `pid`'s ancestors is in `set`. Process loopback captures a
+/// whole process tree, so capturing both would play the child twice.
+fn has_ancestor_in(pid: u32, set: &HashSet<u32>, parents: &HashMap<u32, u32>) -> bool {
+    let mut cur = pid;
+    for _ in 0..32 {
+        match parents.get(&cur) {
+            Some(&p) if p != 0 && p != cur => {
+                if set.contains(&p) {
+                    return true;
+                }
+                cur = p;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+// ── Render ───────────────────────────────────────────────────────────────────
+
+struct Output {
+    client: IAudioClient,
+    rc: IAudioRenderClient,
+    frames: u32,
+    event: HANDLE,
+    name: String,
+}
+
+impl Output {
+    fn open(dev: &IMMDevice) -> anyhow::Result<Self> {
+        let name = friendly_name(dev);
+        unsafe {
+            let client: IAudioClient = dev.Activate(CLSCTX_ALL, None)?;
+            client
+                .Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
+                        | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    BUFFER_100MS,
+                    0,
+                    &pcm_format(),
+                    None,
+                )
+                .with_context(|| format!("open output {name:?}"))?;
+            let event = CreateEventW(None, false, false, None)?;
+            client.SetEventHandle(event)?;
+            let frames = client.GetBufferSize()?;
+            let rc: IAudioRenderClient = client.GetService()?;
+            client.Start()?;
+            Ok(Self { client, rc, frames, event, name })
+        }
+    }
+
+    fn queued(&self) -> u32 {
+        unsafe { self.client.GetCurrentPadding().unwrap_or(self.frames) }
+    }
+
+    /// Queue one block if it fits; a full device buffer drops it.
+    fn write(&self, block: &[f32]) -> windows::core::Result<()> {
+        let n = (block.len() / 2) as u32;
+        unsafe {
+            if self.frames - self.client.GetCurrentPadding()? < n {
+                return Ok(());
+            }
+            let buf = self.rc.GetBuffer(n)? as *mut i16;
+            let out = std::slice::from_raw_parts_mut(buf, block.len());
+            for (o, s) in out.iter_mut().zip(block) {
+                *o = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            }
+            self.rc.ReleaseBuffer(n, 0)
+        }
+    }
+}
+
+impl Drop for Output {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.client.Stop();
+            let _ = CloseHandle(self.event);
+        }
+    }
+}
+
+// ── Capture ──────────────────────────────────────────────────────────────────
+
+enum Source {
+    /// A program and its child processes.
+    Process(u32),
+    /// A capture endpoint, by endpoint id.
+    Device(String),
+}
+
+/// A capture running on its own thread, feeding `ring`. Dropping stops it.
+struct Capture {
+    ring: Arc<Ring>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Capture {
+    fn spawn(source: Source) -> Self {
+        let ring = Arc::new(Ring::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (r, s) = (ring.clone(), stop.clone());
+        let thread = std::thread::Builder::new()
+            .name("mixer-capture".into())
+            .spawn(move || {
+                if let Err(e) = capture_loop(&source, &r, &s) {
+                    match source {
+                        Source::Process(pid) => log::warn!("mixer: capture of pid {pid} stopped: {e:#}"),
+                        Source::Device(_) => log::warn!("mixer: microphone capture stopped: {e:#}"),
+                    }
+                }
+            })
+            .ok();
+        Self { ring, stop, thread }
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn capture_loop(source: &Source, ring: &Ring, stop: &AtomicBool) -> anyhow::Result<()> {
+    const SILENT: u32 = 0x2; // AUDCLNT_BUFFERFLAGS_SILENT
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let (client, flags) = match source {
+            Source::Process(pid) => (
+                activate_process_loopback(*pid)?,
+                AUDCLNT_STREAMFLAGS_LOOPBACK
+                    | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                    | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+            ),
+            Source::Device(id) => {
+                let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+                let wide: Vec<u16> = id.encode_utf16().chain(Some(0)).collect();
+                let dev = en.GetDevice(PCWSTR(wide.as_ptr()))?;
+                (
+                    dev.Activate::<IAudioClient>(CLSCTX_ALL, None)?,
+                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                        | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                )
+            }
+        };
+        client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, BUFFER_100MS, 0, &pcm_format(), None)?;
+        let event = CreateEventW(None, false, false, None)?;
+        client.SetEventHandle(event)?;
+        let cap: IAudioCaptureClient = client.GetService()?;
+        client.Start()?;
+        let mut samples: Vec<f32> = Vec::new();
+        let result = (|| -> anyhow::Result<()> {
+            while !stop.load(Ordering::Relaxed) {
+                if WaitForSingleObject(event, 100) != WAIT_OBJECT_0 {
+                    continue;
+                }
+                loop {
+                    let mut data = std::ptr::null_mut();
+                    let (mut n, mut flags) = (0u32, 0u32);
+                    cap.GetBuffer(&mut data, &mut n, &mut flags, None, None)?;
+                    if n == 0 {
+                        cap.ReleaseBuffer(0)?;
+                        break;
+                    }
+                    let count = n as usize * CHANNELS as usize;
+                    samples.clear();
+                    if flags & SILENT != 0 {
+                        samples.resize(count, 0.0);
+                    } else {
+                        let pcm = std::slice::from_raw_parts(data as *const i16, count);
+                        samples.extend(pcm.iter().map(|&s| s as f32 / 32768.0));
+                    }
+                    cap.ReleaseBuffer(n)?;
+                    ring.push(&samples);
+                }
+            }
+            Ok(())
+        })();
+        let _ = client.Stop();
+        let _ = CloseHandle(event);
+        result
+    }
+}
+
+#[implement(IActivateAudioInterfaceCompletionHandler)]
+struct Activated(mpsc::Sender<()>);
+
+impl IActivateAudioInterfaceCompletionHandler_Impl for Activated_Impl {
+    fn ActivateCompleted(&self, _op: Option<&IActivateAudioInterfaceAsyncOperation>) -> windows::core::Result<()> {
+        let _ = self.0.send(());
+        Ok(())
+    }
+}
+
+/// Raw PROPVARIANT holding a VT_BLOB (x64 layout: 8-byte header + 16-byte union).
+#[repr(C)]
+struct BlobVariant {
+    vt: u16,
+    _reserved: [u16; 3],
+    size: u32,
+    data: *const u8,
+    _pad: u64,
+}
+const VT_BLOB: u16 = 65;
+
+/// Audio client capturing `pid` and its children (Windows 10 2004+).
+fn activate_process_loopback(pid: u32) -> anyhow::Result<IAudioClient> {
+    let params = AUDIOCLIENT_ACTIVATION_PARAMS {
+        ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+        Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+            ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                TargetProcessId: pid,
+                ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+            },
+        },
+    };
+    let var = BlobVariant {
+        vt: VT_BLOB,
+        _reserved: [0; 3],
+        size: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+        data: &params as *const _ as *const u8,
+        _pad: 0,
+    };
+    let (tx, rx) = mpsc::channel();
+    let handler: IActivateAudioInterfaceCompletionHandler = Activated(tx).into();
+    unsafe {
+        let op = ActivateAudioInterfaceAsync(
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+            &IAudioClient::IID,
+            Some(&var as *const _ as *const windows::core::PROPVARIANT),
+            &handler,
+        )?;
+        rx.recv_timeout(Duration::from_secs(5)).map_err(|_| anyhow!("activation timed out"))?;
+        let mut hr = HRESULT(0);
+        let mut unk: Option<IUnknown> = None;
+        op.GetActivateResult(&mut hr, &mut unk)?;
+        hr.ok()?;
+        Ok(unk.ok_or_else(|| anyhow!("no interface"))?.cast()?)
+    }
+}
+
+// ── The mixer thread ─────────────────────────────────────────────────────────
+
+struct Io {
+    en: IMMDeviceEnumerator,
+    engine: Engine,
+    cfg: MixerConfig,
+    devices: MixerDevices,
+    /// Levels and mutes set from the board since the last layout; re-applied
+    /// over a new layout so a profile edit doesn't snap faders back.
+    live_levels: HashMap<MixTarget, f32>,
+    live_mutes: HashMap<MixTarget, bool>,
+    monitor: Option<Output>,
+    mic_out: Option<Output>,
+    voice: Option<Capture>,
+    sink: Option<IMMDevice>,
+    /// pid → (channel, capture).
+    captures: HashMap<u32, (u32, Capture)>,
+    router: Option<Router>,
+    next_scan: Instant,
+    tmp: Vec<f32>,
+    voice_buf: Vec<f32>,
+    monitor_buf: Vec<f32>,
+    mic_buf: Vec<f32>,
+}
+
+impl Io {
+    fn new(en: IMMDeviceEnumerator) -> Self {
+        Self {
+            en,
+            engine: Engine::default(),
+            cfg: MixerConfig::default(),
+            devices: MixerDevices::default(),
+            live_levels: HashMap::new(),
+            live_mutes: HashMap::new(),
+            monitor: None,
+            mic_out: None,
+            voice: None,
+            sink: None,
+            captures: HashMap::new(),
+            router: Router::new(),
+            next_scan: Instant::now(),
+            tmp: vec![0.0; BLOCK_SAMPLES],
+            voice_buf: vec![0.0; BLOCK_SAMPLES],
+            monitor_buf: vec![0.0; BLOCK_SAMPLES],
+            mic_buf: vec![0.0; BLOCK_SAMPLES],
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.cfg.enabled && (self.monitor.is_some() || self.mic_out.is_some())
+    }
+
+    fn handle(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Configure(cfg, devices) => self.configure(cfg, devices),
+            Cmd::SetLevel(t, v) => {
+                self.live_levels.insert(t, v);
+                self.engine.set_level(t, v);
+            }
+            Cmd::SetMute(t, m) => {
+                self.live_mutes.insert(t, m);
+                self.engine.set_mute(t, m);
+            }
+            Cmd::ToggleMute(t) => {
+                if let Some(m) = self.engine.muted(t) {
+                    self.live_mutes.insert(t, !m);
+                    self.engine.set_mute(t, !m);
+                }
+            }
+            Cmd::Shutdown(_) => unreachable!("handled by the loop"),
+        }
+    }
+
+    fn configure(&mut self, cfg: MixerConfig, devices: MixerDevices) {
+        let reopen = devices != self.devices || cfg.enabled != self.cfg.enabled;
+        if cfg != self.cfg {
+            // Board moves were relative to the old layout.
+            self.live_levels.clear();
+            self.live_mutes.clear();
+        }
+        self.engine.configure(&cfg);
+        for (t, v) in &self.live_levels {
+            self.engine.set_level(*t, *v);
+        }
+        for (t, m) in &self.live_mutes {
+            self.engine.set_mute(*t, *m);
+        }
+        self.cfg = cfg;
+        self.devices = devices;
+        if reopen {
+            self.close_devices();
+            if self.cfg.enabled {
+                self.open_devices();
+            }
+        }
+        self.next_scan = Instant::now();
+    }
+
+    fn open_devices(&mut self) {
+        let d = self.devices.clone();
+        let monitor_dev = find_device(&self.en, eRender, d.monitor.as_deref());
+        self.monitor = match monitor_dev.as_ref().map(Output::open) {
+            Some(Ok(o)) => Some(o),
+            Some(Err(e)) => {
+                log::warn!("mixer: {e:#}");
+                None
+            }
+            None => {
+                log::warn!("mixer: monitor device {:?} not found", d.monitor);
+                None
+            }
+        };
+        self.sink = d.sink.as_deref().and_then(|n| {
+            let dev = find_device(&self.en, eRender, Some(n));
+            if dev.is_none() {
+                log::warn!("mixer: sink {n:?} not found; programs are not rerouted");
+            }
+            dev
+        });
+        // Rerouting onto the device we play the mix on would feed it back into itself.
+        let same = |a: &Option<IMMDevice>, b: &Option<IMMDevice>| {
+            matches!((a.as_ref().and_then(device_id), b.as_ref().and_then(device_id)), (Some(x), Some(y)) if x == y)
+        };
+        if same(&self.sink, &monitor_dev) {
+            log::error!("mixer: sink and monitor are the same device; programs are not rerouted");
+            self.sink = None;
+        }
+        self.mic_out = d.mic_out.as_deref().and_then(|n| match find_device(&self.en, eRender, Some(n)) {
+            Some(dev) => Output::open(&dev).map_err(|e| log::warn!("mixer: {e:#}")).ok(),
+            None => {
+                log::warn!("mixer: Slidr Mic output {n:?} not found");
+                None
+            }
+        });
+        self.voice = match find_device(&self.en, eCapture, d.mic_input.as_deref()).as_ref().and_then(device_id) {
+            Some(id) => Some(Capture::spawn(Source::Device(id))),
+            None => {
+                log::warn!("mixer: microphone {:?} not found", d.mic_input);
+                None
+            }
+        };
+        log::info!(
+            "mixer: monitor {:?}, Slidr Mic {:?}, sink {:?}",
+            self.monitor.as_ref().map(|o| &o.name),
+            self.mic_out.as_ref().map(|o| &o.name),
+            self.sink.as_ref().map(friendly_name),
+        );
+    }
+
+    fn close_devices(&mut self) {
+        self.captures.clear();
+        if let Some(r) = &mut self.router {
+            r.clear_all();
+        }
+        self.voice = None;
+        self.monitor = None;
+        self.mic_out = None;
+        self.sink = None;
+    }
+
+    /// Match running programs to channels; start/stop captures and routes.
+    fn scan(&mut self) {
+        let sessions = session_programs(&self.en);
+        let mut wanted: HashMap<u32, u32> = HashMap::new();
+        if self.running() {
+            for (pid, exe) in &sessions {
+                let hit = self.cfg.channels.iter().find(|c| {
+                    c.programs.iter().any(|p| crate::audio::wasapi::program_matches(p, *pid, exe))
+                });
+                if let Some(c) = hit {
+                    wanted.insert(*pid, c.id);
+                }
+            }
+            let parents = parent_pids();
+            let set: HashSet<u32> = wanted.keys().copied().collect();
+            wanted.retain(|pid, _| !has_ancestor_in(*pid, &set, &parents));
+        }
+
+        self.captures.retain(|pid, (ch, _)| wanted.get(pid) == Some(ch));
+        for (pid, ch) in &wanted {
+            if !self.captures.contains_key(pid) {
+                log::info!("mixer: capturing {} (pid {pid}) into channel {ch}", sessions[pid]);
+                self.captures.insert(*pid, (*ch, Capture::spawn(Source::Process(*pid))));
+            }
+        }
+
+        let reroute: HashSet<u32> = wanted
+            .iter()
+            .filter(|(_, ch)| self.cfg.channels.iter().any(|c| c.id == **ch && c.reroute))
+            .map(|(pid, _)| *pid)
+            .collect();
+        let can_route = self.router.is_some() && self.sink.is_some();
+        if let (Some(router), Some(sink)) = (&mut self.router, &self.sink) {
+            for pid in &reroute {
+                if !router.is_routed(*pid) {
+                    if let Err(e) = router.route(*pid, sink) {
+                        log::debug!("mixer: rerouting pid {pid} failed ({e}); retrying");
+                    }
+                }
+            }
+        }
+        if let Some(router) = &mut self.router {
+            if router.pending() {
+                let paths: HashMap<u32, String> = sessions
+                    .keys()
+                    .map(|pid| (*pid, crate::app_groups::process_path(*pid).unwrap_or_default()))
+                    .collect();
+                router.recover(&paths, &|pid| can_route && reroute.contains(&pid));
+            }
+        }
+        for c in &self.cfg.channels {
+            self.engine.set_monitored(c.id, self.running() && can_route && c.reroute);
+        }
+    }
+
+    /// Wait for the monitor to want audio, then mix until its queue is topped up.
+    fn pump(&mut self) {
+        let clock = self.monitor.as_ref().or(self.mic_out.as_ref()).map(|o| o.event);
+        match clock {
+            Some(ev) => unsafe {
+                WaitForSingleObject(ev, 20);
+            },
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+        for _ in 0..8 {
+            let wants = self.monitor.as_ref().or(self.mic_out.as_ref()).is_some_and(|o| o.queued() < MONITOR_QUEUE);
+            if !wants {
+                break;
+            }
+            self.mix_block();
+        }
+    }
+
+    fn mix_block(&mut self) {
+        let mut channels: HashMap<u32, Vec<f32>> = HashMap::new();
+        for (ch, cap) in self.captures.values() {
+            cap.ring.pop(&mut self.tmp);
+            let sum = channels.entry(*ch).or_insert_with(|| vec![0.0; BLOCK_SAMPLES]);
+            for (s, t) in sum.iter_mut().zip(&self.tmp) {
+                *s += t;
+            }
+        }
+        let voice = match &self.voice {
+            Some(cap) => {
+                cap.ring.pop(&mut self.voice_buf);
+                Some(&mut self.voice_buf[..])
+            }
+            None => None,
+        };
+        self.engine.process(&mut channels, voice, &mut self.monitor_buf, &mut self.mic_buf);
+        if let Some(m) = &self.monitor {
+            if let Err(e) = m.write(&self.monitor_buf) {
+                log::warn!("mixer: monitor write failed ({e}); reopening devices");
+                self.reopen();
+                return;
+            }
+        }
+        if let Some(o) = &self.mic_out {
+            if o.queued() < MIC_QUEUE_MAX {
+                if let Err(e) = o.write(&self.mic_buf) {
+                    log::warn!("mixer: Slidr Mic write failed ({e}); reopening devices");
+                    self.reopen();
+                }
+            }
+        }
+    }
+
+    /// A device went away (unplugged, format change): start over.
+    fn reopen(&mut self) {
+        self.close_devices();
+        self.open_devices();
+        self.next_scan = Instant::now();
+    }
+}
+
+pub fn run(rx: Receiver<Cmd>) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let en: IMMDeviceEnumerator = match unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) } {
+        Ok(en) => en,
+        Err(e) => {
+            log::error!("mixer: no audio device enumerator ({e}); mixer disabled");
+            return;
+        }
+    };
+    let mut io = Io::new(en);
+    loop {
+        // While mixing, commands must not stall the audio; otherwise block.
+        let first = if io.running() {
+            rx.try_recv().ok()
+        } else {
+            match rx.recv_timeout(SCAN_EVERY) {
+                Ok(c) => Some(c),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        };
+        for cmd in first.into_iter().chain(rx.try_iter()) {
+            if let Cmd::Shutdown(ack) = cmd {
+                io.close_devices();
+                let _ = ack.send(());
+                return;
+            }
+            io.handle(cmd);
+        }
+        if Instant::now() >= io.next_scan {
+            io.next_scan = Instant::now() + SCAN_EVERY;
+            io.scan();
+        }
+        if io.running() {
+            io.pump();
+        }
+    }
+    io.close_devices();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end on real devices, run by hand:
+    ///
+    ///     SLIDR_TEST_MONITOR="Voicemeeter In 2" SLIDR_TEST_MIC_OUT="Voicemeeter In 1" \
+    ///         cargo test --bin slidr windows_io -- --ignored --nocapture
+    ///
+    /// Both outputs should be ones nobody listens to. `SLIDR_TEST_MIC` picks
+    /// the microphone (default: the system default). Measures what this
+    /// process plays (its own process loopback) at two voice fader positions.
+    #[test]
+    #[ignore]
+    fn voice_reaches_the_slidr_mic_and_follows_its_fader() {
+        let env = |k: &str| std::env::var(k).ok();
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let en: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).unwrap() };
+        let mut io = Io::new(en);
+        let devices = MixerDevices {
+            monitor: env("SLIDR_TEST_MONITOR"),
+            mic_input: env("SLIDR_TEST_MIC"),
+            sink: None,
+            mic_out: env("SLIDR_TEST_MIC_OUT"),
+        };
+        assert!(devices.monitor.is_some() && devices.mic_out.is_some(), "set SLIDR_TEST_MONITOR / SLIDR_TEST_MIC_OUT");
+        io.configure(MixerConfig { enabled: true, ..Default::default() }, devices);
+        assert!(io.monitor.is_some() && io.mic_out.is_some() && io.voice.is_some());
+        let tap = Capture::spawn(Source::Process(unsafe { GetCurrentProcessId() }));
+
+        let energy = |b: &[f32]| b.iter().map(|s| (*s as f64).powi(2)).sum::<f64>();
+        let db = |e: f64, n: usize| 10.0 * (e / n.max(1) as f64).log10();
+        // (what this process played, mic input, Slidr Mic bus) over `secs`.
+        // Input and bus are compared block by block, so the room changing
+        // between two measurements doesn't matter.
+        let mut measure = |io: &mut Io, secs: u64| -> (f64, f64, f64) {
+            let (mut tapped, mut n_tap, mut input, mut bus, mut n) = (0f64, 0usize, 0f64, 0f64, 0usize);
+            let mut block = vec![0.0; BLOCK_SAMPLES];
+            let end = Instant::now() + Duration::from_secs(secs);
+            while Instant::now() < end {
+                unsafe { WaitForSingleObject(io.monitor.as_ref().unwrap().event, 20) };
+                while io.monitor.as_ref().unwrap().queued() < MONITOR_QUEUE {
+                    io.mix_block();
+                    input += energy(&io.voice_buf);
+                    bus += energy(&io.mic_buf);
+                    n += BLOCK_SAMPLES;
+                }
+                while tap.ring.pop(&mut block) {
+                    tapped += energy(&block);
+                    n_tap += block.len();
+                }
+            }
+            (db(tapped, n_tap), db(input, n), db(bus, n))
+        };
+        measure(&mut io, 1);
+        let (full, in_full, bus_full) = measure(&mut io, 2);
+        io.handle(Cmd::SetLevel(MixTarget::Voice, 0.25));
+        measure(&mut io, 1);
+        let (_, in_q, bus_q) = measure(&mut io, 2);
+        io.handle(Cmd::SetMute(MixTarget::Voice, true));
+        measure(&mut io, 1);
+        let (muted, _, _) = measure(&mut io, 2);
+        println!(
+            "played {full:.1} dBFS; bus minus input at 100 %: {:.1} dB, at 25 %: {:.1} dB; muted played {muted:.1} dBFS",
+            bus_full - in_full,
+            bus_q - in_q
+        );
+        io.close_devices();
+
+        assert!(full > -90.0, "nothing from the microphone was played");
+        assert!((bus_full - in_full).abs() < 0.5, "voice at 100 % must pass unchanged");
+        // Fader 0.25 → gain 0.0625 → −24 dB.
+        assert!((bus_q - in_q + 24.1).abs() < 1.0, "fader did not scale the voice");
+        assert!(muted < -90.0, "mute did not silence the voice");
+    }
+}

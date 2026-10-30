@@ -1638,8 +1638,10 @@ component WizardPopup inherits Rectangle {
 
     property <[string]> button-kinds: ["Mute process", "Mute main audio", "Mute microphone",
                                        "Open application", "Open website", "Simulate key",
-                                       "Cycle output device", "API call"];
-    property <[string]> slider-kinds: ["Process volume", "Microphone", "Output device", "API call"];
+                                       "Cycle output device", "API call", "Mute mixer channel"];
+    // Mixer entries go last so the indices above (the API call's included) stay put.
+    property <[string]> slider-kinds: ["Process volume", "Microphone", "Output device", "API call",
+                                       "Mixer channel"];
     property <[string]> kinds: root.target-kind == 1 ? root.button-kinds : root.slider-kinds;
     property <string> kind-label: root.kinds[root.kind];
     property <[string]> method-names: ["GET", "POST", "PUT", "PATCH", "DELETE"];
@@ -2300,6 +2302,263 @@ component LedConfigPopup inherits Rectangle {
 // Window
 // ──────────────────────────────────────────────────────────────────────────
 
+// One mixer channel as the Mixer page shows it. `level` / `send` are percent;
+// `eq` indexes `eq-names` (0 = off).
+export struct MixChannelUI {
+    id: int, name: string, programs: string, level: float, muted: bool,
+    eq: int, reroute: bool, send-on: bool, send: float,
+}
+
+// Fader + percent readout, the row control of the mixer.
+component LevelRow inherits HorizontalLayout {
+    in property <float> value;
+    callback changed(float);
+    spacing: 10px;
+    AccentSlider { minimum: 0; maximum: 100; value: root.value;
+        horizontal-stretch: 1;
+        changed(v) => { root.changed(v); } }
+    Text { text: Math.round(root.value) + " %"; min-width: 42px;
+        horizontal-alignment: right; vertical-alignment: center;
+        font-family: "Inter"; font-size: 12px; }
+}
+
+// Small caption + control, stacked.
+component Labeled inherits VerticalLayout {
+    in property <string> label;
+    spacing: 4px;
+    Text { text: root.label; font-family: "Inter"; font-size: 11px;
+        color: Palette.foreground.with-alpha(0.6); }
+    @children
+}
+
+component MixerPage inherits VerticalBox {
+    in-out property <bool> enabled;
+    in property <[MixChannelUI]> channels;
+    in-out property <float> voice-level;
+    in-out property <bool> voice-muted;
+    in-out property <bool> voice-monitor;
+    in-out property <int> voice-eq;
+    in property <[string]> eq-names;
+    in property <[string]> monitor-names;
+    in property <[string]> mic-names;
+    in property <[string]> spare-names;
+    in-out property <int> monitor-idx;
+    in-out property <int> mic-idx;
+    in-out property <int> sink-idx;
+    in-out property <int> cable-idx;
+    in property <string> hint;
+
+    // Any page-level value changed (enabled, devices, voice strip).
+    callback changed();
+    // One field of one channel: `field` names it, the value comes in `num` or `text`.
+    callback channel-set(int, string, float, string);
+    callback add-channel();
+    callback delete-channel(int);
+    callback choose-programs(int);
+
+    spacing: 14px;
+    property <length> control-w: 260px;
+
+    HorizontalBox {
+        Text { text: "Mixer"; font-size: 26px; font-weight: 700; font-family: "Inter";
+            vertical-alignment: center; }
+        Rectangle { horizontal-stretch: 1; }
+        Text { text: root.enabled ? "On" : "Off"; font-family: "Inter";
+            vertical-alignment: center; color: Palette.foreground.with-alpha(0.7); }
+        Toggle { checked <=> root.enabled; toggled => { root.changed(); } }
+    }
+
+    ScrollView {
+        mouse-drag-pan-enabled: false;
+        vertical-stretch: 1;
+        VerticalBox {
+            spacing: 12px; alignment: start;
+            width: parent.width - 18px;
+
+            if root.hint != "": Card {
+                border-color: Theme.accent-bg;
+                HorizontalBox { padding: 14px;
+                    Text { text: root.hint; wrap: word-wrap; font-family: "Inter";
+                        font-size: 12px; horizontal-stretch: 1; }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
+                    Text { text: "Devices"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
+                    Rectangle { height: 6px; }
+                    SettingRow {
+                        label: "Headphones";
+                        description: "Where you hear the mix";
+                        Select { field-width: root.control-w; model: root.monitor-names;
+                            current-index <=> root.monitor-idx;
+                            selected => { root.changed(); } }
+                    }
+                    SettingRow {
+                        label: "Microphone";
+                        description: "Your real microphone";
+                        Select { field-width: root.control-w; model: root.mic-names;
+                            current-index <=> root.mic-idx;
+                            selected => { root.changed(); } }
+                    }
+                    SettingRow {
+                        label: "Slidr Mic";
+                        description: "Input side of a virtual cable (e.g. \"CABLE Input\"). Pick its other end (\"CABLE Output\") as the microphone in Discord.";
+                        Select { field-width: root.control-w; model: root.spare-names;
+                            current-index <=> root.cable-idx;
+                            selected => { root.changed(); } }
+                    }
+                    SettingRow {
+                        label: "Silent output";
+                        description: "An output nobody listens to. Channel programs are moved there so you only hear Slidr's mix.";
+                        Select { field-width: root.control-w; model: root.spare-names;
+                            current-index <=> root.sink-idx;
+                            selected => { root.changed(); } }
+                    }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 10px;
+                    HorizontalLayout { spacing: 10px;
+                        Icon { source: @image-url("../assets/icons/microphone-2.svg"); size: 18px; }
+                        Text { text: "Voice"; font-weight: 700; font-family: "Inter"; font-size: 14px;
+                            vertical-alignment: center; horizontal-stretch: 1; }
+                    }
+                    Labeled { label: "Level in the Slidr Mic";
+                        LevelRow { value: root.voice-level;
+                            changed(v) => { root.voice-level = v; root.changed(); } }
+                    }
+                    HorizontalLayout { spacing: 24px; alignment: start;
+                        Labeled { label: "EQ";
+                            Select { field-width: 200px; model: root.eq-names;
+                                current-index <=> root.voice-eq;
+                                selected => { root.changed(); } }
+                        }
+                        Labeled { label: "Muted";
+                            Toggle { checked <=> root.voice-muted; toggled => { root.changed(); } }
+                        }
+                        Labeled { label: "Hear yourself";
+                            Toggle { checked <=> root.voice-monitor; toggled => { root.changed(); } }
+                        }
+                    }
+                }
+            }
+
+            for ch in root.channels: Card {
+                VerticalBox { padding: 18px; spacing: 10px;
+                    HorizontalLayout { spacing: 10px;
+                        Icon { source: @image-url("../assets/icons/volume.svg"); size: 18px;
+                            y: (parent.height - self.height) / 2; }
+                        LineEdit { width: 180px; height: 34px; text: ch.name;
+                            placeholder-text: "Channel name";
+                            edited(t) => { root.channel-set(ch.id, "name", 0, t); } }
+                        Text { text: ch.programs != "" ? ch.programs : "No programs yet";
+                            horizontal-stretch: 1; vertical-alignment: center; overflow: elide;
+                            font-family: "Inter"; font-size: 13px;
+                            color: ch.programs != "" ? Palette.foreground : Palette.foreground.with-alpha(0.5); }
+                        IconButton { icon: @image-url("../assets/icons/app-window.svg"); label: "Programs";
+                            clicked => { root.choose-programs(ch.id); } }
+                        SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
+                            y: (parent.height - self.height) / 2;
+                            clicked => { root.delete-channel(ch.id); } }
+                    }
+                    Labeled { label: "Level";
+                        LevelRow { value: ch.level;
+                            changed(v) => { root.channel-set(ch.id, "level", v, ""); } }
+                    }
+                    HorizontalLayout { spacing: 24px; alignment: start;
+                        Labeled { label: "EQ";
+                            Select { field-width: 200px; model: root.eq-names;
+                                current-index: ch.eq;
+                                selected(i) => { root.channel-set(ch.id, "eq", i, ""); } }
+                        }
+                        Labeled { label: "Muted";
+                            Toggle { checked: ch.muted;
+                                toggled => { root.channel-set(ch.id, "muted", self.checked ? 1 : 0, ""); } }
+                        }
+                        Labeled { label: "Replace original";
+                            Toggle { checked: ch.reroute;
+                                toggled => { root.channel-set(ch.id, "reroute", self.checked ? 1 : 0, ""); } }
+                        }
+                        Labeled { label: "Into Slidr Mic";
+                            Toggle { checked: ch.send-on;
+                                toggled => { root.channel-set(ch.id, "send-on", self.checked ? 1 : 0, ""); } }
+                        }
+                    }
+                    if ch.send-on: Labeled { label: "Level in the Slidr Mic";
+                        LevelRow { value: ch.send;
+                            changed(v) => { root.channel-set(ch.id, "send", v, ""); } }
+                    }
+                }
+            }
+
+            HorizontalLayout { alignment: start;
+                IconButton { icon: @image-url("../assets/icons/plus.svg"); label: "Add channel";
+                    clicked => { root.add-channel(); } }
+            }
+        }
+    }
+}
+
+// Multi-select list of programs for one mixer channel.
+component ProgramPickerPopup inherits Rectangle {
+    in property <string> title;
+    in property <[PickerEntry]> options;
+    in-out property <string> filter;
+    callback toggle(string);
+    callback filter-changed(string);
+    callback close();
+
+    background: #00000099;
+    TouchArea { clicked => { root.close(); } }
+
+    Rectangle {
+        x: parent.width / 2 - self.width / 2;
+        y: parent.height / 2 - self.height / 2;
+        width: 480px; height: 560px;
+        background: Palette.background;
+        border-radius: 14px; border-width: 1px; border-color: Palette.border;
+        TouchArea {}
+        VerticalBox {
+            padding: 22px; spacing: 12px;
+            Text { text: root.title; font-size: 20px; font-weight: 700; font-family: "Inter"; }
+            LineEdit { height: 36px; placeholder-text: "Search…"; text <=> root.filter;
+                edited(t) => { root.filter-changed(t); } }
+            ScrollView {
+                mouse-drag-pan-enabled: false;
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 6px; alignment: start;
+                    if root.options.length == 0: Text { text: "Nothing found";
+                        font-family: "Inter"; color: Palette.foreground.with-alpha(0.6); }
+                    for e in root.options: Rectangle {
+                        border-radius: 8px; height: 40px;
+                        background: e.selected ? Theme.accent-bg.with-alpha(0.22) : Palette.alternate-background;
+                        border-width: 1px;
+                        border-color: e.selected ? Theme.accent-bg : Palette.border;
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.toggle(e.value); }
+                            HorizontalLayout { padding-left: 12px; padding-right: 12px; spacing: 10px;
+                                VerticalLayout { alignment: center; KindIcon { kind: e.icon-kind; size: 18px; } }
+                                Text { text: e.name; vertical-alignment: center; overflow: elide;
+                                    font-family: "Inter"; horizontal-stretch: 1; }
+                                VerticalLayout { alignment: center;
+                                    if e.selected: Icon { source: @image-url("../assets/icons/check.svg");
+                                        tint: Theme.accent-bg; size: 16px; } }
+                            }
+                        }
+                    }
+                }
+            }
+            HorizontalLayout { alignment: end;
+                IconButton { label: "Done"; primary: true; clicked => { root.close(); } }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Slidr";
     icon: @image-url("../assets/logo-128.png");
@@ -2358,6 +2617,35 @@ export component AppWindow inherits Window {
 
     in-out property <int> current-page: 0;
     in-out property <bool> edit-mode: false;
+
+    // ── Mixer page ──
+    in-out property <bool> mixer-enabled;
+    in property <[MixChannelUI]> mixer-channels;
+    in-out property <float> mixer-voice-level;
+    in-out property <bool> mixer-voice-muted;
+    in-out property <bool> mixer-voice-monitor;
+    in-out property <int> mixer-voice-eq;
+    in property <[string]> mixer-eq-names;
+    in property <[string]> mixer-monitor-names;
+    in property <[string]> mixer-mic-names;
+    in property <[string]> mixer-spare-names;
+    in-out property <int> mixer-monitor-idx;
+    in-out property <int> mixer-mic-idx;
+    in-out property <int> mixer-sink-idx;
+    in-out property <int> mixer-cable-idx;
+    in property <string> mixer-hint;
+    callback mixer-changed();
+    callback mixer-channel-set(int, string, float, string);
+    callback mixer-add-channel();
+    callback mixer-delete-channel(int);
+    in-out property <bool> mixer-picker-open: false;
+    in property <string> mixer-picker-title;
+    in property <[PickerEntry]> mixer-picker-options;
+    in-out property <string> mixer-picker-filter;
+    callback mixer-choose-programs(int);
+    callback mixer-toggle-program(string);
+    callback mixer-picker-filter-changed(string);
+    callback mixer-picker-closed();
 
     in-out property <bool> assign-popup-open: false;
     in-out property <int> assign-target-kind: 0;
@@ -2566,6 +2854,10 @@ export component AppWindow inherits Window {
                     icon: @image-url("../assets/icons/grid-dots.svg");
                     active: root.current-page == 2;
                     clicked => { root.current-page = 2; root.edit-mode = false; root.page-changed(2); } }
+                NavItem { label: "Mixer"; compact: root.sidebar-collapsed;
+                    icon: @image-url("../assets/icons/volume.svg");
+                    active: root.current-page == 4;
+                    clicked => { root.current-page = 4; root.edit-mode = false; root.page-changed(4); } }
                 NavItem { label: "Settings"; compact: root.sidebar-collapsed;
                     icon: @image-url("../assets/icons/settings.svg");
                     active: root.current-page == 3;
@@ -2721,6 +3013,28 @@ export component AppWindow inherits Window {
                     toggle-collapse(id) => { root.toggle-category-collapse(1, id); }
                     reorder-category(fid, to) => { root.reorder-category(1, fid, to); }
                     move-line(fc, fi, tc, ti) => { root.move-line(1, fc, fi, tc, ti); }
+                }
+                if root.current-page == 4: MixerPage {
+                    enabled <=> root.mixer-enabled;
+                    channels: root.mixer-channels;
+                    voice-level <=> root.mixer-voice-level;
+                    voice-muted <=> root.mixer-voice-muted;
+                    voice-monitor <=> root.mixer-voice-monitor;
+                    voice-eq <=> root.mixer-voice-eq;
+                    eq-names: root.mixer-eq-names;
+                    monitor-names: root.mixer-monitor-names;
+                    mic-names: root.mixer-mic-names;
+                    spare-names: root.mixer-spare-names;
+                    monitor-idx <=> root.mixer-monitor-idx;
+                    mic-idx <=> root.mixer-mic-idx;
+                    sink-idx <=> root.mixer-sink-idx;
+                    cable-idx <=> root.mixer-cable-idx;
+                    hint: root.mixer-hint;
+                    changed => { root.mixer-changed(); }
+                    channel-set(id, f, n, t) => { root.mixer-channel-set(id, f, n, t); }
+                    add-channel => { root.mixer-add-channel(); }
+                    delete-channel(id) => { root.mixer-delete-channel(id); }
+                    choose-programs(id) => { root.mixer-choose-programs(id); }
                 }
                 if root.current-page == 3: SettingsPage {
                     theme-index <=> root.theme-index;
@@ -2920,6 +3234,14 @@ export component AppWindow inherits Window {
         }
     }
 
+    if root.mixer-picker-open: ProgramPickerPopup {
+        title: root.mixer-picker-title;
+        options: root.mixer-picker-options;
+        filter <=> root.mixer-picker-filter;
+        toggle(v) => { root.mixer-toggle-program(v); }
+        filter-changed(t) => { root.mixer-picker-filter-changed(t); }
+        close => { root.mixer-picker-open = false; root.mixer-picker-closed(); }
+    }
     if root.preset-popup-open: PresetPopup {
         active-name: root.active-preset-name;
         presets: root.preset-names;

@@ -2342,11 +2342,14 @@ component MixerPage inherits VerticalBox {
     in property <[string]> monitor-names;
     in property <[string]> mic-names;
     in property <[string]> spare-names;
+    in property <[string]> cable-names;
     in-out property <int> monitor-idx;
     in-out property <int> mic-idx;
     in-out property <int> sink-idx;
     in-out property <int> cable-idx;
     in property <string> hint;
+    in property <bool> hint-download;
+    callback open-download();
 
     // Any page-level value changed (enabled, devices, voice strip).
     callback changed();
@@ -2377,9 +2380,11 @@ component MixerPage inherits VerticalBox {
 
             if root.hint != "": Card {
                 border-color: Theme.accent-bg;
-                HorizontalBox { padding: 14px;
+                HorizontalBox { padding: 14px; spacing: 12px;
                     Text { text: root.hint; wrap: word-wrap; font-family: "Inter";
-                        font-size: 12px; horizontal-stretch: 1; }
+                        font-size: 12px; horizontal-stretch: 1; vertical-alignment: center; }
+                    if root.hint-download: IconButton { label: "Download VB-CABLE"; primary: true;
+                        clicked => { root.open-download(); } }
                 }
             }
 
@@ -2403,8 +2408,8 @@ component MixerPage inherits VerticalBox {
                     }
                     SettingRow {
                         label: "Slidr Mic";
-                        description: "Input side of a virtual cable (e.g. \"CABLE Input\"). Pick its other end (\"CABLE Output\") as the microphone in Discord.";
-                        Select { field-width: root.control-w; model: root.spare-names;
+                        description: "Virtual cable Slidr sends your voice and mix into. Pick the same one as the microphone in Discord.";
+                        Select { field-width: root.control-w; model: root.cable-names;
                             current-index <=> root.cable-idx;
                             selected => { root.changed(); } }
                     }
@@ -2629,6 +2634,9 @@ export component AppWindow inherits Window {
     in property <[string]> mixer-monitor-names;
     in property <[string]> mixer-mic-names;
     in property <[string]> mixer-spare-names;
+    in property <[string]> mixer-cable-names;
+    in property <bool> mixer-hint-download;
+    callback mixer-open-download();
     in-out property <int> mixer-monitor-idx;
     in-out property <int> mixer-mic-idx;
     in-out property <int> mixer-sink-idx;
@@ -3025,6 +3033,9 @@ export component AppWindow inherits Window {
                     monitor-names: root.mixer-monitor-names;
                     mic-names: root.mixer-mic-names;
                     spare-names: root.mixer-spare-names;
+                    cable-names: root.mixer-cable-names;
+                    hint-download: root.mixer-hint-download;
+                    open-download => { root.mixer-open-download(); }
                     monitor-idx <=> root.mixer-monitor-idx;
                     mic-idx <=> root.mixer-mic-idx;
                     sink-idx <=> root.mixer-sink-idx;

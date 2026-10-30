@@ -8,7 +8,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
@@ -249,7 +248,6 @@ enum Source {
 struct Capture {
     ring: Arc<Ring>,
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
 }
 
 impl Capture {
@@ -257,7 +255,7 @@ impl Capture {
         let ring = Arc::new(Ring::default());
         let stop = Arc::new(AtomicBool::new(false));
         let (r, s) = (ring.clone(), stop.clone());
-        let thread = std::thread::Builder::new()
+        let _ = std::thread::Builder::new()
             .name("mixer-capture".into())
             .spawn(move || {
                 if let Err(e) = capture_loop(&source, &r, &s) {
@@ -266,18 +264,16 @@ impl Capture {
                         Source::Device(_) => log::warn!("mixer: microphone capture stopped: {e:#}"),
                     }
                 }
-            })
-            .ok();
-        Self { ring, stop, thread }
+            });
+        Self { ring, stop }
     }
 }
 
 impl Drop for Capture {
     fn drop(&mut self) {
+        // Not joined: the thread notices within its 100 ms wait and exits on
+        // its own, and the audio thread must not sit here meanwhile.
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
     }
 }
 
@@ -400,9 +396,24 @@ fn activate_process_loopback(pid: u32) -> anyhow::Result<IAudioClient> {
     }
 }
 
-// ── The mixer thread ─────────────────────────────────────────────────────────
+// ── Threads ──────────────────────────────────────────────────────────────────
+//
+// Two threads, so nothing slow ever sits between the monitor's buffer and the
+// next block: the audio thread only mixes and writes, the control thread does
+// everything that may take a while (enumerating sessions and processes —
+// ~100 ms — and routing) and tells the audio thread what to capture.
 
-struct Io {
+/// Control thread → audio thread.
+enum AudioCmd {
+    Mixer(Cmd),
+    /// Programs to capture: pid → channel.
+    Capture(HashMap<u32, u32>),
+    /// Channels whose programs are rerouted (and so belong on the monitor).
+    Monitored(Vec<(u32, bool)>),
+    Stop(crossbeam_channel::Sender<()>),
+}
+
+struct Audio {
     en: IMMDeviceEnumerator,
     engine: Engine,
     cfg: MixerConfig,
@@ -414,19 +425,20 @@ struct Io {
     monitor: Option<Output>,
     mic_out: Option<Output>,
     voice: Option<Capture>,
-    sink: Option<IMMDevice>,
     /// pid → (channel, capture).
     captures: HashMap<u32, (u32, Capture)>,
-    router: Option<Router>,
-    next_scan: Instant,
+    /// Whether devices are open and mixing — the control thread only starts
+    /// captures and reroutes while this is set.
+    running_flag: Arc<AtomicBool>,
+    stats: Stats,
     tmp: Vec<f32>,
     voice_buf: Vec<f32>,
     monitor_buf: Vec<f32>,
     mic_buf: Vec<f32>,
 }
 
-impl Io {
-    fn new(en: IMMDeviceEnumerator) -> Self {
+impl Audio {
+    fn new(en: IMMDeviceEnumerator, running_flag: Arc<AtomicBool>) -> Self {
         Self {
             en,
             engine: Engine::default(),
@@ -437,10 +449,9 @@ impl Io {
             monitor: None,
             mic_out: None,
             voice: None,
-            sink: None,
             captures: HashMap::new(),
-            router: Router::new(),
-            next_scan: Instant::now(),
+            running_flag,
+            stats: Stats::new(),
             tmp: vec![0.0; BLOCK_SAMPLES],
             voice_buf: vec![0.0; BLOCK_SAMPLES],
             monitor_buf: vec![0.0; BLOCK_SAMPLES],
@@ -469,7 +480,7 @@ impl Io {
                     self.engine.set_mute(t, !m);
                 }
             }
-            Cmd::Shutdown(_) => unreachable!("handled by the loop"),
+            Cmd::Shutdown(_) => unreachable!("the control thread handles shutdown"),
         }
     }
 
@@ -495,13 +506,12 @@ impl Io {
                 self.open_devices();
             }
         }
-        self.next_scan = Instant::now();
+        self.running_flag.store(self.running(), Ordering::Relaxed);
     }
 
     fn open_devices(&mut self) {
         let d = self.devices.clone();
-        let monitor_dev = find_device(&self.en, eRender, d.monitor.as_deref());
-        self.monitor = match monitor_dev.as_ref().map(Output::open) {
+        self.monitor = match find_device(&self.en, eRender, d.monitor.as_deref()).as_ref().map(Output::open) {
             Some(Ok(o)) => Some(o),
             Some(Err(e)) => {
                 log::warn!("mixer: {e:#}");
@@ -512,21 +522,6 @@ impl Io {
                 None
             }
         };
-        self.sink = d.sink.as_deref().and_then(|n| {
-            let dev = find_device(&self.en, eRender, Some(n));
-            if dev.is_none() {
-                log::warn!("mixer: sink {n:?} not found; programs are not rerouted");
-            }
-            dev
-        });
-        // Rerouting onto the device we play the mix on would feed it back into itself.
-        let same = |a: &Option<IMMDevice>, b: &Option<IMMDevice>| {
-            matches!((a.as_ref().and_then(device_id), b.as_ref().and_then(device_id)), (Some(x), Some(y)) if x == y)
-        };
-        if same(&self.sink, &monitor_dev) {
-            log::error!("mixer: sink and monitor are the same device; programs are not rerouted");
-            self.sink = None;
-        }
         self.mic_out = d.mic_out.as_deref().and_then(|n| match find_device(&self.en, eRender, Some(n)) {
             Some(dev) => Output::open(&dev).map_err(|e| log::warn!("mixer: {e:#}")).ok(),
             None => {
@@ -542,76 +537,25 @@ impl Io {
             }
         };
         log::info!(
-            "mixer: monitor {:?}, Slidr Mic {:?}, sink {:?}",
+            "mixer: monitor {:?}, Slidr Mic {:?}",
             self.monitor.as_ref().map(|o| &o.name),
             self.mic_out.as_ref().map(|o| &o.name),
-            self.sink.as_ref().map(friendly_name),
         );
     }
 
     fn close_devices(&mut self) {
         self.captures.clear();
-        if let Some(r) = &mut self.router {
-            r.clear_all();
-        }
         self.voice = None;
         self.monitor = None;
         self.mic_out = None;
-        self.sink = None;
     }
 
-    /// Match running programs to channels; start/stop captures and routes.
-    fn scan(&mut self) {
-        let sessions = session_programs(&self.en);
-        let mut wanted: HashMap<u32, u32> = HashMap::new();
-        if self.running() {
-            for (pid, exe) in &sessions {
-                let hit = self.cfg.channels.iter().find(|c| {
-                    c.programs.iter().any(|p| crate::audio::wasapi::program_matches(p, *pid, exe))
-                });
-                if let Some(c) = hit {
-                    wanted.insert(*pid, c.id);
-                }
-            }
-            let parents = parent_pids();
-            let set: HashSet<u32> = wanted.keys().copied().collect();
-            wanted.retain(|pid, _| !has_ancestor_in(*pid, &set, &parents));
-        }
-
+    /// Start captures for new programs, drop those that left. Spawning only
+    /// starts a thread, so this is cheap enough for the audio thread.
+    fn set_captures(&mut self, wanted: HashMap<u32, u32>) {
         self.captures.retain(|pid, (ch, _)| wanted.get(pid) == Some(ch));
-        for (pid, ch) in &wanted {
-            if !self.captures.contains_key(pid) {
-                log::info!("mixer: capturing {} (pid {pid}) into channel {ch}", sessions[pid]);
-                self.captures.insert(*pid, (*ch, Capture::spawn(Source::Process(*pid))));
-            }
-        }
-
-        let reroute: HashSet<u32> = wanted
-            .iter()
-            .filter(|(_, ch)| self.cfg.channels.iter().any(|c| c.id == **ch && c.reroute))
-            .map(|(pid, _)| *pid)
-            .collect();
-        let can_route = self.router.is_some() && self.sink.is_some();
-        if let (Some(router), Some(sink)) = (&mut self.router, &self.sink) {
-            for pid in &reroute {
-                if !router.is_routed(*pid) {
-                    if let Err(e) = router.route(*pid, sink) {
-                        log::debug!("mixer: rerouting pid {pid} failed ({e}); retrying");
-                    }
-                }
-            }
-        }
-        if let Some(router) = &mut self.router {
-            if router.pending() {
-                let paths: HashMap<u32, String> = sessions
-                    .keys()
-                    .map(|pid| (*pid, crate::app_groups::process_path(*pid).unwrap_or_default()))
-                    .collect();
-                router.recover(&paths, &|pid| can_route && reroute.contains(&pid));
-            }
-        }
-        for c in &self.cfg.channels {
-            self.engine.set_monitored(c.id, self.running() && can_route && c.reroute);
+        for (pid, ch) in wanted {
+            self.captures.entry(pid).or_insert_with(|| (ch, Capture::spawn(Source::Process(pid))));
         }
     }
 
@@ -625,6 +569,9 @@ impl Io {
             None => std::thread::sleep(Duration::from_millis(10)),
         }
         for _ in 0..8 {
+            if self.monitor.as_ref().is_some_and(|o| o.queued() == 0) {
+                self.stats.monitor_dry += 1;
+            }
             let wants = self.monitor.as_ref().or(self.mic_out.as_ref()).is_some_and(|o| o.queued() < MONITOR_QUEUE);
             if !wants {
                 break;
@@ -636,7 +583,9 @@ impl Io {
     fn mix_block(&mut self) {
         let mut channels: HashMap<u32, Vec<f32>> = HashMap::new();
         for (ch, cap) in self.captures.values() {
-            cap.ring.pop(&mut self.tmp);
+            if !cap.ring.pop(&mut self.tmp) {
+                self.stats.underruns += 1;
+            }
             let sum = channels.entry(*ch).or_insert_with(|| vec![0.0; BLOCK_SAMPLES]);
             for (s, t) in sum.iter_mut().zip(&self.tmp) {
                 *s += t;
@@ -671,7 +620,168 @@ impl Io {
     fn reopen(&mut self) {
         self.close_devices();
         self.open_devices();
-        self.next_scan = Instant::now();
+        self.running_flag.store(self.running(), Ordering::Relaxed);
+    }
+}
+
+fn audio_thread(rx: Receiver<AudioCmd>, running_flag: Arc<AtomicBool>) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let en: IMMDeviceEnumerator = match unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) } {
+        Ok(en) => en,
+        Err(e) => {
+            log::error!("mixer: no audio device enumerator ({e}); mixer disabled");
+            return;
+        }
+    };
+    let mut audio = Audio::new(en, running_flag);
+    loop {
+        // While mixing, commands must not stall the audio; otherwise block.
+        let first = if audio.running() {
+            rx.try_recv().ok()
+        } else {
+            match rx.recv() {
+                Ok(c) => Some(c),
+                Err(_) => break,
+            }
+        };
+        for cmd in first.into_iter().chain(rx.try_iter()) {
+            match cmd {
+                AudioCmd::Mixer(c) => audio.handle(c),
+                AudioCmd::Capture(wanted) => audio.set_captures(wanted),
+                AudioCmd::Monitored(list) => {
+                    for (ch, on) in list {
+                        audio.engine.set_monitored(ch, on);
+                    }
+                }
+                AudioCmd::Stop(ack) => {
+                    audio.close_devices();
+                    audio.running_flag.store(false, Ordering::Relaxed);
+                    let _ = ack.send(());
+                    return;
+                }
+            }
+        }
+        if audio.running() {
+            audio.pump();
+            audio.stats.report();
+        }
+    }
+    audio.close_devices();
+}
+
+/// Control side: matches programs to channels, routes them, and feeds the
+/// audio thread.
+struct Control {
+    en: IMMDeviceEnumerator,
+    audio: crossbeam_channel::Sender<AudioCmd>,
+    audio_running: Arc<AtomicBool>,
+    router: Option<Router>,
+    cfg: MixerConfig,
+    devices: MixerDevices,
+    sink: Option<IMMDevice>,
+    /// What the audio thread was last told to capture (to log changes only).
+    capturing: HashMap<u32, u32>,
+}
+
+impl Control {
+    fn configure(&mut self, cfg: MixerConfig, devices: MixerDevices) {
+        if devices != self.devices {
+            self.sink = devices.sink.as_deref().and_then(|n| {
+                let dev = find_device(&self.en, eRender, Some(n));
+                if dev.is_none() {
+                    log::warn!("mixer: silent output {n:?} not found; programs are not rerouted");
+                }
+                dev
+            });
+            // Rerouting onto the device the mix plays on would feed it back into itself.
+            let monitor = find_device(&self.en, eRender, devices.monitor.as_deref()).as_ref().and_then(device_id);
+            if self.sink.as_ref().and_then(device_id).is_some_and(|s| Some(s) == monitor) {
+                log::error!("mixer: silent output and headphones are the same device; programs are not rerouted");
+                self.sink = None;
+            }
+            // Nor onto the Slidr Mic's cable: the programs would end up in Discord.
+            let sink_adapter = self.sink.as_ref().map(friendly_name);
+            if sink_adapter.as_deref().and_then(super::adapter).is_some_and(|a| Some(a) == devices.mic_out.as_deref().and_then(super::adapter)) {
+                log::error!("mixer: silent output is the Slidr Mic's cable; programs are not rerouted");
+                self.sink = None;
+            }
+            log::info!("mixer: silent output {:?}", self.sink.as_ref().map(friendly_name));
+        }
+        if !cfg.enabled {
+            if let Some(r) = &mut self.router {
+                r.clear_all();
+            }
+        }
+        self.cfg = cfg.clone();
+        self.devices = devices.clone();
+        let _ = self.audio.send(AudioCmd::Mixer(Cmd::Configure(cfg, devices)));
+    }
+
+    /// Match running programs to channels; update captures and routes.
+    fn scan(&mut self) {
+        let sessions = session_programs(&self.en);
+        let mut wanted: HashMap<u32, u32> = HashMap::new();
+        if self.cfg.enabled && self.audio_running.load(Ordering::Relaxed) {
+            for (pid, exe) in &sessions {
+                let hit = self.cfg.channels.iter().find(|c| {
+                    c.programs.iter().any(|p| crate::audio::wasapi::program_matches(p, *pid, exe))
+                });
+                if let Some(c) = hit {
+                    wanted.insert(*pid, c.id);
+                }
+            }
+            let parents = parent_pids();
+            let set: HashSet<u32> = wanted.keys().copied().collect();
+            wanted.retain(|pid, _| !has_ancestor_in(*pid, &set, &parents));
+        }
+        if wanted != self.capturing {
+            for (pid, ch) in &wanted {
+                if self.capturing.get(pid) != Some(ch) {
+                    log::info!("mixer: capturing {} (pid {pid}) into channel {ch}", sessions[pid]);
+                }
+            }
+            self.capturing = wanted.clone();
+            let _ = self.audio.send(AudioCmd::Capture(wanted.clone()));
+        }
+
+        let reroute: HashSet<u32> = wanted
+            .iter()
+            .filter(|(_, ch)| self.cfg.channels.iter().any(|c| c.id == **ch && c.reroute))
+            .map(|(pid, _)| *pid)
+            .collect();
+        let can_route = self.router.is_some() && self.sink.is_some();
+        if let (Some(router), Some(sink)) = (&mut self.router, &self.sink) {
+            for pid in &reroute {
+                if !router.is_routed(*pid) {
+                    if let Err(e) = router.route(*pid, sink) {
+                        log::debug!("mixer: rerouting pid {pid} failed ({e}); retrying");
+                    }
+                }
+            }
+        }
+        if let Some(router) = &mut self.router {
+            if router.pending() {
+                let paths: HashMap<u32, String> = sessions
+                    .keys()
+                    .map(|pid| (*pid, crate::app_groups::process_path(*pid).unwrap_or_default()))
+                    .collect();
+                router.recover(&paths, &|pid| can_route && reroute.contains(&pid));
+            }
+        }
+        let monitored = self.cfg.channels.iter().map(|c| (c.id, can_route && c.reroute)).collect();
+        let _ = self.audio.send(AudioCmd::Monitored(monitored));
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(r) = &mut self.router {
+            r.clear_all();
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        if self.audio.send(AudioCmd::Stop(tx)).is_ok() {
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+        }
     }
 }
 
@@ -686,35 +796,83 @@ pub fn run(rx: Receiver<Cmd>) {
             return;
         }
     };
-    let mut io = Io::new(en);
+    let (audio_tx, audio_rx) = crossbeam_channel::unbounded();
+    let audio_running = Arc::new(AtomicBool::new(false));
+    {
+        let flag = audio_running.clone();
+        if let Err(e) = std::thread::Builder::new().name("mixer-audio".into()).spawn(move || audio_thread(audio_rx, flag)) {
+            log::error!("mixer: could not start the audio thread: {e}");
+            return;
+        }
+    }
+    let mut control = Control {
+        en,
+        audio: audio_tx,
+        audio_running,
+        router: Router::new(),
+        cfg: MixerConfig::default(),
+        devices: MixerDevices::default(),
+        sink: None,
+        capturing: HashMap::new(),
+    };
+    let mut next_scan = Instant::now();
     loop {
-        // While mixing, commands must not stall the audio; otherwise block.
-        let first = if io.running() {
-            rx.try_recv().ok()
-        } else {
-            match rx.recv_timeout(SCAN_EVERY) {
-                Ok(c) => Some(c),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-        };
-        for cmd in first.into_iter().chain(rx.try_iter()) {
-            if let Cmd::Shutdown(ack) = cmd {
-                io.close_devices();
+        let wait = next_scan.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(wait) {
+            Ok(Cmd::Shutdown(ack)) => {
+                control.shutdown();
                 let _ = ack.send(());
                 return;
             }
-            io.handle(cmd);
-        }
-        if Instant::now() >= io.next_scan {
-            io.next_scan = Instant::now() + SCAN_EVERY;
-            io.scan();
-        }
-        if io.running() {
-            io.pump();
+            Ok(Cmd::Configure(cfg, devices)) => {
+                control.configure(cfg, devices);
+                // Let the audio thread open its devices before matching programs.
+                next_scan = Instant::now() + Duration::from_millis(200);
+            }
+            Ok(cmd) => {
+                let _ = control.audio.send(AudioCmd::Mixer(cmd));
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let t = Instant::now();
+                control.scan();
+                if t.elapsed() > Duration::from_millis(250) {
+                    log::debug!("mixer: scan took {} ms", t.elapsed().as_millis());
+                }
+                next_scan = Instant::now() + SCAN_EVERY;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    io.close_devices();
+    control.shutdown();
+}
+
+/// Glitch counters, logged every few seconds while something went wrong —
+/// the way to tell a starving device from a starving capture.
+struct Stats {
+    since: Instant,
+    /// Program capture had less than a block when the mix needed one.
+    underruns: u32,
+    /// The monitor had played everything queued before we refilled it.
+    monitor_dry: u32,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self { since: Instant::now(), underruns: 0, monitor_dry: 0 }
+    }
+
+    fn report(&mut self) {
+        if self.since.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        if self.underruns > 0 || self.monitor_dry > 0 {
+            log::info!(
+                "mixer: last 5 s: {} capture underruns, monitor ran dry {} times",
+                self.underruns, self.monitor_dry
+            );
+        }
+        *self = Self::new();
+    }
 }
 
 #[cfg(test)]
@@ -737,7 +895,7 @@ mod tests {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
         let en: IMMDeviceEnumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).unwrap() };
-        let mut io = Io::new(en);
+        let mut io = Audio::new(en, Default::default());
         let devices = MixerDevices {
             monitor: env("SLIDR_TEST_MONITOR"),
             mic_input: env("SLIDR_TEST_MIC"),
@@ -754,7 +912,7 @@ mod tests {
         // (what this process played, mic input, Slidr Mic bus) over `secs`.
         // Input and bus are compared block by block, so the room changing
         // between two measurements doesn't matter.
-        let mut measure = |io: &mut Io, secs: u64| -> (f64, f64, f64) {
+        let mut measure = |io: &mut Audio, secs: u64| -> (f64, f64, f64) {
             let (mut tapped, mut n_tap, mut input, mut bus, mut n) = (0f64, 0usize, 0f64, 0f64, 0usize);
             let mut block = vec![0.0; BLOCK_SAMPLES];
             let end = Instant::now() + Duration::from_secs(secs);

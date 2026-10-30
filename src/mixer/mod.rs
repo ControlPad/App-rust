@@ -21,6 +21,14 @@ use once_cell::sync::OnceCell;
 
 use crate::model::{MixTarget, MixerConfig, MixerDevices};
 
+/// The audio adapter in an endpoint's friendly name — the part in the last
+/// parentheses: "CABLE Output (VB-Audio Virtual Cable)" → "VB-Audio Virtual Cable".
+/// Both ends of a virtual cable share it.
+pub fn adapter(name: &str) -> Option<&str> {
+    let open = name.rfind('(')?;
+    name[open + 1..].strip_suffix(')').map(str::trim)
+}
+
 /// Journal of programs rerouted by the mixer, in the config folder.
 const JOURNAL_FILE: &str = "mixer-routing.json";
 

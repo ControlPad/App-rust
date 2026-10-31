@@ -3,9 +3,10 @@
 //! change together.
 //!
 //! Sounds are `<name>_on.wav` / `<name>_off.wav` (16-bit PCM, 48 kHz, mono or
-//! stereo) read from a folder and re-read when a file changes, so they can be
-//! tuned while Slidr runs. They play on the monitor only, never into the
-//! Slidr Mic.
+//! stereo), built into Slidr from `assets/sounds/<set>/`. To tune them while
+//! Slidr runs, point `SLIDR_SOUND_DIR` at a folder with the same layout
+//! (`<dir>/sets/<set>/`): its files are used instead and re-read when one
+//! changes. They play on the monitor only, never into the Slidr Mic.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -29,11 +30,45 @@ pub const SFX_GAIN: f32 = 0.8;
 pub const SETS: [(&str, &str); 3] = [("tide", "Tide"), ("grid", "Grid"), ("grain", "Grain")];
 pub const DEFAULT_SET: &str = "tide";
 
-/// Where the sounds are read from: `SLIDR_SOUND_DIR`, else `~/mixer-sounds`
-/// (while they are being designed; they move into the repo once settled).
-/// Each set is a folder `sets/<id>` in there.
+/// A folder to read the sounds from instead of the built-in ones, for
+/// tuning them: `SLIDR_SOUND_DIR`. Each set is a folder `sets/<id>` in there.
 pub fn sound_dir() -> Option<PathBuf> {
-    std::env::var_os("SLIDR_SOUND_DIR").map(PathBuf::from).or_else(|| dirs::home_dir().map(|h| h.join("mixer-sounds")))
+    std::env::var_os("SLIDR_SOUND_DIR").map(PathBuf::from)
+}
+
+/// The sounds Slidr plays, per set: power, mute, the "Replace original" and
+/// "Into Slidr Mic" switches, and the EQ sound used by "Effects & EQ".
+macro_rules! built_in {
+    ($($set:literal),*) => {
+        &[$(($set, &[
+            built_in!(@ $set, "power_on"), built_in!(@ $set, "power_off"),
+            built_in!(@ $set, "mute_on"), built_in!(@ $set, "mute_off"),
+            built_in!(@ $set, "replace_on"), built_in!(@ $set, "replace_off"),
+            built_in!(@ $set, "mic_on"), built_in!(@ $set, "mic_off"),
+            built_in!(@ $set, "eq_on"), built_in!(@ $set, "eq_off"),
+        ])),*]
+    };
+    (@ $set:literal, $name:literal) => {
+        ($name, include_bytes!(concat!("../../assets/sounds/", $set, "/", $name, ".wav")) as &[u8])
+    };
+}
+
+type BuiltInSet = (&'static str, &'static [(&'static str, &'static [u8])]);
+const BUILT_IN: &[BuiltInSet] = built_in!("tide", "grid", "grain");
+
+/// The built-in sounds of `set`, decoded.
+fn built_in_set(set: &str) -> HashMap<String, Sound> {
+    let Some((_, files)) = BUILT_IN.iter().find(|(s, _)| *s == set) else { return HashMap::new() };
+    files
+        .iter()
+        .filter_map(|(name, bytes)| match parse_wav(bytes) {
+            Some(s) => Some((name.to_string(), Arc::new(s))),
+            None => {
+                log::warn!("mixer: built-in sound {set}/{name} is not 16-bit PCM at 48 kHz");
+                None
+            }
+        })
+        .collect()
 }
 
 /// 16-bit PCM WAV at 48 kHz → mono samples. Anything else is refused.
@@ -74,7 +109,8 @@ pub fn parse_wav(bytes: &[u8]) -> Option<Vec<f32>> {
     })
 }
 
-/// The chosen set's folder, re-read file by file when something changed.
+/// The chosen set's sounds: the built-in ones, or — while tuning — its
+/// folder, re-read file by file when something changed.
 pub struct Library {
     set: String,
     files: HashMap<String, (SystemTime, Sound)>,
@@ -99,9 +135,19 @@ impl Library {
         true
     }
 
-    /// Pick up added, changed and removed files. `true` if anything changed.
+    /// Load the set, or pick up added, changed and removed files when tuning
+    /// from a folder. `true` if anything changed.
     pub fn refresh(&mut self) -> bool {
-        let Some(dir) = sound_dir().map(|d| d.join("sets").join(&self.set)) else { return false };
+        let Some(dir) = sound_dir().map(|d| d.join("sets").join(&self.set)) else {
+            if !self.files.is_empty() {
+                return false;
+            }
+            self.files = built_in_set(&self.set)
+                .into_iter()
+                .map(|(n, s)| (n, (SystemTime::UNIX_EPOCH, s)))
+                .collect();
+            return !self.files.is_empty();
+        };
         let Ok(entries) = std::fs::read_dir(&dir) else {
             let had = !self.files.is_empty();
             self.files.clear();
@@ -370,6 +416,17 @@ mod tests {
         assert_eq!(fades.slot(MixTarget::Channel(1), 7), 900);
         let own: Sounds = [("effects_off".to_string(), Arc::new(vec![0.0; 400])), ("eq_off".to_string(), Arc::new(vec![0.0; 900]))].into();
         assert_eq!(diff(&a, &b, &|_| None, &|_| None, &own).1.slot(MixTarget::Channel(1), 7), 400);
+    }
+
+    #[test]
+    fn every_set_is_built_in_and_decodes() {
+        for (set, _) in SETS {
+            let sounds = built_in_set(set);
+            assert_eq!(sounds.len(), 10, "{set}");
+            for name in ["power_on", "power_off", "mute_on", "mute_off", "replace_on", "replace_off", "mic_on", "mic_off", "eq_on", "eq_off"] {
+                assert!(sounds.get(name).is_some_and(|s| !s.is_empty()), "{set}/{name}");
+            }
+        }
     }
 
     #[test]

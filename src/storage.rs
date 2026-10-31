@@ -71,7 +71,9 @@ pub fn list_presets() -> Vec<String> {
 pub fn load_preset(name: &str) -> anyhow::Result<Preset> {
     let path = presets_dir().join(name).join("preset.json");
     let data = fs::read_to_string(&path).with_context(|| format!("read {path:?}"))?;
-    let preset: Preset = serde_json::from_str(&data)?;
+    let mut preset: Preset = serde_json::from_str(&data)?;
+    // The microphone used to be picked on the Mixer page (a global setting).
+    preset.move_voice_to_channel(load_settings().mixer_devices.mic_input.as_deref());
     Ok(preset)
 }
 

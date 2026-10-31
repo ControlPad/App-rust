@@ -22,12 +22,17 @@ pub struct AudioStream {
     /// percent substituted for `{value}`) instead of controlling audio volume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiCall>,
+    /// When set, the slider drives a level inside Slidr's own mixer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixer: Option<MixTarget>,
 }
 
 impl AudioStream {
     pub fn label(&self) -> String {
         if let Some(api) = &self.api {
             api.label()
+        } else if let Some(m) = &self.mixer {
+            format!("mixer: {}", m.key())
         } else if let Some(p) = &self.process {
             crate::app_groups::label_for(p)
         } else if let Some(m) = &self.mic_name {
@@ -137,6 +142,8 @@ pub enum ActionKind {
     KeyPress,
     CycleOutput,
     ApiCall,
+    /// Toggle mute of a mixer strip (`ButtonAction::mixer`).
+    MuteMixer,
 }
 
 impl ActionKind {
@@ -150,6 +157,7 @@ impl ActionKind {
             Self::KeyPress => "Simulate key",
             Self::CycleOutput => "Cycle output device",
             Self::ApiCall => "API call",
+            Self::MuteMixer => "Mute mixer channel",
         }
     }
 }
@@ -172,6 +180,9 @@ pub struct ButtonAction {
     /// HTTP request config, used when `kind == ApiCall`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiCall>,
+    /// Mixer strip, used when `kind == MuteMixer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixer: Option<MixTarget>,
 }
 
 // ── LED control (experimental: buttons 5/6/7 → board LEDs A0/A1/D13) ─────────
@@ -503,6 +514,49 @@ pub struct Settings {
     /// Last loaded profile name (sticky across launches).
     #[serde(default)]
     pub active_preset: String,
+
+    /// Devices the software mixer plays to and records from. Machine-specific,
+    /// so global rather than per profile.
+    #[serde(default)]
+    pub mixer_devices: MixerDevices,
+
+    /// Effect chains saved by the user, offered on every profile's strips.
+    #[serde(default)]
+    pub fx_presets: Vec<FxPreset>,
+
+    /// Short sounds when mixer things are switched (see `mixer::sfx`).
+    #[serde(default = "default_true")]
+    pub mixer_sounds: bool,
+    /// Their volume, 0..1.
+    #[serde(default = "default_sound_volume")]
+    pub mixer_sound_volume: f32,
+    /// Which set they come from (`crate::mixer::SOUND_SETS`).
+    #[serde(default = "default_sound_set")]
+    pub mixer_sound_set: String,
+    /// EQ curves saved by the user, offered on every profile's strips.
+    #[serde(default)]
+    pub eq_presets: Vec<EqPreset>,
+
+    /// Show the Sliders / Buttons lists as a grid of cards.
+    #[serde(default)]
+    pub grid_sliders: bool,
+    #[serde(default)]
+    pub grid_buttons: bool,
+
+    /// Sidebar tabs in display order, by name (see `crate::sidebar`).
+    #[serde(default)]
+    pub nav_order: Vec<String>,
+    /// Tabs hidden from the sidebar. Settings can't be hidden.
+    #[serde(default)]
+    pub nav_hidden: Vec<String>,
+}
+
+fn default_sound_volume() -> f32 {
+    0.8
+}
+
+fn default_sound_set() -> String {
+    crate::mixer::DEFAULT_SOUND_SET.into()
 }
 
 impl Default for Settings {
@@ -517,6 +571,16 @@ impl Default for Settings {
             discord_client_secret: String::new(),
             update_check: true,
             active_preset: "Default".into(),
+            mixer_devices: MixerDevices::default(),
+            fx_presets: Vec::new(),
+            mixer_sounds: true,
+            mixer_sound_volume: default_sound_volume(),
+            mixer_sound_set: default_sound_set(),
+            eq_presets: Vec::new(),
+            grid_sliders: false,
+            grid_buttons: false,
+            nav_order: Vec::new(),
+            nav_hidden: Vec::new(),
         }
     }
 }
@@ -599,6 +663,9 @@ pub struct Preset {
     /// See [`crate::version`] for why the comparison only matters downwards.
     #[serde(default)]
     pub app_version: String,
+    /// Software mixer channels of this profile (see `docs/mixer-plan.md`).
+    #[serde(default)]
+    pub mixer: MixerConfig,
 }
 
 impl Preset {
@@ -628,6 +695,49 @@ pub fn next_id<T, F: Fn(&T) -> u32>(existing: &[T], id_of: F) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_strip_becomes_a_microphone_channel_once() {
+        let mut p: Preset = serde_json::from_str(r#"{"id":1,"name":"P"}"#).unwrap();
+        p.mixer.channels.push(MixChannel {
+            id: 4,
+            name: "Music".into(),
+            programs: vec!["spotify".into()],
+            level: 1.0,
+            muted: false,
+            fx: Effects::default(),
+            reroute: true,
+            mic_send: None,
+            collapsed: false,
+        });
+        p.mixer.voice.level = 0.25;
+        p.slider_categories.push(SliderCategory {
+            id: 1,
+            name: "Mic".into(),
+            streams: vec![AudioStream { mixer: Some(MixTarget::Voice), ..Default::default() }],
+            collapsed: false,
+        });
+        assert!(p.move_voice_to_channel(Some("Mikrofon (RX)")));
+        let mic = &p.mixer.channels[0];
+        assert_eq!((mic.id, mic.mics().collect::<Vec<_>>()), (5, vec!["Mikrofon (RX)"]));
+        assert_eq!((mic.level, mic.mic_send), (0.0, Some(0.25)), "not heard, sent as before");
+        assert!(mic.mics_only() && !p.mixer.channels[1].mics_only());
+        assert_eq!(p.slider_categories[0].streams[0].mixer, Some(MixTarget::Send(5)));
+        assert!(!p.move_voice_to_channel(None), "only once");
+        assert_eq!(p.mixer.channels.len(), 2);
+    }
+
+    #[test]
+    fn preset_files_say_what_they_hold() {
+        let eq = PresetFile::Eq(MixerConfig::default_eq_presets().remove(0));
+        let json = serde_json::to_string(&eq).unwrap();
+        assert!(json.contains("\"slidr_preset\":\"eq\""));
+        assert_eq!(serde_json::from_str::<PresetFile>(&json).unwrap(), eq);
+        let fx = PresetFile::Effects(FxPreset::built_in().remove(0));
+        let back: PresetFile = serde_json::from_str(&serde_json::to_string(&fx).unwrap()).unwrap();
+        assert_eq!(back, fx);
+        assert!(serde_json::from_str::<PresetFile>("{\"name\":\"x\"}").is_err());
+    }
 
     #[test]
     fn next_id_grows() {
@@ -665,4 +775,579 @@ mod tests {
         );
         assert_eq!(AudioStream::default().label(), "default output");
     }
+
+    #[test]
+    fn effects_from_before_chains_become_a_chain() {
+        let old = r#"{"eq_on": true, "eq": [{"kind": "peak", "freq": 1000.0, "gain_db": 3.0}],
+            "gate": {"on": true, "threshold_db": -50.0, "release_ms": 150.0},
+            "comp": {"on": false, "threshold_db": -20.0},
+            "limit": {"on": true, "ceiling_db": -2.0}}"#;
+        let fx: Effects = serde_json::from_str(old).unwrap();
+        let kinds: Vec<&str> = fx.chain.iter().map(|s| s.fx.name()).collect();
+        assert_eq!(kinds, ["Noise gate", "EQ", "Limiter"], "only what was on, in the old order");
+        assert!(matches!(fx.chain[0].fx, Fx::Gate(Gate { threshold_db, .. }) if threshold_db == -50.0));
+        assert!(matches!(fx.chain[2].fx, Fx::Limiter(Limiter { ceiling_db }) if ceiling_db == -2.0));
+    }
+
+    #[test]
+    fn chain_round_trips() {
+        let fx = Effects { on: false, chain: FxPreset::built_in().remove(1).chain };
+        let json = serde_json::to_string(&fx).unwrap();
+        assert!(json.contains("\"type\":\"compressor\""), "{json}");
+        assert_eq!(serde_json::from_str::<Effects>(&json).unwrap(), fx);
+    }
+}
+
+// ── Software mixer (see docs/mixer-plan.md) ─────────────────────────────────
+
+/// One strip of the mixer a slider or button can address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MixTarget {
+    /// The real microphone's strip (what goes into the Slidr Mic).
+    Voice,
+    /// A program channel's level (by `MixChannel::id`).
+    Channel(u32),
+    /// How much of a program channel goes into the Slidr Mic.
+    Send(u32),
+}
+
+impl MixTarget {
+    /// Stable short form, also used as a map key.
+    pub fn key(&self) -> String {
+        match self {
+            Self::Voice => "voice".into(),
+            Self::Channel(id) => format!("channel {id}"),
+            Self::Send(id) => format!("send {id}"),
+        }
+    }
+
+    /// Compact text form for the UI's string-valued pickers: `voice`,
+    /// `channel:<id>`, `send:<id>`.
+    pub fn to_value(&self) -> String {
+        match self {
+            Self::Voice => "voice".into(),
+            Self::Channel(id) => format!("channel:{id}"),
+            Self::Send(id) => format!("send:{id}"),
+        }
+    }
+
+    pub fn from_value(v: &str) -> Option<Self> {
+        if v == "voice" {
+            return Some(Self::Voice);
+        }
+        let (kind, id) = v.split_once(':')?;
+        let id = id.parse().ok()?;
+        match kind {
+            "channel" => Some(Self::Channel(id)),
+            "send" => Some(Self::Send(id)),
+            _ => None,
+        }
+    }
+}
+
+impl MixerConfig {
+    /// What a strip is called in lists ("Music", "Music → Slidr Mic", …).
+    pub fn label(&self, target: MixTarget) -> String {
+        let name = |id: u32| {
+            self.channels
+                .iter()
+                .find(|c| c.id == id)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("Channel {id}"))
+        };
+        match target {
+            MixTarget::Voice => "Voice (microphone)".into(),
+            MixTarget::Channel(id) => name(id),
+            MixTarget::Send(id) => format!("{} → Slidr Mic", name(id)),
+        }
+    }
+
+    /// A strip's saved fader position.
+    pub fn level(&self, t: MixTarget) -> Option<f32> {
+        match t {
+            MixTarget::Voice => Some(self.voice.level),
+            MixTarget::Channel(id) => self.channels.iter().find(|c| c.id == id).map(|c| c.level),
+            MixTarget::Send(id) => self.channels.iter().find(|c| c.id == id).and_then(|c| c.mic_send),
+        }
+    }
+
+    /// Built-in EQ starting points, offered by the EQ editor.
+    pub fn default_eq_presets() -> Vec<EqPreset> {
+        use EqBandKind::*;
+        let b = |kind, freq, gain_db, q| EqBand { kind, freq, gain_db, q };
+        let q = default_q();
+        vec![
+            EqPreset {
+                id: 1,
+                name: "Voice clarity".into(),
+                bands: vec![b(HighPass, 80.0, 0.0, q), b(LowShelf, 200.0, -2.0, q), b(Peak, 3000.0, 3.0, 1.0), b(HighShelf, 10000.0, 2.0, q)],
+            },
+            EqPreset {
+                id: 2,
+                name: "Warm voice".into(),
+                bands: vec![b(HighPass, 70.0, 0.0, q), b(Peak, 250.0, 2.0, 0.8), b(HighShelf, 8000.0, -2.0, q)],
+            },
+            EqPreset { id: 3, name: "Bass boost".into(), bands: vec![b(LowShelf, 120.0, 6.0, q)] },
+            EqPreset { id: 4, name: "Treble boost".into(), bands: vec![b(HighShelf, 6000.0, 5.0, q)] },
+            EqPreset {
+                id: 5,
+                name: "Loudness".into(),
+                bands: vec![b(LowShelf, 100.0, 4.0, q), b(HighShelf, 8000.0, 3.0, q)],
+            },
+        ]
+    }
+}
+
+/// Mixer layout of a profile.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MixerConfig {
+    /// Off by default: the mixer reroutes programs, which nobody should get by
+    /// surprise after an update.
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub channels: Vec<MixChannel>,
+    /// The old fixed microphone strip; see [`Preset::move_voice_to_channel`].
+    #[serde(default)]
+    pub voice: VoiceStrip,
+    /// Set once the voice strip became a channel.
+    #[serde(default)]
+    pub voice_moved: bool,
+    #[serde(default)]
+    pub eq_presets: Vec<EqPreset>,
+}
+
+/// A channel source that is a microphone, not a program: `@mic:<device>`,
+/// an empty device meaning the system default.
+pub const MIC_PREFIX: &str = "@mic:";
+
+impl MixChannel {
+    /// The microphones among the sources ("" = system default).
+    pub fn mics(&self) -> impl Iterator<Item = &str> {
+        self.programs.iter().filter_map(|p| p.strip_prefix(MIC_PREFIX))
+    }
+
+    /// Only microphones, no programs: nothing plays these anywhere else, so
+    /// the channel's fader is simply how loud you hear them.
+    pub fn mics_only(&self) -> bool {
+        !self.programs.is_empty() && self.programs.iter().all(|p| p.starts_with(MIC_PREFIX))
+    }
+}
+
+impl Preset {
+    /// Older layouts had a fixed voice strip fed by the microphone chosen on
+    /// the page. The microphone is now a source in a channel like any
+    /// program: turn the strip into a "Microphone" channel (once) and point
+    /// board controls that drove it at that channel. `true` if it changed.
+    pub fn move_voice_to_channel(&mut self, mic: Option<&str>) -> bool {
+        let m = &mut self.mixer;
+        if m.voice_moved {
+            return false;
+        }
+        m.voice_moved = true;
+        let v = std::mem::take(&mut m.voice);
+        let id = m.channels.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        m.channels.insert(0, MixChannel {
+            id,
+            name: "Microphone".into(),
+            programs: vec![format!("{MIC_PREFIX}{}", mic.unwrap_or(""))],
+            // The strip's level was what went into the Slidr Mic; you heard
+            // yourself only with "hear yourself" on.
+            level: if v.to_monitor { v.level } else { 0.0 },
+            muted: v.muted,
+            fx: v.fx,
+            reroute: false,
+            mic_send: Some(v.level),
+            collapsed: false,
+        });
+        for c in &mut self.slider_categories {
+            for s in &mut c.streams {
+                if s.mixer == Some(MixTarget::Voice) {
+                    s.mixer = Some(MixTarget::Send(id));
+                }
+            }
+        }
+        for c in &mut self.button_categories {
+            for a in &mut c.actions {
+                if a.mixer == Some(MixTarget::Voice) {
+                    a.mixer = Some(MixTarget::Channel(id));
+                }
+            }
+        }
+        true
+    }
+}
+
+/// A group of programs mixed as one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MixChannel {
+    pub id: u32,
+    pub name: String,
+    /// Process names, paths or `@group:<id>` refs, as for sliders.
+    #[serde(default)]
+    pub programs: Vec<String>,
+    /// Fader position in [0, 1].
+    #[serde(default = "default_level")]
+    pub level: f32,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub fx: Effects,
+    /// Move the programs to the sink so only Slidr's mix is heard. Off = the
+    /// program keeps playing normally and is only copied into the Slidr Mic.
+    #[serde(default = "default_true")]
+    pub reroute: bool,
+    /// Share of this channel in the Slidr Mic, [0, 1]; `None` = not sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mic_send: Option<f32>,
+    /// Folded on the Mixer page (only the header and level show).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapsed: bool,
+}
+
+/// The real microphone's strip.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VoiceStrip {
+    #[serde(default = "default_level")]
+    pub level: f32,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub fx: Effects,
+    /// Also play the voice on the monitor (hear yourself).
+    #[serde(default)]
+    pub to_monitor: bool,
+}
+
+impl Default for VoiceStrip {
+    fn default() -> Self {
+        Self { level: default_level(), muted: false, fx: Effects::default(), to_monitor: false }
+    }
+}
+
+/// A strip's effect chain, processed top to bottom. The same effect may
+/// appear more than once (two compressors, an EQ on each side of one).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "EffectsFile")]
+pub struct Effects {
+    /// Master switch: off bypasses the whole chain, keeping every setting.
+    #[serde(default = "default_true")]
+    pub on: bool,
+    #[serde(default)]
+    pub chain: Vec<FxSlot>,
+}
+
+impl Default for Effects {
+    fn default() -> Self {
+        Self { on: true, chain: Vec::new() }
+    }
+}
+
+impl Effects {
+    /// How many effects are on (shown on the strip's button).
+    pub fn active(&self) -> usize {
+        self.chain.iter().filter(|s| s.on).count()
+    }
+
+    /// A free slot id within this chain.
+    pub fn next_id(&self) -> u32 {
+        self.chain.iter().map(|s| s.id).max().unwrap_or(0) + 1
+    }
+
+    pub fn slot_mut(&mut self, id: u32) -> Option<&mut FxSlot> {
+        self.chain.iter_mut().find(|s| s.id == id)
+    }
+}
+
+/// One effect in a chain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FxSlot {
+    /// Unique within its chain; lets the running effect keep its state when
+    /// the chain is reordered or edited.
+    pub id: u32,
+    #[serde(default = "default_true")]
+    pub on: bool,
+    #[serde(flatten)]
+    pub fx: Fx,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Fx {
+    Gate(Gate),
+    Eq { bands: Vec<EqBand> },
+    Compressor(Compressor),
+    Normalizer(Normalizer),
+    Limiter(Limiter),
+}
+
+impl Fx {
+    /// Every effect the "Add effect" list offers, with default settings.
+    pub fn catalog() -> Vec<Fx> {
+        vec![
+            Fx::Gate(Gate::default()),
+            Fx::Eq { bands: Vec::new() },
+            Fx::Compressor(Compressor::default()),
+            Fx::Normalizer(Normalizer::default()),
+            Fx::Limiter(Limiter::default()),
+        ]
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Fx::Gate(_) => "Noise gate",
+            Fx::Eq { .. } => "EQ",
+            Fx::Compressor(_) => "Compressor",
+            Fx::Normalizer(_) => "Normalizer",
+            Fx::Limiter(_) => "Limiter",
+        }
+    }
+}
+
+/// Silences the strip while it stays below `threshold_db` (room noise between words).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Gate {
+    pub threshold_db: f32,
+    pub release_ms: f32,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self { threshold_db: -45.0, release_ms: 150.0 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Compressor {
+    pub threshold_db: f32,
+    pub ratio: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+    pub makeup_db: f32,
+}
+
+impl Default for Compressor {
+    fn default() -> Self {
+        Self { threshold_db: -20.0, ratio: 3.0, attack_ms: 10.0, release_ms: 150.0, makeup_db: 0.0 }
+    }
+}
+
+/// Slowly steers the average loudness to `target_db` (RMS), by at most `max_gain_db`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Normalizer {
+    pub target_db: f32,
+    pub max_gain_db: f32,
+}
+
+impl Default for Normalizer {
+    fn default() -> Self {
+        Self { target_db: -18.0, max_gain_db: 12.0 }
+    }
+}
+
+/// Keeps peaks under `ceiling_db`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Limiter {
+    pub ceiling_db: f32,
+}
+
+impl Default for Limiter {
+    fn default() -> Self {
+        Self { ceiling_db: -1.0 }
+    }
+}
+
+/// On-disk form of [`Effects`]: the chain, or — in profiles written before
+/// chains existed — one fixed slot per effect, which is turned into a chain.
+#[derive(Deserialize)]
+struct EffectsFile {
+    #[serde(default = "default_true")]
+    on: bool,
+    #[serde(default)]
+    chain: Option<Vec<FxSlot>>,
+    #[serde(default)]
+    eq_on: bool,
+    #[serde(default)]
+    eq: Vec<EqBand>,
+    #[serde(default)]
+    gate: Option<OldSlot<Gate>>,
+    #[serde(default)]
+    comp: Option<OldSlot<Compressor>>,
+    #[serde(default)]
+    norm: Option<OldSlot<Normalizer>>,
+    #[serde(default)]
+    limit: Option<OldSlot<Limiter>>,
+}
+
+#[derive(Deserialize)]
+struct OldSlot<T> {
+    #[serde(default)]
+    on: bool,
+    #[serde(flatten)]
+    params: T,
+}
+
+impl From<EffectsFile> for Effects {
+    fn from(f: EffectsFile) -> Self {
+        if let Some(chain) = f.chain {
+            return Self { on: f.on, chain };
+        }
+        // Old fixed order: gate → EQ → compressor → normalizer → limiter.
+        // Only what was in use carries over.
+        let mut chain = Vec::new();
+        let mut push = |on: bool, fx: Fx| chain.push(FxSlot { id: chain.len() as u32 + 1, on, fx });
+        if let Some(g) = f.gate.filter(|g| g.on) {
+            push(true, Fx::Gate(g.params));
+        }
+        if f.eq_on || !f.eq.is_empty() {
+            push(f.eq_on, Fx::Eq { bands: f.eq });
+        }
+        if let Some(c) = f.comp.filter(|c| c.on) {
+            push(true, Fx::Compressor(c.params));
+        }
+        if let Some(n) = f.norm.filter(|n| n.on) {
+            push(true, Fx::Normalizer(n.params));
+        }
+        if let Some(l) = f.limit.filter(|l| l.on) {
+            push(true, Fx::Limiter(l.params));
+        }
+        Self { on: true, chain }
+    }
+}
+
+/// A saved effect chain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FxPreset {
+    pub name: String,
+    pub chain: Vec<FxSlot>,
+}
+
+impl FxPreset {
+    /// Chains that ship with Slidr.
+    pub fn built_in() -> Vec<FxPreset> {
+        use EqBandKind::*;
+        let q = default_q();
+        let b = |kind, freq, gain_db, q| EqBand { kind, freq, gain_db, q };
+        let preset = |name: &str, fx: Vec<Fx>| FxPreset {
+            name: name.into(),
+            chain: fx.into_iter().enumerate().map(|(i, fx)| FxSlot { id: i as u32 + 1, on: true, fx }).collect(),
+        };
+        vec![
+            preset("Voice – clean", vec![
+                Fx::Gate(Gate { threshold_db: -45.0, release_ms: 150.0 }),
+                Fx::Eq { bands: vec![b(HighPass, 80.0, 0.0, q), b(LowShelf, 200.0, -2.0, q), b(Peak, 3000.0, 3.0, 1.0)] },
+                Fx::Compressor(Compressor { threshold_db: -20.0, ratio: 3.0, ..Compressor::default() }),
+                Fx::Limiter(Limiter { ceiling_db: -1.0 }),
+            ]),
+            preset("Voice – broadcast", vec![
+                Fx::Gate(Gate { threshold_db: -50.0, release_ms: 200.0 }),
+                Fx::Eq { bands: vec![b(HighPass, 90.0, 0.0, q), b(Peak, 180.0, 2.5, 0.9), b(Peak, 4000.0, 3.0, 1.0), b(HighShelf, 10000.0, 2.0, q)] },
+                Fx::Compressor(Compressor { threshold_db: -24.0, ratio: 4.0, attack_ms: 5.0, release_ms: 120.0, makeup_db: 4.0 }),
+                Fx::Limiter(Limiter { ceiling_db: -1.0 }),
+            ]),
+            preset("Music – even loudness", vec![
+                Fx::Normalizer(Normalizer { target_db: -18.0, max_gain_db: 12.0 }),
+                Fx::Limiter(Limiter { ceiling_db: -1.0 }),
+            ]),
+            preset("Game – night mode", vec![
+                Fx::Compressor(Compressor { threshold_db: -30.0, ratio: 4.0, attack_ms: 5.0, release_ms: 250.0, makeup_db: 6.0 }),
+                Fx::Limiter(Limiter { ceiling_db: -3.0 }),
+            ]),
+            preset("Bass boost", vec![Fx::Eq { bands: vec![b(LowShelf, 120.0, 6.0, q)] }, Fx::Limiter(Limiter { ceiling_db: -1.0 })]),
+            // Dialogue forward, impact kept: lifts the speech range, then a
+            // gentle, slow compressor brings quiet lines up against loud scenes
+            // without pumping the score.
+            preset("Movies & series", vec![
+                Fx::Eq { bands: vec![
+                    b(LowShelf, 80.0, 3.0, q),
+                    b(Peak, 300.0, -1.5, 0.8),
+                    b(Peak, 2500.0, 3.5, 1.0),
+                    b(HighShelf, 10000.0, 1.5, q),
+                ] },
+                Fx::Compressor(Compressor { threshold_db: -28.0, ratio: 2.5, attack_ms: 15.0, release_ms: 300.0, makeup_db: 4.0 }),
+                Fx::Limiter(Limiter { ceiling_db: -1.0 }),
+            ]),
+            // An approximation of the consumer JBL voicing (not an official
+            // profile): warm, forward bass, slightly recessed mids, crisp top.
+            preset("JBL-style", vec![
+                Fx::Eq { bands: vec![
+                    b(LowShelf, 105.0, 6.0, q),
+                    b(Peak, 60.0, 1.5, 1.2),
+                    b(Peak, 1500.0, -1.5, 0.9),
+                    b(HighShelf, 8000.0, 3.0, q),
+                ] },
+                Fx::Limiter(Limiter { ceiling_db: -1.0 }),
+            ]),
+        ]
+    }
+}
+
+/// A user preset as exported to / imported from a file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "slidr_preset", rename_all = "snake_case")]
+pub enum PresetFile {
+    Eq(EqPreset),
+    Effects(FxPreset),
+}
+
+/// A starting point for a strip's EQ.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EqPreset {
+    pub id: u32,
+    pub name: String,
+    #[serde(default)]
+    pub bands: Vec<EqBand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EqBandKind {
+    Peak,
+    LowShelf,
+    HighShelf,
+    HighPass,
+    LowPass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EqBand {
+    pub kind: EqBandKind,
+    /// Centre / corner frequency in Hz.
+    pub freq: f32,
+    /// Boost or cut in dB (ignored by the pass filters).
+    #[serde(default)]
+    pub gain_db: f32,
+    #[serde(default = "default_q")]
+    pub q: f32,
+}
+
+/// Mixer devices by friendly name. `None` = the system default for `monitor`
+/// and `mic_input`; without `sink` nothing is rerouted, without `mic_out`
+/// there is no Slidr Mic.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct MixerDevices {
+    /// Where the monitor mix plays (the user's headset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<String>,
+    /// The real microphone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mic_input: Option<String>,
+    /// Output nobody listens to; rerouted programs play here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sink: Option<String>,
+    /// Render side of the virtual cable that is the Slidr Mic (e.g. "CABLE Input").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mic_out: Option<String>,
+}
+
+fn default_level() -> f32 {
+    1.0
+}
+fn default_q() -> f32 {
+    std::f32::consts::FRAC_1_SQRT_2
 }

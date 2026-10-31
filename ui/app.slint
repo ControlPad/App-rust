@@ -26,6 +26,11 @@ export struct ButtonCell { pressed: bool, category: string, assigned: bool }
 export struct LineItem { id: int, primary: string, secondary: string, icon-kind: int }
 export struct CategorySummary { id: int, name: string, count: int, collapsed: bool, lines: [LineItem] }
 export struct AssignPick { id: int, name: string }
+// A sidebar tab in Settings: `page` is its page index, `fixed` = can't be hidden.
+export struct NavRow { page: int, label: string, visible: bool, fixed: bool }
+// One of the user's own presets in Settings: an EQ curve (`eq`) or an effect
+// chain, at `index` in its list.
+export struct UserPresetRow { eq: bool, index: int, name: string, detail: string }
 // A row in the wizard's picker. `name` is what the user reads; `value` is what
 // gets stored (a process name, an executable path, or an "@group:<id>" reference
 // for a curated program category — `is-group` marks the latter).
@@ -110,10 +115,12 @@ component Select {
     in property <[string]> model;
     in-out property <int> current-index: 0;
     in property <length> field-width: 260px;
+    in property <bool> enabled: true;
     callback selected(int);
 
     min-width: root.field-width; max-width: root.field-width;
     min-height: 36px; max-height: 36px;
+    opacity: root.enabled ? 1.0 : 0.55;
 
     Rectangle {
         background: Palette.alternate-background;
@@ -138,7 +145,8 @@ component Select {
         }
     }
     ta := TouchArea {
-        mouse-cursor: pointer;
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
         clicked => { popup.show(); }
     }
     popup := PopupWindow {
@@ -581,6 +589,21 @@ component SquareIconButton {
     }
 }
 
+// Small text button for moving something up / down a list.
+component MoveButton {
+    in property <string> text;
+    in property <bool> enabled: true;
+    callback clicked();
+    min-width: 28px; max-width: 28px; min-height: 28px; max-height: 28px;
+    opacity: root.enabled ? 1.0 : 0.25;
+    Rectangle { border-radius: 6px;
+        background: (ta.has-hover && root.enabled) ? Palette.alternate-background.darker(0.06) : transparent; }
+    ta := TouchArea { enabled: root.enabled; mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); } }
+    Text { text: root.text; font-size: 15px; font-family: "Inter";
+        horizontal-alignment: center; vertical-alignment: center; }
+}
+
 // Row used in settings: label on the far left, control on the far right.
 component SettingRow inherits HorizontalLayout {
     in property <string> label;
@@ -618,7 +641,7 @@ component HomePage inherits VerticalBox {
     spacing: 16px;
     alignment: start;
 
-    HorizontalBox {
+    HorizontalBox { padding: 0;
         Text { text: "Home"; font-size: 26px; font-weight: 700;
             font-family: "Inter"; vertical-alignment: center; }
         Rectangle { horizontal-stretch: 1; }
@@ -793,6 +816,10 @@ component CategoriesPage inherits VerticalBox {
     in-out property <string> draft-name: "";
     in-out property <int> renaming-id: -1;
     in-out property <string> rename-draft: "";
+    // Cards side by side in columns (filled left to right, row by row).
+    in property <bool> grid;
+    property <length> content-w: sv.visible-width - 18px;
+    property <int> cols: root.grid ? Math.max(1, Math.floor((root.content-w + 12px) / 372px)) : 1;
 
     // ── drag state ──────────────────────────────────────────────────────────
     // Global pointer position (window coords) while a drag is active.
@@ -832,11 +859,13 @@ component CategoriesPage inherits VerticalBox {
         }
     }
 
-    ScrollView {
+    sv := ScrollView {
             mouse-drag-pan-enabled: false;
         vertical-stretch: 1;
         VerticalBox {
             padding: 0; spacing: 8px; alignment: start;
+            // Leave room for the scrollbar, as the other pages do.
+            width: root.content-w;
             if root.categories.length == 0: Card {
                 VerticalLayout { padding: 24px; spacing: 6px; alignment: center;
                     Text { text: "No categories yet";
@@ -848,8 +877,13 @@ component CategoriesPage inherits VerticalBox {
                         horizontal-alignment: center; }
                 }
             }
+            HorizontalLayout { spacing: 12px;
+            for _[col] in root.cols: VerticalLayout {
+            width: (root.content-w - (root.cols - 1) * 12px) / root.cols;
+            alignment: start;
             for cat[ci] in root.categories: VerticalLayout {
-                spacing: 8px;
+            if Math.mod(ci, root.cols) == col: VerticalLayout {
+                spacing: 8px; padding-bottom: 8px;
                 // Drop indicator above this card (category reorder).
                 DropMark { active: root.cat-drag && root.drop-cat-pos == ci; }
                 card := Card {
@@ -916,7 +950,7 @@ component CategoriesPage inherits VerticalBox {
                                 clicked => { root.toggle-collapse(cat.id); }
                             }
                             if root.renaming-id != cat.id: Text { text: cat.name;
-                                font-weight: 700; font-size: 14px;
+                                font-weight: 700; font-size: 14px; overflow: elide; min-width: 0;
                                 font-family: "Inter"; vertical-alignment: center;
                                 horizontal-stretch: 1; }
                             if root.renaming-id == cat.id: LineEdit {
@@ -1013,11 +1047,13 @@ component CategoriesPage inherits VerticalBox {
                                         VerticalLayout { alignment: center;
                                             KindIcon { kind: line.icon-kind; size: 20px; } }
                                         VerticalLayout {
-                                            horizontal-stretch: 1; spacing: 0px;
+                                            horizontal-stretch: 1; spacing: 0px; min-width: 0;
                                             alignment: center;
-                                            Text { text: line.primary; font-weight: 500;
+                                            // Elided, so a long device list can't push
+                                            // the buttons out of a narrow (grid) card.
+                                            Text { text: line.primary; font-weight: 500; overflow: elide;
                                                 font-size: 12px; font-family: "Inter"; }
-                                            Text { text: line.secondary; font-size: 10px;
+                                            Text { text: line.secondary; font-size: 10px; overflow: elide;
                                                 font-family: "Inter";
                                                 color: Palette.foreground.with-alpha(0.55); }
                                         }
@@ -1050,6 +1086,9 @@ component CategoriesPage inherits VerticalBox {
                 if ci == root.categories.length - 1: DropMark {
                     active: root.cat-drag && root.drop-cat-pos == root.categories.length;
                 }
+            }
+            }
+            }
             }
         }
     }
@@ -1084,6 +1123,28 @@ component SettingsPage inherits VerticalBox {
     // "", "checking", "up-to-date", "available", "failed"
     in property <string> update-state;
     in property <string> update-latest;
+    in property <[NavRow]> nav-rows;
+    in-out property <bool> sounds-on;
+    in-out property <float> sound-volume;
+    in property <[string]> sound-sets;
+    in-out property <int> sound-set-index;
+    in-out property <bool> grid-sliders;
+    in-out property <bool> grid-buttons;
+    in property <[UserPresetRow]> user-presets;
+    in property <[string]> spare-names;
+    in property <[string]> cable-names;
+    in-out property <int> sink-idx;
+    in-out property <int> cable-idx;
+    callback mixer-devices-changed();
+    callback nav-move(int, int);
+    callback nav-visible(int, bool);
+    callback preset-rename(bool, int, string);
+    callback preset-export(bool, int);
+    callback preset-delete(bool, int);
+    callback preset-import();
+    // Row being renamed (position in `user-presets`), -1 for none.
+    property <int> renaming: -1;
+    property <string> rename-draft;
 
     callback theme-changed(int);
     callback check-for-updates();
@@ -1103,7 +1164,7 @@ component SettingsPage inherits VerticalBox {
     in property <bool> profile-write-blocked;
     callback reopen-version-warning();
 
-    HorizontalBox {
+    HorizontalBox { padding: 0;
         Text { text: "Settings"; font-size: 26px; font-weight: 700; font-family: "Inter";
             vertical-alignment: center; }
         Rectangle { horizontal-stretch: 1; }
@@ -1113,7 +1174,7 @@ component SettingsPage inherits VerticalBox {
             mouse-drag-pan-enabled: false;
         vertical-stretch: 1;
         VerticalBox {
-            spacing: 12px; alignment: start;
+            padding: 0; spacing: 12px; alignment: start;
             // Pin the content to the viewport width so this page scrolls only
             // vertically. Left to itself the layout takes its preferred width,
             // and one long description then drags every card off to the right.
@@ -1153,6 +1214,154 @@ component SettingsPage inherits VerticalBox {
                                 }
                             }
                         }
+                    }
+                    SettingRow {
+                        label: "Sliders tab";
+                        description: "A grid of cards uses the width of a wide window";
+                        Select { field-width: root.control-w; model: ["List", "Grid"];
+                            current-index: root.grid-sliders ? 1 : 0;
+                            selected(i) => { root.grid-sliders = i == 1; root.dirty(); } }
+                    }
+                    SettingRow {
+                        label: "Buttons tab";
+                        Select { field-width: root.control-w; model: ["List", "Grid"];
+                            current-index: root.grid-buttons ? 1 : 0;
+                            selected(i) => { root.grid-buttons = i == 1; root.dirty(); } }
+                    }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
+                    Text { text: "Sidebar"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
+                    Text { text: "Order and visibility of the tabs on the left. Settings always stays.";
+                        font-family: "Inter"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
+                    Rectangle { height: 6px; }
+                    for r[i] in root.nav-rows: HorizontalLayout {
+                        spacing: 8px; height: 36px;
+                        Text { text: r.label; horizontal-stretch: 1; vertical-alignment: center;
+                            font-family: "Inter"; font-size: 13px; font-weight: 500;
+                            color: r.visible ? Palette.foreground : Palette.foreground.with-alpha(0.45); }
+                        VerticalLayout { alignment: center;
+                            MoveButton { text: "↑"; enabled: i > 0; clicked => { root.nav-move(r.page, -1); } } }
+                        VerticalLayout { alignment: center;
+                            MoveButton { text: "↓"; enabled: i < root.nav-rows.length - 1;
+                                clicked => { root.nav-move(r.page, 1); } } }
+                        VerticalLayout { alignment: center;
+                            Toggle { checked: r.visible; enabled: !r.fixed;
+                                toggled => { root.nav-visible(r.page, self.checked); } } }
+                    }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
+                    Text { text: "Mixer devices"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
+                    Text { text: "Slidr plays the mix on your Windows default output and follows it when that changes. Add your microphone to a mixer channel to send it into the Slidr Mic.";
+                        wrap: word-wrap; font-family: "Inter"; font-size: 11px;
+                        color: Palette.foreground.with-alpha(0.55); }
+                    Rectangle { height: 6px; }
+                    SettingRow {
+                        label: "Slidr Mic";
+                        description: root.cable-names.length > 2
+                            ? "Virtual cable your voice and mix go into. Choose it as the microphone in your voice chat app."
+                            : "Your virtual cable. Choose it as the microphone in your voice chat app.";
+                        Select { field-width: root.control-w; model: root.cable-names;
+                            enabled: root.cable-names.length > 2;
+                            current-index <=> root.cable-idx;
+                            selected => { root.mixer-devices-changed(); } }
+                    }
+                    SettingRow {
+                        label: "Silent output";
+                        description: "An output nobody listens to. Channel programs are moved there so you only hear Slidr's mix.";
+                        Select { field-width: root.control-w; model: root.spare-names;
+                            current-index <=> root.sink-idx;
+                            selected => { root.mixer-devices-changed(); } }
+                    }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
+                    Text { text: "Mixer sounds"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
+                    Rectangle { height: 6px; }
+                    SettingRow {
+                        label: "Switch sounds";
+                        description: "Short sounds on your output when you mute, switch effects or turn the mixer on or off. Never sent to the Slidr Mic.";
+                        HorizontalLayout { width: root.control-w; alignment: end;
+                            VerticalLayout { alignment: center;
+                                Toggle { checked <=> root.sounds-on; toggled => { root.dirty(); } } } }
+                    }
+                    SettingRow {
+                        label: "Sound set";
+                        Select {
+                            field-width: root.control-w;
+                            model: root.sound-sets;
+                            current-index <=> root.sound-set-index;
+                            selected(i) => { root.dirty(); }
+                        }
+                    }
+                    SettingRow {
+                        label: "Volume";
+                        HorizontalLayout {
+                            width: root.control-w; spacing: 10px;
+                            AccentSlider { minimum: 0; maximum: 100; value: root.sound-volume;
+                                changed(v) => { root.sound-volume = v; root.dirty(); }
+                                horizontal-stretch: 1; }
+                            Text { text: Math.round(root.sound-volume) + " %"; min-width: 40px;
+                                horizontal-alignment: right; font-family: "Inter"; vertical-alignment: center; }
+                        }
+                    }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
+                    HorizontalLayout { spacing: 8px;
+                        VerticalLayout { horizontal-stretch: 1; spacing: 2px;
+                            Text { text: "My presets"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
+                            Text { text: "EQ curves and effect chains you saved in the mixer.";
+                                font-family: "Inter"; font-size: 11px; wrap: word-wrap;
+                                color: Palette.foreground.with-alpha(0.55); }
+                        }
+                        VerticalLayout { alignment: center;
+                            IconButton { label: "Import…"; icon: @image-url("../assets/icons/plus.svg");
+                                clicked => { root.preset-import(); } } }
+                    }
+                    Rectangle { height: 6px; }
+                    if root.user-presets.length == 0: Text {
+                        text: "None yet. Save one with \"Save as preset\" in the EQ or effects editor.";
+                        font-family: "Inter"; font-size: 12px; wrap: word-wrap;
+                        color: Palette.foreground.with-alpha(0.55); }
+                    for p[i] in root.user-presets: HorizontalLayout {
+                        spacing: 8px; min-height: 40px;
+                        if root.renaming != i: VerticalLayout { horizontal-stretch: 1; alignment: center; spacing: 1px;
+                            Text { text: p.name; font-family: "Inter"; font-size: 13px; font-weight: 500;
+                                overflow: elide; }
+                            Text { text: p.detail; font-family: "Inter"; font-size: 11px; overflow: elide;
+                                color: Palette.foreground.with-alpha(0.55); }
+                        }
+                        if root.renaming == i: VerticalLayout { horizontal-stretch: 1; alignment: center;
+                            LineEdit { height: 32px; text <=> root.rename-draft;
+                                accepted => { root.preset-rename(p.eq, p.index, root.rename-draft); root.renaming = -1; } } }
+                        VerticalLayout { alignment: center;
+                            SquareIconButton {
+                                icon: root.renaming == i ? @image-url("../assets/icons/check.svg")
+                                                         : @image-url("../assets/icons/edit.svg");
+                                clicked => {
+                                    if (root.renaming == i) {
+                                        root.preset-rename(p.eq, p.index, root.rename-draft);
+                                        root.renaming = -1;
+                                    } else {
+                                        root.renaming = i; root.rename-draft = p.name;
+                                    }
+                                } } }
+                        VerticalLayout { alignment: center;
+                            IconButton { label: "Export…"; clicked => { root.preset-export(p.eq, p.index); } } }
+                        VerticalLayout { alignment: center;
+                            SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
+                                tint: #d32f2f.with-alpha(0.8);
+                                clicked => { root.renaming = -1; root.preset-delete(p.eq, p.index); } } }
                     }
                 }
             }
@@ -1638,8 +1847,10 @@ component WizardPopup inherits Rectangle {
 
     property <[string]> button-kinds: ["Mute process", "Mute main audio", "Mute microphone",
                                        "Open application", "Open website", "Simulate key",
-                                       "Cycle output device", "API call"];
-    property <[string]> slider-kinds: ["Process volume", "Microphone", "Output device", "API call"];
+                                       "Cycle output device", "API call", "Mute mixer channel"];
+    // Mixer entries go last so the indices above (the API call's included) stay put.
+    property <[string]> slider-kinds: ["Process volume", "Microphone", "Output device", "API call",
+                                       "Mixer channel"];
     property <[string]> kinds: root.target-kind == 1 ? root.button-kinds : root.slider-kinds;
     property <string> kind-label: root.kinds[root.kind];
     property <[string]> method-names: ["GET", "POST", "PUT", "PATCH", "DELETE"];
@@ -2300,6 +2511,570 @@ component LedConfigPopup inherits Rectangle {
 // Window
 // ──────────────────────────────────────────────────────────────────────────
 
+// One mixer channel as the Mixer page shows it. `level` / `send` are percent;
+// `fx-count` is how many effects of its chain are on; `fx-on` is the chain's master switch.
+export struct MixChannelUI {
+    id: int, name: string, programs: string, level: float, muted: bool,
+    fx-count: int, fx-on: bool, reroute: bool, send-on: bool, send: float,
+    collapsed: bool,
+    // Only microphones in it: "Replace original" means nothing there.
+    mics-only: bool,
+}
+
+// Fader + percent readout, the row control of the mixer. The readout shows
+// the fader itself (dragging takes it off `value`), and a new `value` — the
+// board moved it — puts the fader there again.
+component LevelRow inherits HorizontalLayout {
+    in property <float> value;
+    callback changed(float);
+    spacing: 10px;
+    changed value => { fader.value = root.value; }
+    fader := AccentSlider { minimum: 0; maximum: 100; value: root.value;
+        horizontal-stretch: 1;
+        changed(v) => { root.changed(v); } }
+    Text { text: Math.round(fader.value) + " %"; min-width: 42px;
+        horizontal-alignment: right; vertical-alignment: center;
+        font-family: "Inter"; font-size: 12px; }
+}
+
+// Caption over a switch, the switch at its natural width.
+component LabeledToggle inherits VerticalLayout {
+    in property <string> label;
+    in-out property <bool> checked;
+    callback toggled(bool);
+    spacing: 4px;
+    Text { text: root.label; font-family: "Inter"; font-size: 11px;
+        color: Palette.foreground.with-alpha(0.6); }
+    // As tall as a button and centred, so a row of these lines up with a
+    // switch that has an "Edit" button beside it.
+    HorizontalLayout { alignment: start; min-height: 36px;
+        VerticalLayout { alignment: center;
+            Toggle { checked <=> root.checked; toggled => { root.toggled(self.checked); } } } }
+}
+
+// Small caption + control, stacked.
+component Labeled inherits VerticalLayout {
+    in property <string> label;
+    spacing: 4px;
+    Text { text: root.label; font-family: "Inter"; font-size: 11px;
+        color: Palette.foreground.with-alpha(0.6); }
+    @children
+}
+
+component MixerPage inherits VerticalBox {
+    in-out property <bool> enabled;
+    in property <[MixChannelUI]> channels;
+    in property <string> hint;
+    in property <bool> hint-download;
+    callback open-download();
+
+    // The on/off switch changed.
+    callback changed();
+    // One field of one channel: `field` names it, the value comes in `num` or `text`.
+    callback channel-set(int, string, float, string);
+    callback add-channel();
+    callback delete-channel(int);
+    callback choose-programs(int);
+    // Open the effects editor for "voice" or "channel:<id>".
+    callback edit-fx(string);
+    // Channel id, insertion slot in the list (before it moves).
+    callback move-channel(int, int);
+
+    spacing: 14px;
+    property <length> control-w: 260px;
+    property <length> content-w: sv.visible-width - 18px;
+    // Channel drag (reorder).
+    property <length> ptr-x;
+    property <length> ptr-y;
+    property <bool> ch-drag: false;
+    property <int> drag-id: -1;
+    property <int> drop-pos: -1;
+
+    HorizontalBox { padding: 0;
+        Text { text: "Mixer"; font-size: 26px; font-weight: 700; font-family: "Inter";
+            vertical-alignment: center; }
+        Rectangle { horizontal-stretch: 1; }
+        Text { text: root.enabled ? "On" : "Off"; font-family: "Inter";
+            vertical-alignment: center; color: Palette.foreground.with-alpha(0.7); }
+        Toggle { checked <=> root.enabled; toggled => { root.changed(); } }
+    }
+
+    sv := ScrollView {
+        mouse-drag-pan-enabled: false;
+        vertical-stretch: 1;
+        VerticalBox {
+            padding: 0; spacing: 12px; alignment: start;
+            width: root.content-w;
+
+            if root.hint != "": Card {
+                border-color: Theme.accent-bg;
+                HorizontalBox { padding: 14px; spacing: 12px;
+                    Text { text: root.hint; wrap: word-wrap; font-family: "Inter";
+                        font-size: 12px; horizontal-stretch: 1; vertical-alignment: center; }
+                    if root.hint-download: IconButton { label: "Download VB-CABLE"; primary: true;
+                        clicked => { root.open-download(); } }
+                }
+            }
+
+            for ch[ci] in root.channels: VerticalLayout {
+                spacing: 6px; padding-bottom: 6px;
+                // Drop indicator above this card (channel reorder).
+                DropMark { active: root.ch-drag && root.drop-pos == ci; }
+                card := Card {
+                    // Which insertion slot the drag pointer means over this card.
+                    // Ternary-guarded: `absolute-position` is only read mid-drag
+                    // (see the note in CategoriesPage).
+                    property <int> slot:
+                        root.ch-drag
+                        ? ((root.ptr-x >= card.absolute-position.x
+                            && root.ptr-x < card.absolute-position.x + card.width
+                            && root.ptr-y >= card.absolute-position.y
+                            && root.ptr-y < card.absolute-position.y + card.height)
+                          ? (root.ptr-y < card.absolute-position.y + card.height / 2 ? ci : ci + 1)
+                          : -999)
+                        : -999;
+                    changed slot => { if (card.slot != -999) { root.drop-pos = card.slot; } }
+                    opacity: (root.ch-drag && root.drag-id == ch.id) ? 0.4 : 1.0;
+                VerticalBox { padding: 18px; spacing: 10px;
+                    HorizontalLayout { spacing: 8px;
+                        // Drag handle — reorder channels.
+                        grip := TouchArea {
+                            width: 22px; mouse-cursor: grab;
+                            pointer-event(ev) => {
+                                if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
+                                    root.ch-drag = true; root.drag-id = ch.id; root.drop-pos = ci;
+                                    root.ptr-x = grip.absolute-position.x + grip.mouse-x;
+                                    root.ptr-y = grip.absolute-position.y + grip.mouse-y;
+                                } else if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.up) {
+                                    if (root.ch-drag && root.drop-pos != -1) {
+                                        root.move-channel(root.drag-id, root.drop-pos);
+                                    }
+                                    root.ch-drag = false; root.drop-pos = -1;
+                                }
+                            }
+                            moved => {
+                                root.ptr-x = grip.absolute-position.x + grip.mouse-x;
+                                root.ptr-y = grip.absolute-position.y + grip.mouse-y;
+                            }
+                            Image { source: @image-url("../assets/icons/grid-dots.svg");
+                                width: 16px; height: 16px;
+                                colorize: Palette.foreground.with-alpha(0.45);
+                                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
+                        }
+                        VerticalLayout { alignment: center;
+                            SquareIconButton {
+                                icon: ch.collapsed ? @image-url("../assets/icons/chevron-right.svg")
+                                                   : @image-url("../assets/icons/chevron-down.svg");
+                                clicked => { root.channel-set(ch.id, "collapsed", ch.collapsed ? 0 : 1, ""); } } }
+                        LineEdit { min-width: 120px; preferred-width: 180px; height: 34px; text: ch.name;
+                            placeholder-text: "Channel name";
+                            edited(t) => { root.channel-set(ch.id, "name", 0, t); } }
+                        Text { text: ch.programs != "" ? ch.programs : "Nothing added yet";
+                            horizontal-stretch: 1; min-width: 0; vertical-alignment: center; overflow: elide;
+                            font-family: "Inter"; font-size: 13px;
+                            color: ch.programs != "" ? Palette.foreground : Palette.foreground.with-alpha(0.5); }
+                        IconButton { icon: @image-url("../assets/icons/app-window.svg"); label: "Sources";
+                            clicked => { root.choose-programs(ch.id); } }
+                        VerticalLayout { alignment: center;
+                            SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
+                                clicked => { root.delete-channel(ch.id); } } }
+                    }
+                    Labeled { label: ch.mics-only ? "Level you hear yourself at" : "Level";
+                        LevelRow { value: ch.level;
+                            changed(v) => { root.channel-set(ch.id, "level", v, ""); } }
+                    }
+                    if !ch.collapsed: VerticalLayout { spacing: 10px;
+                    HorizontalLayout { spacing: 20px; alignment: start;
+                        Labeled { label: "Effects & EQ";
+                            HorizontalLayout { spacing: 8px;
+                                VerticalLayout { alignment: center;
+                                    Toggle { checked: ch.fx-on;
+                                        toggled => { root.channel-set(ch.id, "fx-on", self.checked ? 1 : 0, ""); } } }
+                                IconButton { label: ch.fx-count > 0 ? "Edit (" + ch.fx-count + " on)" : "Edit";
+                                    clicked => { root.edit-fx("channel:" + ch.id); } }
+                            }
+                        }
+                        LabeledToggle { label: "Muted"; checked: ch.muted;
+                            toggled(on) => { root.channel-set(ch.id, "muted", on ? 1 : 0, ""); } }
+                        if !ch.mics-only: LabeledToggle { label: "Replace original"; checked: ch.reroute;
+                            toggled(on) => { root.channel-set(ch.id, "reroute", on ? 1 : 0, ""); } }
+                        send := LabeledToggle { label: "Into Slidr Mic"; checked: ch.send-on;
+                            toggled(on) => { root.channel-set(ch.id, "send-on", on ? 1 : 0, ""); } }
+                    }
+                    // Follows the switch itself, so flipping it doesn't rebuild the card.
+                    if send.checked: Labeled { label: "Level in the Slidr Mic";
+                        LevelRow { value: ch.send;
+                            changed(v) => { root.channel-set(ch.id, "send", v, ""); } }
+                    }
+                    }
+                }
+                }
+                // Trailing drop indicator after the last card (move to the end).
+                if ci == root.channels.length - 1: DropMark {
+                    active: root.ch-drag && root.drop-pos == root.channels.length;
+                }
+            }
+
+            HorizontalLayout { alignment: start;
+                IconButton { icon: @image-url("../assets/icons/plus.svg"); label: "Add channel";
+                    clicked => { root.add-channel(); } }
+            }
+        }
+    }
+}
+
+// Multi-select list of programs for one mixer channel.
+component ProgramPickerPopup inherits Rectangle {
+    in property <string> title;
+    in property <[PickerEntry]> options;
+    in-out property <string> filter;
+    // 0 = programs, 1 = microphones.
+    in-out property <int> tab;
+    callback tab-changed(int);
+    callback toggle(string);
+    callback filter-changed(string);
+    callback close();
+
+    background: #00000099;
+    TouchArea { clicked => { root.close(); } }
+
+    Rectangle {
+        x: parent.width / 2 - self.width / 2;
+        y: parent.height / 2 - self.height / 2;
+        width: 480px; height: 560px;
+        background: Palette.background;
+        border-radius: 14px; border-width: 1px; border-color: Palette.border;
+        TouchArea {}
+        VerticalBox {
+            padding: 22px; spacing: 12px;
+            HorizontalLayout { spacing: 10px;
+                Text { text: root.title; font-size: 20px; font-weight: 700; font-family: "Inter";
+                    horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                Select { field-width: 150px; model: ["Programs", "Microphones"];
+                    current-index <=> root.tab;
+                    selected(i) => { root.tab-changed(i); } }
+            }
+            LineEdit { height: 36px; placeholder-text: "Search…"; text <=> root.filter;
+                edited(t) => { root.filter-changed(t); } }
+            ScrollView {
+                mouse-drag-pan-enabled: false;
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 6px; alignment: start;
+                    if root.options.length == 0: Text { text: "Nothing found";
+                        font-family: "Inter"; color: Palette.foreground.with-alpha(0.6); }
+                    for e in root.options: Rectangle {
+                        border-radius: 8px; height: 40px;
+                        background: e.selected ? Theme.accent-bg.with-alpha(0.22) : Palette.alternate-background;
+                        border-width: 1px;
+                        border-color: e.selected ? Theme.accent-bg : Palette.border;
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.toggle(e.value); }
+                            HorizontalLayout { padding-left: 12px; padding-right: 12px; spacing: 10px;
+                                VerticalLayout { alignment: center; KindIcon { kind: e.icon-kind; size: 18px; } }
+                                Text { text: e.name; vertical-alignment: center; overflow: elide;
+                                    font-family: "Inter"; horizontal-stretch: 1; }
+                                VerticalLayout { alignment: center;
+                                    if e.selected: Icon { source: @image-url("../assets/icons/check.svg");
+                                        tint: Theme.accent-bg; size: 16px; } }
+                            }
+                        }
+                    }
+                }
+            }
+            HorizontalLayout { alignment: end;
+                IconButton { label: "Done"; primary: true; clicked => { root.close(); } }
+            }
+        }
+    }
+}
+
+// One EQ band as the editor shows it. `freq-pos` / `q-pos` are 0..1 on a log
+// scale, `gain` is dB; `x` / `y` place the band's handle on the curve (0..1).
+export struct EqBandUI {
+    kind: int, freq-pos: float, gain: float, q-pos: float,
+    freq-text: string, gain-text: string, q-text: string,
+    x: float, y: float,
+}
+
+// Parametric EQ for one mixer strip: the response curve with draggable band
+// handles, and one row of controls per band.
+component EqEditorPopup inherits Rectangle {
+    in property <string> title;
+    in-out property <bool> on;
+    in property <[EqBandUI]> bands;
+    // SVG path of the response, in a 1000 × 300 box (±15 dB).
+    in property <string> curve;
+    in property <[string]> preset-names;
+    callback toggled(bool);
+    callback set(int, string, float);
+    callback drag(int, float, float);
+    callback drag-end();
+    callback add();
+    callback delete(int);
+    callback load-preset(int);
+    callback save-preset(string);
+    in-out property <string> preset-name;
+    callback close();
+
+    background: #00000099;
+    TouchArea { clicked => { root.close(); } }
+
+    Rectangle {
+        x: parent.width / 2 - self.width / 2;
+        y: parent.height / 2 - self.height / 2;
+        width: min(parent.width - 48px, 820px); height: min(parent.height - 48px, 700px);
+        background: Palette.background;
+        border-radius: 14px; border-width: 1px; border-color: Palette.border;
+        TouchArea {}
+        VerticalBox {
+            padding: 22px; spacing: 12px;
+            HorizontalLayout { spacing: 10px;
+                Text { text: root.title; font-size: 20px; font-weight: 700; font-family: "Inter";
+                    vertical-alignment: center; horizontal-stretch: 1; }
+                Text { text: root.on ? "On" : "Off"; font-family: "Inter"; vertical-alignment: center;
+                    color: Palette.foreground.with-alpha(0.7); }
+                Toggle { checked <=> root.on; toggled => { root.toggled(self.checked); } }
+            }
+
+            graph := Rectangle {
+                height: 220px;
+                background: Palette.alternate-background;
+                border-radius: 10px; border-width: 1px; border-color: Palette.border;
+                clip: true;
+                opacity: root.on ? 1.0 : 0.5;
+                for db in [12, 6, 0, -6, -12]: Rectangle {
+                    x: 0; width: parent.width; height: 1px;
+                    y: (15 - db) / 30 * parent.height;
+                    background: db == 0 ? Palette.foreground.with-alpha(0.35) : Palette.border;
+                }
+                for m in [{ p: 0.233, t: "100 Hz" }, { p: 0.566, t: "1 kHz" }, { p: 0.9, t: "10 kHz" }]: Rectangle {
+                    x: m.p * parent.width; y: 0; width: 1px; height: parent.height;
+                    background: Palette.border;
+                    Text { x: 4px; y: parent.height - 18px; text: m.t; font-size: 10px;
+                        font-family: "Inter"; color: Palette.foreground.with-alpha(0.5); }
+                }
+                Path {
+                    x: 0; y: 0; width: parent.width; height: parent.height;
+                    viewbox-width: 1000; viewbox-height: 300;
+                    commands: root.curve;
+                    stroke: Theme.accent-bg; stroke-width: 2px;
+                }
+                for b[i] in root.bands: dot := Rectangle {
+                    x: b.x * graph.width - 9px; y: b.y * graph.height - 9px;
+                    width: 18px; height: 18px; border-radius: 9px;
+                    background: Theme.accent-bg; border-width: 2px; border-color: white;
+                    Text { text: i + 1; color: white; font-size: 10px; font-weight: 700;
+                        horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        mouse-cursor: move;
+                        moved => {
+                            if (self.pressed) {
+                                root.drag(i, (dot.x + self.mouse-x) / graph.width, (dot.y + self.mouse-y) / graph.height);
+                            }
+                        }
+                        pointer-event(e) => {
+                            if (e.kind == PointerEventKind.up) { root.drag-end(); }
+                        }
+                    }
+                }
+            }
+
+            ScrollView {
+                mouse-drag-pan-enabled: false;
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 8px; alignment: start;
+                    width: parent.width - 18px;
+                    if root.bands.length == 0: Text { text: "No bands yet — add one or load a preset.";
+                        font-family: "Inter"; color: Palette.foreground.with-alpha(0.6); }
+                    for b[i] in root.bands: Card {
+                        HorizontalBox { padding: 10px; spacing: 14px;
+                            Text { text: i + 1; min-width: 14px; font-weight: 700; font-family: "Inter";
+                                vertical-alignment: center; }
+                            VerticalLayout { alignment: center;
+                                Select { field-width: 130px;
+                                    model: ["Peak", "Low shelf", "High shelf", "High pass", "Low pass"];
+                                    current-index: b.kind;
+                                    selected(k) => { root.set(i, "kind", k); } }
+                            }
+                            Labeled { label: "Frequency  " + b.freq-text; horizontal-stretch: 1;
+                                AccentSlider { minimum: 0; maximum: 1; value: b.freq-pos;
+                                    changed(v) => { root.set(i, "freq", v); } } }
+                            Labeled { label: "Gain  " + b.gain-text; horizontal-stretch: 1;
+                                AccentSlider { minimum: -15; maximum: 15; value: b.gain;
+                                    changed(v) => { root.set(i, "gain", v); } } }
+                            Labeled { label: "Q  " + b.q-text; horizontal-stretch: 1;
+                                AccentSlider { minimum: 0; maximum: 1; value: b.q-pos;
+                                    changed(v) => { root.set(i, "q", v); } } }
+                            VerticalLayout { alignment: center;
+                                SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
+                                    clicked => { root.delete(i); } } }
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout { spacing: 10px;
+                IconButton { icon: @image-url("../assets/icons/plus.svg"); label: "Add band";
+                    clicked => { root.add(); } }
+                Select { field-width: 200px; model: root.preset-names; current-index: 0;
+                    selected(i) => { if (i > 0) { root.load-preset(i - 1); } self.current-index = 0; } }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            HorizontalLayout { spacing: 10px;
+                LineEdit { height: 36px; horizontal-stretch: 1; placeholder-text: "Name for this curve…";
+                    text <=> root.preset-name; }
+                IconButton { label: "Save as preset"; enabled: root.preset-name != "";
+                    clicked => { root.save-preset(root.preset-name); root.preset-name = ""; } }
+                IconButton { label: "Done"; primary: true; clicked => { root.close(); } }
+            }
+        }
+    }
+}
+
+// One effect in a strip's chain. `kind`: 0 gate · 1 EQ · 2 compressor ·
+// 3 normalizer · 4 limiter; `p1`…`p5` are its parameters in the order the
+// rack shows them; `summary` describes an EQ.
+export struct FxSlotUI {
+    id: int, kind: int, name: string, on: bool,
+    p1: float, p2: float, p3: float, p4: float, p5: float,
+    summary: string,
+}
+
+// Label · slider · value with unit.
+component ParamRow inherits HorizontalLayout {
+    in property <string> label;
+    in-out property <float> value;
+    in property <float> minimum;
+    in property <float> maximum;
+    in property <string> unit;
+    in property <bool> fine: false;   // one decimal instead of none
+    callback changed(float);
+    spacing: 12px;
+    Text { text: root.label; min-width: 90px; vertical-alignment: center;
+        font-family: "Inter"; font-size: 12px; }
+    AccentSlider { minimum: root.minimum; maximum: root.maximum; value: root.value;
+        horizontal-stretch: 1;
+        changed(v) => { root.value = v; root.changed(v); } }
+    Text { text: (root.fine ? Math.round(root.value * 10) / 10 : Math.round(root.value)) + " " + root.unit;
+        min-width: 70px; horizontal-alignment: right; vertical-alignment: center;
+        font-family: "Inter"; font-size: 12px; }
+}
+
+// A strip's effect chain: effects run top to bottom; add from a list, stack,
+// reorder, switch off, or load / save a whole chain as a preset.
+component FxRackPopup inherits Rectangle {
+    in property <string> title;
+    in property <[FxSlotUI]> slots;
+    in property <[string]> add-names;
+    in property <[string]> preset-names;
+    in-out property <string> preset-name;
+    callback param(int, int, float);
+    callback toggle(int, bool);
+    callback move(int, int);
+    callback remove(int);
+    callback add(int);
+    callback load-preset(int);
+    callback save-preset(string);
+    callback edit-eq(int);
+    callback close();
+
+    background: #00000099;
+    TouchArea { clicked => { root.close(); } }
+
+    Rectangle {
+        x: parent.width / 2 - self.width / 2;
+        y: parent.height / 2 - self.height / 2;
+        width: min(parent.width - 48px, 740px); height: min(parent.height - 48px, 720px);
+        background: Palette.background;
+        border-radius: 14px; border-width: 1px; border-color: Palette.border;
+        TouchArea {}
+        VerticalBox {
+            padding: 22px; spacing: 12px;
+            Text { text: root.title; font-size: 20px; font-weight: 700; font-family: "Inter"; }
+            Text { text: "Effects run top to bottom. Add the same one twice to stack it.";
+                font-family: "Inter"; font-size: 11px; color: Palette.foreground.with-alpha(0.55); }
+            ScrollView {
+                mouse-drag-pan-enabled: false;
+                vertical-stretch: 1;
+                VerticalBox {
+                    spacing: 10px; alignment: start;
+                    width: parent.width - 18px;
+                    if root.slots.length == 0: Text {
+                        text: "No effects yet — add one below or load a preset.";
+                        font-family: "Inter"; color: Palette.foreground.with-alpha(0.6); }
+                    for sl[i] in root.slots: Card {
+                        VerticalBox { padding: 12px; spacing: 8px;
+                            HorizontalLayout { spacing: 8px;
+                                Text { text: (i + 1) + "."; min-width: 20px; vertical-alignment: center;
+                                    font-family: "Inter"; color: Palette.foreground.with-alpha(0.6); }
+                                Text { text: sl.name; font-weight: 700; font-family: "Inter"; font-size: 14px;
+                                    vertical-alignment: center; horizontal-stretch: 1; }
+                                MoveButton { text: "↑"; enabled: i > 0; clicked => { root.move(sl.id, -1); } }
+                                MoveButton { text: "↓"; enabled: i < root.slots.length - 1;
+                                    clicked => { root.move(sl.id, 1); } }
+                                VerticalLayout { alignment: center;
+                                    Toggle { checked: sl.on; toggled => { root.toggle(sl.id, self.checked); } } }
+                                SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
+                                    clicked => { root.remove(sl.id); } }
+                            }
+                            VerticalLayout { spacing: 6px; opacity: sl.on ? 1.0 : 0.45;
+                                if sl.kind == 0: VerticalLayout { spacing: 6px;
+                                    ParamRow { label: "Threshold"; minimum: -80; maximum: 0; unit: "dB";
+                                        value: sl.p1; changed(v) => { root.param(sl.id, 1, v); } }
+                                    ParamRow { label: "Release"; minimum: 20; maximum: 1000; unit: "ms";
+                                        value: sl.p2; changed(v) => { root.param(sl.id, 2, v); } }
+                                }
+                                if sl.kind == 1: HorizontalLayout { spacing: 10px;
+                                    Text { text: sl.summary; horizontal-stretch: 1; vertical-alignment: center;
+                                        font-family: "Inter"; font-size: 12px; }
+                                    IconButton { label: "Edit curve"; clicked => { root.edit-eq(sl.id); } }
+                                }
+                                if sl.kind == 2: VerticalLayout { spacing: 6px;
+                                    ParamRow { label: "Threshold"; minimum: -60; maximum: 0; unit: "dB";
+                                        value: sl.p1; changed(v) => { root.param(sl.id, 1, v); } }
+                                    ParamRow { label: "Ratio"; minimum: 1; maximum: 20; unit: ": 1"; fine: true;
+                                        value: sl.p2; changed(v) => { root.param(sl.id, 2, v); } }
+                                    ParamRow { label: "Attack"; minimum: 0.5; maximum: 100; unit: "ms"; fine: true;
+                                        value: sl.p3; changed(v) => { root.param(sl.id, 3, v); } }
+                                    ParamRow { label: "Release"; minimum: 20; maximum: 1000; unit: "ms";
+                                        value: sl.p4; changed(v) => { root.param(sl.id, 4, v); } }
+                                    ParamRow { label: "Makeup"; minimum: 0; maximum: 24; unit: "dB"; fine: true;
+                                        value: sl.p5; changed(v) => { root.param(sl.id, 5, v); } }
+                                }
+                                if sl.kind == 3: VerticalLayout { spacing: 6px;
+                                    ParamRow { label: "Target"; minimum: -40; maximum: -6; unit: "dB";
+                                        value: sl.p1; changed(v) => { root.param(sl.id, 1, v); } }
+                                    ParamRow { label: "Max boost"; minimum: 0; maximum: 30; unit: "dB";
+                                        value: sl.p2; changed(v) => { root.param(sl.id, 2, v); } }
+                                }
+                                if sl.kind == 4: ParamRow { label: "Ceiling"; minimum: -12; maximum: 0; unit: "dB";
+                                    fine: true; value: sl.p1; changed(v) => { root.param(sl.id, 1, v); } }
+                            }
+                        }
+                    }
+                }
+            }
+            HorizontalLayout { spacing: 10px;
+                Select { field-width: 170px; model: root.add-names; current-index: 0;
+                    selected(i) => { if (i > 0) { root.add(i - 1); } self.current-index = 0; } }
+                Select { field-width: 210px; model: root.preset-names; current-index: 0;
+                    selected(i) => { if (i > 0) { root.load-preset(i - 1); } self.current-index = 0; } }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            HorizontalLayout { spacing: 10px;
+                LineEdit { height: 36px; horizontal-stretch: 1; placeholder-text: "Name for this chain…";
+                    text <=> root.preset-name; }
+                IconButton { label: "Save as preset"; enabled: root.preset-name != "";
+                    clicked => { root.save-preset(root.preset-name); root.preset-name = ""; } }
+                IconButton { label: "Done"; primary: true; clicked => { root.close(); } }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Slidr";
     icon: @image-url("../assets/logo-128.png");
@@ -2358,6 +3133,79 @@ export component AppWindow inherits Window {
 
     in-out property <int> current-page: 0;
     in-out property <bool> edit-mode: false;
+    in property <[int]> nav-pages: [0, 1, 2, 4, 3];
+    in property <[NavRow]> nav-rows;
+    callback nav-move(int, int);
+    callback nav-visible(int, bool);
+    in-out property <bool> sounds-on: true;
+    in-out property <float> sound-volume: 80;
+    in property <[string]> sound-sets;
+    in-out property <int> sound-set-index;
+
+    // ── Mixer page ──
+    in-out property <bool> mixer-enabled;
+    in property <[MixChannelUI]> mixer-channels;
+    in-out property <bool> mixer-fx-open: false;
+    in property <string> mixer-fx-title;
+    in property <[FxSlotUI]> mixer-fx-slots;
+    in property <[string]> mixer-fx-add-names;
+    in property <[string]> mixer-fx-preset-names;
+    in-out property <string> mixer-fx-preset-name;
+    callback mixer-edit-fx(string);
+    callback mixer-fx-param(int, int, float);
+    callback mixer-fx-toggle(int, bool);
+    callback mixer-fx-move(int, int);
+    callback mixer-fx-remove(int);
+    callback mixer-fx-add(int);
+    callback mixer-fx-load-preset(int);
+    callback mixer-fx-save-preset(string);
+    callback mixer-fx-edit-eq(int);
+    callback mixer-fx-closed();
+    in-out property <bool> mixer-eq-open: false;
+    in property <string> mixer-eq-title;
+    in-out property <bool> mixer-eq-on;
+    in property <[EqBandUI]> mixer-eq-bands;
+    in property <string> mixer-eq-curve;
+    in property <[string]> mixer-eq-preset-names;
+    callback mixer-eq-toggled(bool);
+    callback mixer-eq-set(int, string, float);
+    callback mixer-eq-drag(int, float, float);
+    callback mixer-eq-drag-end();
+    callback mixer-eq-add();
+    callback mixer-eq-delete(int);
+    callback mixer-eq-load-preset(int);
+    callback mixer-eq-save-preset(string);
+    in-out property <string> mixer-eq-preset-name;
+    callback mixer-eq-closed();
+    callback mixer-move-channel(int, int);
+    in-out property <bool> grid-sliders;
+    in-out property <bool> grid-buttons;
+    in property <[UserPresetRow]> user-presets;
+    callback user-preset-rename(bool, int, string);
+    callback user-preset-export(bool, int);
+    callback user-preset-delete(bool, int);
+    callback user-preset-import();
+    in property <[string]> mixer-spare-names;
+    in property <[string]> mixer-cable-names;
+    in property <bool> mixer-hint-download;
+    callback mixer-open-download();
+    in-out property <int> mixer-sink-idx;
+    in-out property <int> mixer-cable-idx;
+    in property <string> mixer-hint;
+    callback mixer-changed();
+    callback mixer-channel-set(int, string, float, string);
+    callback mixer-add-channel();
+    callback mixer-delete-channel(int);
+    in-out property <bool> mixer-picker-open: false;
+    in property <string> mixer-picker-title;
+    in property <[PickerEntry]> mixer-picker-options;
+    in-out property <string> mixer-picker-filter;
+    callback mixer-choose-programs(int);
+    callback mixer-toggle-program(string);
+    callback mixer-picker-filter-changed(string);
+    callback mixer-picker-closed();
+    in-out property <int> mixer-picker-tab-index;
+    callback mixer-picker-tab(int);
 
     in-out property <bool> assign-popup-open: false;
     in-out property <int> assign-target-kind: 0;
@@ -2554,22 +3402,23 @@ export component AppWindow inherits Window {
                     }
                 }
                 Rectangle { height: 8px; }
-                NavItem { label: "Home"; compact: root.sidebar-collapsed;
-                    icon: @image-url("../assets/icons/home.svg");
-                    active: root.current-page == 0;
-                    clicked => { root.current-page = 0; root.page-changed(0); } }
-                NavItem { label: "Sliders"; compact: root.sidebar-collapsed;
-                    icon: @image-url("../assets/icons/adjustments-horizontal.svg");
-                    active: root.current-page == 1;
-                    clicked => { root.current-page = 1; root.edit-mode = false; root.page-changed(1); } }
-                NavItem { label: "Buttons"; compact: root.sidebar-collapsed;
-                    icon: @image-url("../assets/icons/grid-dots.svg");
-                    active: root.current-page == 2;
-                    clicked => { root.current-page = 2; root.edit-mode = false; root.page-changed(2); } }
-                NavItem { label: "Settings"; compact: root.sidebar-collapsed;
-                    icon: @image-url("../assets/icons/settings.svg");
-                    active: root.current-page == 3;
-                    clicked => { root.current-page = 3; root.edit-mode = false; root.page-changed(3); } }
+                // Order and visibility come from Settings (see src/sidebar.rs).
+                for pg in root.nav-pages: NavItem {
+                    compact: root.sidebar-collapsed;
+                    label: pg == 0 ? "Home" : pg == 1 ? "Sliders" : pg == 2 ? "Buttons"
+                         : pg == 4 ? "Mixer" : "Settings";
+                    icon: pg == 0 ? @image-url("../assets/icons/home.svg")
+                        : pg == 1 ? @image-url("../assets/icons/adjustments-horizontal.svg")
+                        : pg == 2 ? @image-url("../assets/icons/grid-dots.svg")
+                        : pg == 4 ? @image-url("../assets/icons/volume.svg")
+                        : @image-url("../assets/icons/settings.svg");
+                    active: root.current-page == pg;
+                    clicked => {
+                        root.current-page = pg;
+                        if (pg != 0) { root.edit-mode = false; }
+                        root.page-changed(pg);
+                    }
+                }
 
                 Rectangle { vertical-stretch: 1; }
 
@@ -2699,7 +3548,7 @@ export component AppWindow inherits Window {
                     request-assign(k, i) => { root.open-assign(k, i); }
                 }
                 if root.current-page == 1: CategoriesPage {
-                    target-kind: 0; categories: root.slider-categories;
+                    target-kind: 0; categories: root.slider-categories; grid: root.grid-sliders;
                     add-category(n) => { root.add-category(0, n); }
                     rename(id, n) => { root.rename-category(0, id, n); }
                     delete(id) => { root.delete-category(0, id); }
@@ -2711,7 +3560,7 @@ export component AppWindow inherits Window {
                     move-line(fc, fi, tc, ti) => { root.move-line(0, fc, fi, tc, ti); }
                 }
                 if root.current-page == 2: CategoriesPage {
-                    target-kind: 1; categories: root.button-categories;
+                    target-kind: 1; categories: root.button-categories; grid: root.grid-buttons;
                     add-category(n) => { root.add-category(1, n); }
                     rename(id, n) => { root.rename-category(1, id, n); }
                     delete(id) => { root.delete-category(1, id); }
@@ -2721,6 +3570,20 @@ export component AppWindow inherits Window {
                     toggle-collapse(id) => { root.toggle-category-collapse(1, id); }
                     reorder-category(fid, to) => { root.reorder-category(1, fid, to); }
                     move-line(fc, fi, tc, ti) => { root.move-line(1, fc, fi, tc, ti); }
+                }
+                if root.current-page == 4: MixerPage {
+                    enabled <=> root.mixer-enabled;
+                    channels: root.mixer-channels;
+                    edit-fx(t) => { root.mixer-edit-fx(t); }
+                    hint-download: root.mixer-hint-download;
+                    open-download => { root.mixer-open-download(); }
+                    hint: root.mixer-hint;
+                    changed => { root.mixer-changed(); }
+                    channel-set(id, f, n, t) => { root.mixer-channel-set(id, f, n, t); }
+                    move-channel(id, to) => { root.mixer-move-channel(id, to); }
+                    add-channel => { root.mixer-add-channel(); }
+                    delete-channel(id) => { root.mixer-delete-channel(id); }
+                    choose-programs(id) => { root.mixer-choose-programs(id); }
                 }
                 if root.current-page == 3: SettingsPage {
                     theme-index <=> root.theme-index;
@@ -2749,6 +3612,25 @@ export component AppWindow inherits Window {
                     update-check <=> root.update-check;
                     update-state: root.update-state;
                     update-latest: root.update-latest;
+                    nav-rows: root.nav-rows;
+                    nav-move(p, d) => { root.nav-move(p, d); }
+                    nav-visible(p, v) => { root.nav-visible(p, v); }
+                    sounds-on <=> root.sounds-on;
+                    sound-volume <=> root.sound-volume;
+                    sound-sets: root.sound-sets;
+                    sound-set-index <=> root.sound-set-index;
+                    grid-sliders <=> root.grid-sliders;
+                    grid-buttons <=> root.grid-buttons;
+                    user-presets: root.user-presets;
+                    spare-names: root.mixer-spare-names;
+                    cable-names: root.mixer-cable-names;
+                    sink-idx <=> root.mixer-sink-idx;
+                    cable-idx <=> root.mixer-cable-idx;
+                    mixer-devices-changed => { root.mixer-changed(); }
+                    preset-rename(e, i, n) => { root.user-preset-rename(e, i, n); }
+                    preset-export(e, i) => { root.user-preset-export(e, i); }
+                    preset-delete(e, i) => { root.user-preset-delete(e, i); }
+                    preset-import => { root.user-preset-import(); }
                     check-for-updates => { root.check-for-updates(); }
                     open-releases => { root.open-releases(); }
                     theme-changed(i) => { root.theme-changed(i); }
@@ -2920,6 +3802,49 @@ export component AppWindow inherits Window {
         }
     }
 
+    if root.mixer-fx-open: FxRackPopup {
+        title: root.mixer-fx-title;
+        slots: root.mixer-fx-slots;
+        add-names: root.mixer-fx-add-names;
+        preset-names: root.mixer-fx-preset-names;
+        preset-name <=> root.mixer-fx-preset-name;
+        param(id, n, v) => { root.mixer-fx-param(id, n, v); }
+        toggle(id, on) => { root.mixer-fx-toggle(id, on); }
+        move(id, d) => { root.mixer-fx-move(id, d); }
+        remove(id) => { root.mixer-fx-remove(id); }
+        add(k) => { root.mixer-fx-add(k); }
+        load-preset(i) => { root.mixer-fx-load-preset(i); }
+        save-preset(n) => { root.mixer-fx-save-preset(n); }
+        edit-eq(id) => { root.mixer-fx-edit-eq(id); }
+        close => { root.mixer-fx-open = false; root.mixer-fx-closed(); }
+    }
+    if root.mixer-eq-open: EqEditorPopup {
+        title: root.mixer-eq-title;
+        on <=> root.mixer-eq-on;
+        bands: root.mixer-eq-bands;
+        curve: root.mixer-eq-curve;
+        preset-names: root.mixer-eq-preset-names;
+        toggled(v) => { root.mixer-eq-toggled(v); }
+        set(i, f, v) => { root.mixer-eq-set(i, f, v); }
+        drag(i, x, y) => { root.mixer-eq-drag(i, x, y); }
+        drag-end => { root.mixer-eq-drag-end(); }
+        add => { root.mixer-eq-add(); }
+        delete(i) => { root.mixer-eq-delete(i); }
+        load-preset(i) => { root.mixer-eq-load-preset(i); }
+        preset-name <=> root.mixer-eq-preset-name;
+        save-preset(n) => { root.mixer-eq-save-preset(n); }
+        close => { root.mixer-eq-open = false; root.mixer-eq-closed(); }
+    }
+    if root.mixer-picker-open: ProgramPickerPopup {
+        title: root.mixer-picker-title;
+        options: root.mixer-picker-options;
+        filter <=> root.mixer-picker-filter;
+        tab <=> root.mixer-picker-tab-index;
+        tab-changed(t) => { root.mixer-picker-tab(t); }
+        toggle(v) => { root.mixer-toggle-program(v); }
+        filter-changed(t) => { root.mixer-picker-filter-changed(t); }
+        close => { root.mixer-picker-open = false; root.mixer-picker-closed(); }
+    }
     if root.preset-popup-open: PresetPopup {
         active-name: root.active-preset-name;
         presets: root.preset-names;

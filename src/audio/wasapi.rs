@@ -125,43 +125,51 @@ impl WasapiBackend {
         mut visit: F,
     ) {
         let _guard = self.lock.lock().unwrap();
-        let group = crate::app_groups::parse_ref(process);
-        let needle = strip_exe(&process.to_lowercase());
         unsafe {
-            let Ok(dev) = self.default_device(0) else { return };
-            let Ok(mgr) = self.session_manager(&dev) else { return };
-            let Ok(enumerator): Result<IAudioSessionEnumerator, _> = mgr.GetSessionEnumerator()
-            else {
-                return;
-            };
-            let Ok(count) = enumerator.GetCount() else { return };
-            for i in 0..count {
-                let Ok(ctl): Result<IAudioSessionControl, _> = enumerator.GetSession(i) else {
+            // Every active output, not just the default: a program can play
+            // elsewhere (its own device choice, or moved to the mixer's
+            // silent output), and its volume still lives on that session.
+            let Ok(devices) = self.enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else { return };
+            for d in 0..devices.GetCount().unwrap_or(0) {
+                let Ok(dev) = devices.Item(d) else { continue };
+                let Ok(mgr) = self.session_manager(&dev) else { continue };
+                let Ok(enumerator): Result<IAudioSessionEnumerator, _> = mgr.GetSessionEnumerator()
+                else {
                     continue;
                 };
-                let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
-                let Ok(pid) = ctl2.GetProcessId() else { continue };
-                if pid == 0 {
-                    continue;
-                }
-                let Some(name) = process_name(pid) else { continue };
-                let hit = match group {
-                    // Group membership also considers where the program lives
-                    // (game libraries), so it needs the full image path.
-                    Some(id) => crate::app_groups::matches(
-                        id,
-                        &name,
-                        crate::app_groups::process_path(pid).as_deref(),
-                    ),
-                    None => {
-                        strip_exe(&name.to_lowercase()).contains(&needle)
-                            || needle.contains(&strip_exe(&name.to_lowercase()))
+                let Ok(count) = enumerator.GetCount() else { continue };
+                for i in 0..count {
+                    let Ok(ctl): Result<IAudioSessionControl, _> = enumerator.GetSession(i) else {
+                        continue;
+                    };
+                    let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
+                    let Ok(pid) = ctl2.GetProcessId() else { continue };
+                    if pid == 0 {
+                        continue;
                     }
-                };
-                if hit {
-                    visit(&ctl2, pid);
+                    let Some(name) = process_name(pid) else { continue };
+                    if program_matches(process, pid, &name) {
+                        visit(&ctl2, pid);
+                    }
                 }
             }
+        }
+    }
+}
+
+/// Does the running program `pid` (image name `exe`) belong to `program`?
+///
+/// `program` is either a plain executable name (matched loosely, so "chrome"
+/// finds "chrome.exe") or a program-group reference such as `@group:games`.
+pub(crate) fn program_matches(program: &str, pid: u32, exe: &str) -> bool {
+    match crate::app_groups::parse_ref(program) {
+        // Group membership also considers where the program lives (game
+        // libraries), so it needs the full image path.
+        Some(id) => crate::app_groups::matches(id, exe, crate::app_groups::process_path(pid).as_deref()),
+        None => {
+            let needle = strip_exe(&program.to_lowercase());
+            let name = strip_exe(&exe.to_lowercase());
+            name.contains(&needle) || needle.contains(&name)
         }
     }
 }
@@ -515,7 +523,7 @@ unsafe trait IPolicyConfig: IUnknown {
     fn SetEndpointVisibility(&self) -> HRESULT;
 }
 
-fn process_name(pid: u32) -> Option<String> {
+pub(crate) fn process_name(pid: u32) -> Option<String> {
     use windows::core::PWSTR;
     use windows::Win32::System::Threading::QueryFullProcessImageNameW;
     use windows::Win32::System::Threading::PROCESS_NAME_WIN32;

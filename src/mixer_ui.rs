@@ -184,6 +184,11 @@ fn push_channels(ui: &AppWindow, m: &MixerConfig) {
     ui.set_mixer_channels(ModelRc::new(VecModel::from(rows)));
 }
 
+/// Redraw the channel cards after the board changed one (effects switch).
+pub fn refresh_channels(ui: &AppWindow, s: &Shared) {
+    push_channels(ui, &s.preset.mixer);
+}
+
 /// Let the page's faders follow the board. Rows are updated in place, and
 /// only where a level actually moved, so nothing on the page is rebuilt.
 pub fn follow_levels(ui: &AppWindow, s: &Shared) {

@@ -135,7 +135,7 @@ pub fn push(ui: &AppWindow, s: &mut Shared) {
     ui.set_mixer_hint_download(no_cable);
     ui.set_mixer_hint(
         if no_cable {
-            "No virtual cable found. Slidr needs one for the Slidr Mic: install VB-CABLE (free), then choose \"CABLE Output\" as the microphone in your voice chat app."
+            "No virtual cable found. Slidr needs one for the Slidr Mic: install VB-CABLE by VB-Audio (donationware, all participations are welcome), restart Windows, then choose \"CABLE Output\" as the microphone in your voice chat app."
         } else if m.enabled && d.mic_out.is_none() {
             "Choose the Slidr Mic under Settings → Mixer devices so other apps can hear your voice through Slidr."
         } else {

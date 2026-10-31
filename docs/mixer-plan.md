@@ -94,9 +94,20 @@ install button.
 
 ## Installer
 
-Optional NSIS section "Virtual audio devices": downloads VB-CABLE from
-vb-audio.com at install time and installs it silently. The driver is not
-bundled (VB-Audio licence). Slidr detects the cable and labels it "Slidr Mic".
+VB-CABLE is Windows-only and not installed by Slidr's installer: the end-user
+licence in its package says it may not be integrated into another software's
+installation procedure without VB-Audio's agreement (the website's licensing
+page is more permissive; the package licence wins until VB-Audio agrees).
+
+So the installer's finish page points to it instead: a short note naming
+VB-Audio, www.vb-cable.com and "donationware, all participations are welcome",
+and an unchecked "Open the VB-CABLE download page" box. Both are hidden when
+the driver is installed already (its `VBAudioVACMME` / `VBAudioVACWDM` service
+is registered). The Mixer page shows the same hint with a download button when
+no cable is found. Setup needs administrator rights and a restart; that stays
+VB-Audio's own setup, run by the user.
+
+Linux needs no driver (see below).
 
 ## Linux
 

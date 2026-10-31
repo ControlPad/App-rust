@@ -8,15 +8,15 @@ use parking_lot::Mutex;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::glue::Shared;
-use crate::model::{Effects, EqBand, EqBandKind, Fx, FxPreset, FxSlot, MixChannel, MixTarget, MixerConfig};
+use crate::model::{
+    Effects, EqBand, EqBandKind, EqPreset, Fx, FxPreset, FxSlot, MixChannel, MixTarget, MixerConfig, MIC_PREFIX,
+};
 use crate::{AppWindow, EqBandUI, FxSlotUI, MixChannelUI, PickerEntry};
 
 /// Device names behind the page's selectors, as last shown — an index from
 /// the UI is resolved against exactly the list it was picked from.
 #[derive(Default)]
 struct Lists {
-    /// Headphones candidates.
-    outputs: Vec<String>,
     /// Real microphones (virtual cables left out: recording one would loop).
     mics: Vec<String>,
     /// Silent-output candidates (never the Slidr Mic's own cable).
@@ -25,8 +25,10 @@ struct Lists {
     cables: Vec<(String, String)>,
 }
 
-static LISTS: Mutex<Lists> =
-    Mutex::new(Lists { outputs: Vec::new(), mics: Vec::new(), sinks: Vec::new(), cables: Vec::new() });
+static LISTS: Mutex<Lists> = Mutex::new(Lists { mics: Vec::new(), sinks: Vec::new(), cables: Vec::new() });
+
+/// What the picker lists: programs (0) or microphones (1).
+static PICKER_TAB: Mutex<i32> = Mutex::new(0);
 
 /// Where VB-CABLE comes from; opened by the hint's download button.
 const CABLE_DOWNLOAD: &str = "https://vb-audio.com/Cable/";
@@ -63,15 +65,18 @@ fn cables(mics: &[String], outputs: &[String]) -> Vec<(String, String)> {
 
 /// Fill the Mixer page from the profile and settings (and refresh device lists).
 pub fn push(ui: &AppWindow, s: &mut Shared) {
-    if s.preset.mixer.eq_presets.is_empty() {
-        s.preset.mixer.eq_presets = MixerConfig::default_eq_presets();
+    // Profiles that never went through a load (a brand-new one) still carry
+    // the old voice strip.
+    let mic = s.settings.mixer_devices.mic_input.clone();
+    if s.preset.move_voice_to_channel(mic.as_deref()) {
+        commit(s);
     }
     let mut outputs = s.audio.list_outputs();
     let all_mics = s.audio.list_mics();
     let d = &s.settings.mixer_devices;
     // A configured device that is unplugged right now stays selectable, so
     // opening the page doesn't silently drop the choice.
-    for name in [&d.monitor, &d.sink, &d.mic_out].into_iter().flatten() {
+    for name in [&d.sink, &d.mic_out].into_iter().flatten() {
         if !outputs.contains(name) {
             outputs.push(name.clone());
         }
@@ -103,12 +108,7 @@ pub fn push(ui: &AppWindow, s: &mut Shared) {
             cables.push((out.clone(), out.clone()));
         }
     }
-    let mut mics: Vec<String> = all_mics.into_iter().filter(|m| !cables.iter().any(|(c, _)| c == m)).collect();
-    if let Some(name) = &d.mic_input {
-        if !mics.contains(name) {
-            mics.push(name.clone());
-        }
-    }
+    let mics: Vec<String> = all_mics.into_iter().filter(|m| !cables.iter().any(|(c, _)| c == m)).collect();
     let cable_adapter = d.mic_out.as_deref().and_then(adapter);
     let sinks: Vec<String> = outputs
         .iter()
@@ -116,27 +116,19 @@ pub fn push(ui: &AppWindow, s: &mut Shared) {
         .cloned()
         .collect();
 
-    let index = |list: &[String], v: &Option<String>| -> i32 {
-        v.as_ref().and_then(|v| list.iter().position(|n| n == v)).map_or(0, |i| i as i32 + 1)
-    };
-    ui.set_mixer_monitor_names(names("System default", outputs.iter().map(String::as_str)));
-    ui.set_mixer_mic_names(names("System default", mics.iter().map(String::as_str)));
-    ui.set_mixer_spare_names(names("Not used", sinks.iter().map(String::as_str)));
+    // No "Not used" here: a silent output is what lets the mix replace
+    // programs, and there is always one to offer.
+    ui.set_mixer_spare_names(ModelRc::new(VecModel::from(
+        sinks.iter().map(|n| SharedString::from(n.as_str())).collect::<Vec<_>>(),
+    )));
     ui.set_mixer_cable_names(names("Not used", cables.iter().map(|(c, _)| c.as_str())));
-    ui.set_mixer_monitor_idx(index(&outputs, &d.monitor));
-    ui.set_mixer_mic_idx(index(&mics, &d.mic_input));
-    ui.set_mixer_sink_idx(index(&sinks, &d.sink));
+    ui.set_mixer_sink_idx(d.sink.as_ref().and_then(|v| sinks.iter().position(|n| n == v)).map_or(-1, |i| i as i32));
     ui.set_mixer_cable_idx(
         d.mic_out.as_ref().and_then(|o| cables.iter().position(|(_, c)| c == o)).map_or(0, |i| i as i32 + 1),
     );
 
     let m = &s.preset.mixer;
     ui.set_mixer_enabled(m.enabled);
-    ui.set_mixer_voice_level(m.voice.level * 100.0);
-    ui.set_mixer_voice_muted(m.voice.muted);
-    ui.set_mixer_voice_monitor(m.voice.to_monitor);
-    ui.set_mixer_voice_fx_count(m.voice.fx.active() as i32);
-    ui.set_mixer_voice_fx_on(m.voice.fx.on);
     push_channels(ui, m);
 
     let no_cable = cables.is_empty();
@@ -145,13 +137,13 @@ pub fn push(ui: &AppWindow, s: &mut Shared) {
         if no_cable {
             "No virtual cable found. Slidr needs one for the Slidr Mic: install VB-CABLE (free), then choose \"CABLE Output\" as the microphone in your voice chat app."
         } else if m.enabled && d.mic_out.is_none() {
-            "Choose the Slidr Mic under Advanced so other apps can hear your voice through Slidr."
+            "Choose the Slidr Mic under Settings → Mixer devices so other apps can hear your voice through Slidr."
         } else {
             ""
         }
         .into(),
     );
-    *LISTS.lock() = Lists { outputs, mics, sinks, cables };
+    *LISTS.lock() = Lists { mics, sinks, cables };
 }
 
 /// Selector model: a leading "none" entry, then the names.
@@ -159,24 +151,51 @@ fn names<'a>(first: &'a str, list: impl Iterator<Item = &'a str>) -> ModelRc<Sha
     ModelRc::new(VecModel::from(std::iter::once(first).chain(list).map(SharedString::from).collect::<Vec<_>>()))
 }
 
+/// What a channel source is called on the page: a program (or program
+/// category), or a microphone.
+fn source_label(p: &str) -> String {
+    match p.strip_prefix(MIC_PREFIX) {
+        Some("") => "Default microphone".into(),
+        Some(mic) => mic.to_string(),
+        None => crate::app_groups::label_for(p),
+    }
+}
+
+fn channel_ui(m: &MixerConfig, c: &MixChannel) -> MixChannelUI {
+    let shown = |t: MixTarget, saved: f32| crate::mixer::shown_level(m, t).unwrap_or(saved) * 100.0;
+    MixChannelUI {
+        id: c.id as i32,
+        name: c.name.as_str().into(),
+        programs: c.programs.iter().map(|p| source_label(p)).collect::<Vec<_>>().join(", ").into(),
+        mics_only: c.mics_only(),
+        level: shown(MixTarget::Channel(c.id), c.level),
+        muted: c.muted,
+        fx_count: c.fx.active() as i32,
+        fx_on: c.fx.on,
+        reroute: c.reroute,
+        send_on: c.mic_send.is_some(),
+        send: shown(MixTarget::Send(c.id), c.mic_send.unwrap_or(1.0)),
+        collapsed: c.collapsed,
+    }
+}
+
 fn push_channels(ui: &AppWindow, m: &MixerConfig) {
-    let rows: Vec<MixChannelUI> = m
-        .channels
-        .iter()
-        .map(|c| MixChannelUI {
-            id: c.id as i32,
-            name: c.name.as_str().into(),
-            programs: c.programs.iter().map(|p| crate::app_groups::label_for(p)).collect::<Vec<_>>().join(", ").into(),
-            level: c.level * 100.0,
-            muted: c.muted,
-            fx_count: c.fx.active() as i32,
-            fx_on: c.fx.on,
-            reroute: c.reroute,
-            send_on: c.mic_send.is_some(),
-            send: c.mic_send.unwrap_or(1.0) * 100.0,
-        })
-        .collect();
+    let rows: Vec<MixChannelUI> = m.channels.iter().map(|c| channel_ui(m, c)).collect();
     ui.set_mixer_channels(ModelRc::new(VecModel::from(rows)));
+}
+
+/// Let the page's faders follow the board. Rows are updated in place, and
+/// only where a level actually moved, so nothing on the page is rebuilt.
+pub fn follow_levels(ui: &AppWindow, s: &Shared) {
+    let m = &s.preset.mixer;
+    let model = ui.get_mixer_channels();
+    for (i, c) in m.channels.iter().enumerate() {
+        let Some(row) = model.row_data(i).filter(|r| r.id == c.id as i32) else { return };
+        let new = channel_ui(m, c);
+        if (row.level - new.level).abs() > 0.5 || (row.send - new.send).abs() > 0.5 {
+            model.set_row_data(i, MixChannelUI { level: new.level, send: new.send, ..row });
+        }
+    }
 }
 
 // ── Effects rack ────────────────────────────────────────────────────────────
@@ -257,15 +276,27 @@ fn fx_presets(s: &Shared) -> Vec<FxPreset> {
     FxPreset::built_in().into_iter().chain(s.settings.fx_presets.iter().cloned()).collect()
 }
 
+/// Built-in EQ curves first, then the user's.
+fn eq_presets(s: &Shared) -> Vec<EqPreset> {
+    MixerConfig::default_eq_presets().into_iter().chain(s.settings.eq_presets.iter().cloned()).collect()
+}
+
+/// Names for a preset selector: the user's own marked "(mine)".
+fn preset_names(all: Vec<String>, builtin: usize) -> ModelRc<SharedString> {
+    let names: Vec<String> =
+        all.into_iter().enumerate().map(|(i, n)| if i < builtin { n } else { format!("{n} (mine)") }).collect();
+    self::names("Load preset…", names.iter().map(String::as_str))
+}
+
+fn push_eq_presets(ui: &AppWindow, s: &Shared) {
+    let builtin = MixerConfig::default_eq_presets().len();
+    ui.set_mixer_eq_preset_names(preset_names(eq_presets(s).into_iter().map(|p| p.name).collect(), builtin));
+}
+
 fn push_rack(ui: &AppWindow, s: &Shared, fx: &Effects) {
     ui.set_mixer_fx_slots(ModelRc::new(VecModel::from(fx.chain.iter().map(slot_ui).collect::<Vec<_>>())));
     let builtin = FxPreset::built_in().len();
-    let presets: Vec<String> = fx_presets(s)
-        .iter()
-        .enumerate()
-        .map(|(i, p)| if i < builtin { p.name.clone() } else { format!("{} (mine)", p.name) })
-        .collect();
-    ui.set_mixer_fx_preset_names(names("Load preset…", presets.iter().map(String::as_str)));
+    ui.set_mixer_fx_preset_names(preset_names(fx_presets(s).into_iter().map(|p| p.name).collect(), builtin));
     let catalog: Vec<&str> = Fx::catalog().iter().map(Fx::name).collect();
     ui.set_mixer_fx_add_names(names("Add effect…", catalog.into_iter()));
 }
@@ -413,10 +444,24 @@ fn push_picker(ui: &AppWindow, s: &Shared, channel: u32) {
         });
         seen.push(value);
     };
+    // Microphones tab: the default one, every real microphone, and whatever
+    // the channel already holds (unplugged ones stay removable).
+    if *PICKER_TAB.lock() == 1 {
+        add(source_label(MIC_PREFIX), MIC_PREFIX.into(), 1, false);
+        for m in c.mics() {
+            add(source_label(&format!("{MIC_PREFIX}{m}")), format!("{MIC_PREFIX}{m}"), 1, false);
+        }
+        for m in &LISTS.lock().mics {
+            add(m.clone(), format!("{MIC_PREFIX}{m}"), 1, false);
+        }
+        rows.sort_by_key(|r| !r.selected);
+        ui.set_mixer_picker_options(ModelRc::new(VecModel::from(rows)));
+        return;
+    }
     for g in crate::app_groups::groups() {
         add(g.name.clone(), crate::app_groups::make_ref(&g.id), g.icon, true);
     }
-    for p in &c.programs {
+    for p in c.programs.iter().filter(|p| !p.starts_with(MIC_PREFIX)) {
         add(crate::app_groups::label_for(p), p.clone(), 0, crate::app_groups::parse_ref(p).is_some());
     }
     let mut playing = s.audio.list_processes();
@@ -447,10 +492,16 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         let weak = ui.as_weak();
         let shared = shared.clone();
         ui.on_page_changed(move |page| {
-            if page == 4 {
-                if let Some(ui) = weak.upgrade() {
-                    push(&ui, &mut shared.lock());
+            let Some(ui) = weak.upgrade() else { return };
+            match page {
+                4 => push(&ui, &mut shared.lock()),
+                // Settings holds the mixer's devices, and the presets saved in the mixer.
+                3 => {
+                    let mut s = shared.lock();
+                    push(&ui, &mut s);
+                    crate::presets_ui::push(&ui, &s.settings);
                 }
+                _ => {}
             }
         });
     }
@@ -461,13 +512,12 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
             let Some(ui) = weak.upgrade() else { return };
             let mut s = shared.lock();
             let lists = LISTS.lock();
-            let pick = |list: &[String], idx: i32| -> Option<String> {
-                usize::try_from(idx - 1).ok().and_then(|i| list.get(i)).cloned()
-            };
             let d = &mut s.settings.mixer_devices;
-            d.monitor = pick(&lists.outputs, ui.get_mixer_monitor_idx());
-            d.mic_input = pick(&lists.mics, ui.get_mixer_mic_idx());
-            d.sink = pick(&lists.sinks, ui.get_mixer_sink_idx());
+            // The mix follows the default output; an old pick would only confuse.
+            d.monitor = None;
+            if let Some(sink) = usize::try_from(ui.get_mixer_sink_idx()).ok().and_then(|i| lists.sinks.get(i)) {
+                d.sink = Some(sink.clone());
+            }
             d.mic_out = usize::try_from(ui.get_mixer_cable_idx() - 1)
                 .ok()
                 .and_then(|i| lists.cables.get(i))
@@ -478,26 +528,49 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
                 d.sink = None;
             }
             drop(lists);
-            let was_enabled = s.preset.mixer.enabled;
-            let m = &mut s.preset.mixer;
-            m.enabled = ui.get_mixer_enabled();
-            m.voice.level = (ui.get_mixer_voice_level() / 100.0).clamp(0.0, 1.0);
-            m.voice.muted = ui.get_mixer_voice_muted();
-            m.voice.to_monitor = ui.get_mixer_voice_monitor();
-            m.voice.fx.on = ui.get_mixer_voice_fx_on();
+            s.preset.mixer.enabled = ui.get_mixer_enabled();
             commit(&mut s);
             // Lists depend on each other (the silent output excludes the
             // Slidr Mic's cable) and the hint on the switch.
-            let _ = was_enabled;
             push(&ui, &mut s);
         });
     }
     {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_mixer_move_channel(move |id, to| {
+            let mut s = shared.lock();
+            let channels = &mut s.preset.mixer.channels;
+            let Some(from) = channels.iter().position(|c| c.id as i32 == id) else { return };
+            // `to` is an insertion slot in the list as it was, before this channel left it.
+            let to = (to.max(0) as usize).min(channels.len());
+            let to = if to > from { to - 1 } else { to };
+            if to == from {
+                return;
+            }
+            let c = channels.remove(from);
+            channels.insert(to, c);
+            commit(&mut s);
+            if let Some(ui) = weak.upgrade() {
+                push_channels(&ui, &s.preset.mixer);
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
         let shared = shared.clone();
         ui.on_mixer_channel_set(move |id, field, num, text| {
             let mut s = shared.lock();
             let Some(c) = s.preset.mixer.channels.iter_mut().find(|c| c.id as i32 == id) else { return };
             match field.as_str() {
+                "collapsed" => {
+                    c.collapsed = num > 0.5;
+                    commit(&mut s);
+                    if let Some(ui) = weak.upgrade() {
+                        push_channels(&ui, &s.preset.mixer);
+                    }
+                    return;
+                }
                 "name" => c.name = text.to_string(),
                 "level" => c.level = (num / 100.0).clamp(0.0, 1.0),
                 "muted" => c.muted = num > 0.5,
@@ -526,6 +599,7 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
                 fx: Effects::default(),
                 reroute: true,
                 mic_send: None,
+                collapsed: false,
             });
             commit(&mut s);
             if let Some(ui) = weak.upgrade() {
@@ -541,7 +615,11 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
             let s = shared.lock();
             let Some(c) = s.preset.mixer.channels.iter().find(|c| c.id as i32 == id) else { return };
             *PICKING.lock() = Some(c.id);
-            ui.set_mixer_picker_title(format!("Programs for {}", c.name).into());
+            // Opens on microphones for a channel that only has those.
+            let tab = i32::from(c.mics_only());
+            *PICKER_TAB.lock() = tab;
+            ui.set_mixer_picker_tab_index(tab);
+            ui.set_mixer_picker_title(format!("Sources for {}", c.name).into());
             ui.set_mixer_picker_filter("".into());
             push_picker(&ui, &s, c.id);
             ui.set_mixer_picker_open(true);
@@ -572,6 +650,16 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         ui.on_mixer_picker_filter_changed(move |_| {
             let Some(ui) = weak.upgrade() else { return };
             let Some(id) = *PICKING.lock() else { return };
+            push_picker(&ui, &shared.lock(), id);
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_mixer_picker_tab(move |tab| {
+            let Some(ui) = weak.upgrade() else { return };
+            let Some(id) = *PICKING.lock() else { return };
+            *PICKER_TAB.lock() = tab;
             push_picker(&ui, &shared.lock(), id);
         });
     }
@@ -689,7 +777,6 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
             // The strip buttons show how many effects are on.
             if let Some(ui) = weak.upgrade() {
                 let s = shared.lock();
-                ui.set_mixer_voice_fx_count(s.preset.mixer.voice.fx.active() as i32);
                 push_channels(&ui, &s.preset.mixer);
             }
         });
@@ -701,12 +788,10 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
             let Some(ui) = weak.upgrade() else { return };
             let Some(target) = *EDITING_FX.lock() else { return };
             let mut s = shared.lock();
-            if s.preset.mixer.eq_presets.is_empty() {
-                s.preset.mixer.eq_presets = MixerConfig::default_eq_presets();
-            }
+            push_eq_presets(&ui, &s);
+            ui.set_mixer_eq_preset_name("".into());
             let m = &mut s.preset.mixer;
             ui.set_mixer_eq_title(format!("EQ – {}", m.label(target)).into());
-            ui.set_mixer_eq_preset_names(names("Load preset…", m.eq_presets.iter().map(|p| p.name.as_str())));
             let Some(slot) = effects_mut(m, target).and_then(|fx| fx.slot_mut(id as u32)) else { return };
             let Fx::Eq { bands } = &slot.fx else { return };
             *EDITING_EQ.lock() = Some((target, slot.id));
@@ -793,11 +878,35 @@ pub fn wire(ui: &AppWindow, shared: Arc<parking_lot::Mutex<Shared>>) {
         ui.on_mixer_eq_load_preset(move |i| {
             let Some(ui) = weak.upgrade() else { return };
             let mut s = shared.lock();
-            let Some(preset) = s.preset.mixer.eq_presets.get(i as usize).map(|p| p.bands.clone()) else { return };
+            let Some(preset) = eq_presets(&s).into_iter().nth(i as usize).map(|p| p.bands) else { return };
             edit_eq(&ui, &mut s, true, true, |on, bands| {
                 *bands = preset;
                 *on = true;
             });
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let shared = shared.clone();
+        ui.on_mixer_eq_save_preset(move |name| {
+            let Some(ui) = weak.upgrade() else { return };
+            let name = name.trim().to_string();
+            let Some((target, id)) = *EDITING_EQ.lock() else { return };
+            if name.is_empty() {
+                return;
+            }
+            let mut s = shared.lock();
+            let Some(slot) = effects_mut(&mut s.preset.mixer, target).and_then(|fx| fx.slot_mut(id)) else { return };
+            let Fx::Eq { bands } = &slot.fx else { return };
+            let bands = bands.clone();
+            // Same name again replaces the old one.
+            let presets = &mut s.settings.eq_presets;
+            presets.retain(|p| p.name != name);
+            let id = presets.iter().map(|p| p.id).max().unwrap_or(1000) + 1;
+            presets.push(EqPreset { id, name: name.clone(), bands });
+            commit(&mut s);
+            push_eq_presets(&ui, &s);
+            crate::glue::toast(&ui, &format!("Saved preset \"{name}\""));
         });
     }
     {

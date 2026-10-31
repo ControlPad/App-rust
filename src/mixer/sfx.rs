@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::model::{Fx, MixTarget, MixerConfig};
+use crate::model::{MixTarget, MixerConfig};
 
 use super::dsp::{BLOCK_FRAMES, RATE};
 
@@ -20,13 +20,18 @@ use super::dsp::{BLOCK_FRAMES, RATE};
 pub type Sound = Arc<Vec<f32>>;
 pub type Sounds = HashMap<String, Sound>;
 
-/// Fade for a switch that has no sound (e.g. the effects master switch).
+/// Fade for a switch whose sound file is missing.
 const SILENT_FADE: u32 = RATE / 4;
 /// Default level of the feedback sounds.
 pub const SFX_GAIN: f32 = 0.8;
 
+/// The sound sets to choose from in Settings: (folder under `sets/`, name).
+pub const SETS: [(&str, &str); 3] = [("tide", "Tide"), ("grid", "Grid"), ("grain", "Grain")];
+pub const DEFAULT_SET: &str = "tide";
+
 /// Where the sounds are read from: `SLIDR_SOUND_DIR`, else `~/mixer-sounds`
 /// (while they are being designed; they move into the repo once settled).
+/// Each set is a folder `sets/<id>` in there.
 pub fn sound_dir() -> Option<PathBuf> {
     std::env::var_os("SLIDR_SOUND_DIR").map(PathBuf::from).or_else(|| dirs::home_dir().map(|h| h.join("mixer-sounds")))
 }
@@ -69,16 +74,34 @@ pub fn parse_wav(bytes: &[u8]) -> Option<Vec<f32>> {
     })
 }
 
-/// The sound folder, re-read file by file when something changed.
-#[derive(Default)]
+/// The chosen set's folder, re-read file by file when something changed.
 pub struct Library {
+    set: String,
     files: HashMap<String, (SystemTime, Sound)>,
 }
 
+impl Default for Library {
+    fn default() -> Self {
+        Self { set: DEFAULT_SET.into(), files: HashMap::new() }
+    }
+}
+
 impl Library {
+    /// Switch to another set (an unknown one falls back to the default);
+    /// the next [`Library::refresh`] loads it. `true` if it changed.
+    pub fn select(&mut self, set: &str) -> bool {
+        let set = SETS.iter().find(|s| s.0 == set).map_or(DEFAULT_SET, |s| s.0);
+        if self.set == set {
+            return false;
+        }
+        self.set = set.into();
+        self.files.clear();
+        true
+    }
+
     /// Pick up added, changed and removed files. `true` if anything changed.
     pub fn refresh(&mut self) -> bool {
-        let Some(dir) = sound_dir() else { return false };
+        let Some(dir) = sound_dir().map(|d| d.join("sets").join(&self.set)) else { return false };
         let Ok(entries) = std::fs::read_dir(&dir) else {
             let had = !self.files.is_empty();
             self.files.clear();
@@ -135,18 +158,6 @@ impl Fades {
     }
 }
 
-/// The sound named for an effect being switched: `comp_on`, `eq_off`, …
-fn fx_sound(fx: &Fx, on: bool) -> String {
-    let base = match fx {
-        Fx::Gate(_) => "gate",
-        Fx::Eq { .. } => "eq",
-        Fx::Compressor(_) => "comp",
-        Fx::Normalizer(_) => "normalizer",
-        Fx::Limiter(_) => "limiter",
-    };
-    format!("{base}_{}", if on { "on" } else { "off" })
-}
-
 pub fn switch_sound(base: &str, on: bool) -> String {
     format!("{base}_{}", if on { "on" } else { "off" })
 }
@@ -187,6 +198,18 @@ pub fn diff(
             }
         }
     }
+    for c in &new.channels {
+        let Some(o) = old.channels.iter().find(|o| o.id == c.id) else { continue };
+        if o.reroute != c.reroute {
+            switched(switch_sound("replace", c.reroute), 0);
+        }
+        // Into the Slidr Mic: the send fades in / out with its sound.
+        if o.mic_send.is_some() != c.mic_send.is_some() {
+            let len = switched(switch_sound("mic", c.mic_send.is_some()), BLOCK_FRAMES as u32);
+            let e = fades.gain.entry(MixTarget::Channel(c.id)).or_insert(0);
+            *e = (*e).max(len);
+        }
+    }
     if old.voice.to_monitor != new.voice.to_monitor {
         let len = switched(switch_sound("monitor", new.voice.to_monitor), BLOCK_FRAMES as u32);
         let e = fades.gain.entry(MixTarget::Voice).or_insert(0);
@@ -194,14 +217,23 @@ pub fn diff(
     }
     for (strip, a, b) in strips {
         let master = a.on != b.on;
+        // The master switch clicks once for the whole chain: `effects_on/off`,
+        // or the EQ's sound while there is no file of its own.
+        let master_len = if master {
+            let own = switch_sound("effects", b.on);
+            let name = if sounds.contains_key(&own) { own } else { switch_sound("eq", b.on) };
+            switched(name, SILENT_FADE)
+        } else {
+            0
+        };
         for slot in &b.chain {
             let Some(was) = a.chain.iter().find(|s| s.id == slot.id) else { continue };
             let (before, after) = (was.on && a.on, slot.on && b.on);
             if before == after {
                 continue;
             }
-            // Only the effect's own switch clicks; the master switch fades quietly.
-            let len = if master { SILENT_FADE } else { switched(fx_sound(&slot.fx, after), SILENT_FADE) };
+            // Switches inside the effects menu stay quiet; only the master clicks.
+            let len = if master { master_len } else { SILENT_FADE };
             fades.slots.insert((strip, slot.id), len);
         }
     }
@@ -243,7 +275,7 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Effects, FxSlot, Limiter, MixChannel};
+    use crate::model::{Effects, Fx, FxSlot, Limiter, MixChannel};
 
     fn wav(channels: u16, rate: u32, samples: &[i16]) -> Vec<u8> {
         let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -284,6 +316,7 @@ mod tests {
                 fx,
                 reroute: true,
                 mic_send: None,
+                collapsed: false,
             }],
             ..Default::default()
         }
@@ -301,9 +334,9 @@ mod tests {
             move |t| (t == MixTarget::Channel(1)).then_some(m)
         };
         let (play, fades) = diff(&a, &b, &muted(&a), &muted(&b), &sounds);
-        assert_eq!(play.len(), 2);
+        assert_eq!(play.len(), 1, "effects inside the menu switch quietly");
         assert_eq!(fades.gain(MixTarget::Channel(1)), 300);
-        assert_eq!(fades.slot(MixTarget::Channel(1), 7), 500);
+        assert_eq!(fades.slot(MixTarget::Channel(1), 7), SILENT_FADE);
         // Nothing switched: nothing plays, quick changes.
         let (play, fades) = diff(&a, &a, &muted(&a), &muted(&a), &sounds);
         assert!(play.is_empty());
@@ -311,10 +344,43 @@ mod tests {
     }
 
     #[test]
-    fn master_switch_fades_every_effect_without_clicks() {
-        let (play, fades) = diff(&cfg(false, true, true), &cfg(false, true, false), &|_| None, &|_| None, &Sounds::new());
-        assert!(play.is_empty());
+    fn replace_and_mic_switches_have_their_sounds() {
+        let sounds: Sounds = [("replace_off", 100usize), ("mic_on", 700)]
+            .into_iter()
+            .map(|(n, l)| (n.to_string(), Arc::new(vec![0.0; l])))
+            .collect();
+        let a = cfg(false, true, true);
+        let mut b = a.clone();
+        b.channels[0].reroute = false;
+        b.channels[0].mic_send = Some(0.5);
+        let (play, fades) = diff(&a, &b, &|_| None, &|_| None, &sounds);
+        assert_eq!(play.len(), 2);
+        assert_eq!(fades.gain(MixTarget::Channel(1)), 700, "the send fades with its sound");
+    }
+
+    #[test]
+    fn master_switch_clicks_once_and_fades_every_effect() {
+        let (a, b) = (cfg(false, true, true), cfg(false, true, false));
+        let (play, fades) = diff(&a, &b, &|_| None, &|_| None, &Sounds::new());
+        assert!(play.is_empty(), "no file, no sound");
         assert_eq!(fades.slot(MixTarget::Channel(1), 7), SILENT_FADE);
+        let eq: Sounds = [("eq_off".to_string(), Arc::new(vec![0.0; 900]))].into();
+        let (play, fades) = diff(&a, &b, &|_| None, &|_| None, &eq);
+        assert_eq!(play.len(), 1, "falls back to the EQ sound");
+        assert_eq!(fades.slot(MixTarget::Channel(1), 7), 900);
+        let own: Sounds = [("effects_off".to_string(), Arc::new(vec![0.0; 400])), ("eq_off".to_string(), Arc::new(vec![0.0; 900]))].into();
+        assert_eq!(diff(&a, &b, &|_| None, &|_| None, &own).1.slot(MixTarget::Channel(1), 7), 400);
+    }
+
+    #[test]
+    fn selecting_a_set_drops_the_old_sounds_and_unknown_sets_fall_back() {
+        let mut lib = Library::default();
+        lib.files.insert("mute_on".into(), (SystemTime::UNIX_EPOCH, Arc::new(vec![0.0])));
+        assert!(!lib.select("tide"), "already the default");
+        assert!(lib.select("grid"));
+        assert!(lib.sounds().is_empty());
+        assert!(lib.select("no-such-set"));
+        assert_eq!(lib.set, DEFAULT_SET);
     }
 
     #[test]

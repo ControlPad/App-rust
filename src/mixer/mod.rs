@@ -16,12 +16,17 @@ mod route;
 #[cfg(target_os = "windows")]
 mod windows_io;
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::Sender;
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
+use parking_lot::Mutex;
 
 use crate::model::{MixTarget, MixerConfig, MixerDevices};
+
+pub use sfx::{DEFAULT_SET as DEFAULT_SOUND_SET, SETS as SOUND_SETS};
 
 /// The audio adapter in an endpoint's friendly name — the part in the last
 /// parentheses: "CABLE Output (VB-Audio Virtual Cable)" → "VB-Audio Virtual Cable".
@@ -36,16 +41,31 @@ const JOURNAL_FILE: &str = "mixer-routing.json";
 
 pub enum Cmd {
     Configure(MixerConfig, MixerDevices),
+    /// The next `Configure` is Slidr starting with the mixer on: no power-on sound.
+    QuietStart,
     SetLevel(MixTarget, f32),
     SetMute(MixTarget, bool),
     ToggleMute(MixTarget),
-    /// Switch sounds on/off, and their volume (0..1).
-    SoundPrefs(bool, f32),
+    /// Switch sounds on/off, their volume (0..1) and the set they come from.
+    SoundPrefs(bool, f32, String),
     /// Restore rerouted programs and stop; acknowledged on the sender.
     Shutdown(Sender<()>),
 }
 
 static TX: OnceCell<Option<Sender<Cmd>>> = OnceCell::new();
+
+/// A layout was handed over since launch.
+static LAUNCHED: AtomicBool = AtomicBool::new(false);
+
+/// Levels the board set, and the layout they apply over — for the Mixer page,
+/// which shows them. Kept by the same rule as the mixer's own: a board move
+/// stays until the page changes that same level.
+static BOARD: Lazy<Mutex<(HashMap<MixTarget, f32>, MixerConfig)>> = Lazy::new(Default::default);
+
+/// Where a strip's fader really is: the board's last move, else the layout's.
+pub fn shown_level(cfg: &MixerConfig, t: MixTarget) -> Option<f32> {
+    BOARD.lock().0.get(&t).copied().or_else(|| cfg.level(t))
+}
 
 /// The mixer thread's inbox, started on first use. `None` where the mixer
 /// isn't implemented yet (Linux, see the plan).
@@ -77,14 +97,27 @@ fn send(cmd: Cmd) {
 
 /// Adopt a profile's layout and the mixer devices.
 pub fn configure(mixer: MixerConfig, devices: MixerDevices) {
+    {
+        let mut board = BOARD.lock();
+        let (levels, last) = &mut *board;
+        levels.retain(|t, _| last.level(*t) == mixer.level(*t));
+        *last = mixer.clone();
+    }
+    // The first layout after launch: the mixer comes up with the app, which
+    // isn't the user switching it on.
+    let launching = !LAUNCHED.swap(true, Ordering::Relaxed);
     // Nothing to start for a profile that never used the mixer.
     if !mixer.enabled && TX.get().is_none() && !journal_pending() {
         return;
+    }
+    if launching && mixer.enabled {
+        send(Cmd::QuietStart);
     }
     send(Cmd::Configure(mixer, devices));
 }
 
 pub fn set_level(target: MixTarget, value: f32) {
+    BOARD.lock().0.insert(target, value);
     send(Cmd::SetLevel(target, value));
 }
 
@@ -96,11 +129,11 @@ pub fn toggle_mute(target: MixTarget) {
     send(Cmd::ToggleMute(target));
 }
 
-/// Switch sounds on/off and their volume. Only reaches a mixer that is
+/// Switch sounds on/off, their volume and set. Only reaches a mixer that is
 /// already running (one that isn't has nothing to click).
-pub fn sound_prefs(on: bool, volume: f32) {
+pub fn sound_prefs(on: bool, volume: f32, set: &str) {
     if let Some(Some(tx)) = TX.get() {
-        let _ = tx.send(Cmd::SoundPrefs(on, volume));
+        let _ = tx.send(Cmd::SoundPrefs(on, volume, set.to_string()));
     }
 }
 

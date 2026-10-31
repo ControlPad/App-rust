@@ -411,6 +411,10 @@ enum AudioCmd {
     Capture(HashMap<u32, u32>),
     /// Channels whose programs are rerouted (and so belong on the monitor).
     Monitored(Vec<(u32, bool)>),
+    /// Microphones to capture: (channel, device name; "" = system default).
+    Mics(HashSet<(u32, String)>),
+    /// The system's default output changed: the monitor follows it.
+    DefaultOutputChanged,
     /// The feedback sounds, after the folder changed.
     Sounds(Sounds),
     Stop(crossbeam_channel::Sender<()>),
@@ -427,14 +431,20 @@ struct Audio {
     live_mutes: HashMap<MixTarget, bool>,
     monitor: Option<Output>,
     mic_out: Option<Output>,
-    voice: Option<Capture>,
     /// pid → (channel, capture).
     captures: HashMap<u32, (u32, Capture)>,
+    /// (channel, microphone) → capture; `None` while the microphone isn't
+    /// there (tried again when the set of microphones changes).
+    mics: HashMap<(u32, String), Option<Capture>>,
     /// Whether devices are open and mixing — the control thread only starts
     /// captures and reroutes while this is set.
     running_flag: Arc<AtomicBool>,
     sounds: Sounds,
     sfx_on: bool,
+    /// The set the sounds come from, once the settings named it.
+    sound_set: Option<String>,
+    /// The next layout is the one Slidr starts with: power on without a sound.
+    quiet_start: bool,
     player: Player,
     /// Master gain of both buses: fades in on power-on, out on power-off.
     bus: Fade,
@@ -458,11 +468,13 @@ impl Audio {
             live_mutes: HashMap::new(),
             monitor: None,
             mic_out: None,
-            voice: None,
             captures: HashMap::new(),
+            mics: HashMap::new(),
             running_flag,
             sounds: Sounds::new(),
             sfx_on: true,
+            sound_set: None,
+            quiet_start: false,
             player: Player::default(),
             bus: Fade::new(1.0),
             closing: None,
@@ -495,6 +507,7 @@ impl Audio {
     fn handle(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Configure(cfg, devices) => self.configure(cfg, devices),
+            Cmd::QuietStart => self.quiet_start = true,
             Cmd::SetLevel(t, v) => {
                 self.live_levels.insert(t, v);
                 self.engine.set_level(t, v);
@@ -510,9 +523,16 @@ impl Audio {
                     self.engine.set_mute(t, !m, len);
                 }
             }
-            Cmd::SoundPrefs(on, volume) => {
+            Cmd::SoundPrefs(on, volume, set) => {
                 self.sfx_on = on;
                 self.player.gain = volume.clamp(0.0, 1.0);
+                // Picking another set lets you hear it (not on the first
+                // prefs after start, which only restore the saved one).
+                let changed = self.sound_set.as_ref().is_some_and(|s| *s != set);
+                self.sound_set = Some(set);
+                if changed && self.running() && self.closing.is_none() {
+                    self.play("mute_on");
+                }
             }
             Cmd::Shutdown(_) => unreachable!("the control thread handles shutdown"),
         }
@@ -555,19 +575,23 @@ impl Audio {
         let (was_on, now_on) = (old.enabled, cfg.enabled);
         self.cfg = cfg;
         self.devices = devices;
-        if reopen || (now_on && !was_on) {
+        let starting = std::mem::take(&mut self.quiet_start);
+        if now_on && !was_on {
+            // Power-on: the mix rises with its sound — but not when Slidr
+            // itself starts with the mixer on; nothing was switched then.
+            self.closing = None;
             self.close_devices();
-            if now_on {
-                self.open_devices();
-                if !was_on {
-                    // Power-on: the mix rises with its sound. (A device change
-                    // just reopens, quietly.)
-                    self.bus = Fade::new(0.0);
-                    let len = self.play("power_on");
-                    self.bus.set_over(1.0, len.max(BLOCK_FRAMES as u32));
-                }
-            }
-        } else if was_on && !now_on && self.running() {
+            self.open_devices();
+            self.bus = Fade::new(0.0);
+            let len = if starting { 0 } else { self.play("power_on") };
+            self.bus.set_over(1.0, len.max(BLOCK_FRAMES as u32));
+        } else if reopen && now_on {
+            // Another device: reopen quietly. Program captures don't depend
+            // on the devices and keep running (the control thread only sends
+            // changes, so dropping them here would leave the mix silent).
+            self.close_outputs();
+            self.open_devices();
+        } else if was_on && !now_on && was_running {
             // Power-off: keep playing while the mix sinks with its sound.
             let len = self.play("power_off").max(BLOCK_FRAMES as u32);
             self.bus.set_over(0.0, len);
@@ -591,14 +615,18 @@ impl Audio {
 
     fn open_devices(&mut self) {
         let d = self.devices.clone();
-        self.monitor = match find_device(&self.en, eRender, d.monitor.as_deref()).as_ref().map(Output::open) {
+        // The mix plays on the system's default output and follows it (so
+        // switching outputs in Windows or from the board just works). Tests
+        // name a silent one instead.
+        let monitor = if cfg!(test) { d.monitor.as_deref() } else { None };
+        self.monitor = match find_device(&self.en, eRender, monitor).as_ref().map(Output::open) {
             Some(Ok(o)) => Some(o),
             Some(Err(e)) => {
                 log::warn!("mixer: {e:#}");
                 None
             }
             None => {
-                log::warn!("mixer: monitor device {:?} not found", d.monitor);
+                log::warn!("mixer: no output device to play on");
                 None
             }
         };
@@ -609,13 +637,6 @@ impl Audio {
                 None
             }
         });
-        self.voice = match find_device(&self.en, eCapture, d.mic_input.as_deref()).as_ref().and_then(device_id) {
-            Some(id) => Some(Capture::spawn(Source::Device(id))),
-            None => {
-                log::warn!("mixer: microphone {:?} not found", d.mic_input);
-                None
-            }
-        };
         log::info!(
             "mixer: monitor {:?}, Slidr Mic {:?}",
             self.monitor.as_ref().map(|o| &o.name),
@@ -625,9 +646,39 @@ impl Audio {
 
     fn close_devices(&mut self) {
         self.captures.clear();
-        self.voice = None;
+        self.mics.clear();
+        self.close_outputs();
+    }
+
+    /// Close the outputs, keeping program and microphone captures.
+    fn close_outputs(&mut self) {
         self.monitor = None;
         self.mic_out = None;
+    }
+
+    /// Start captures for microphones added to channels, drop removed ones.
+    fn set_mics(&mut self, wanted: HashSet<(u32, String)>) {
+        self.mics.retain(|k, cap| wanted.contains(k) && cap.is_some());
+        let cable = self.devices.mic_out.as_deref().and_then(super::adapter).map(str::to_string);
+        for key in wanted {
+            if self.mics.contains_key(&key) {
+                continue;
+            }
+            let name = (!key.1.is_empty()).then_some(key.1.as_str());
+            let dev = find_device(&self.en, eCapture, name);
+            // Recording the Slidr Mic's own cable (say, as the default
+            // microphone) would feed the mix back into itself.
+            if dev.as_ref().map(friendly_name).as_deref().and_then(super::adapter).is_some_and(|a| Some(a) == cable.as_deref()) {
+                log::error!("mixer: microphone {:?} is the Slidr Mic itself; not captured", key.1);
+                self.mics.insert(key, None);
+                continue;
+            }
+            let cap = dev.as_ref().and_then(device_id).map(|id| Capture::spawn(Source::Device(id)));
+            if cap.is_none() {
+                log::warn!("mixer: microphone {:?} not found", key.1);
+            }
+            self.mics.insert(key, cap);
+        }
     }
 
     /// Start captures for new programs, drop those that left. Spawning only
@@ -671,14 +722,16 @@ impl Audio {
                 *s += t;
             }
         }
-        let voice = match &self.voice {
-            Some(cap) => {
-                cap.ring.pop(&mut self.voice_buf);
-                Some(&mut self.voice_buf[..])
+        for ((ch, _), cap) in &self.mics {
+            let Some(cap) = cap else { continue };
+            // A microphone starting up has nothing yet: silence, not an underrun.
+            cap.ring.pop(&mut self.voice_buf);
+            let sum = channels.entry(*ch).or_insert_with(|| vec![0.0; BLOCK_SAMPLES]);
+            for (s, t) in sum.iter_mut().zip(&self.voice_buf) {
+                *s += t;
             }
-            None => None,
-        };
-        self.engine.process(&mut channels, voice, &mut self.monitor_buf, &mut self.mic_buf);
+        }
+        self.engine.process(&mut channels, None, &mut self.monitor_buf, &mut self.mic_buf);
         if !self.bus.is_at(1.0) {
             for (m, k) in self.monitor_buf.chunks_exact_mut(2).zip(self.mic_buf.chunks_exact_mut(2)) {
                 let g = self.bus.next();
@@ -708,18 +761,14 @@ impl Audio {
 
     /// A device went away (unplugged, format change): start over.
     fn reopen(&mut self) {
-        self.close_devices();
+        self.close_outputs();
         self.open_devices();
         self.running_flag.store(self.running(), Ordering::Relaxed);
     }
 }
 
 fn level_of(cfg: &MixerConfig, t: MixTarget) -> Option<f32> {
-    match t {
-        MixTarget::Voice => Some(cfg.voice.level),
-        MixTarget::Channel(id) => cfg.channels.iter().find(|c| c.id == id).map(|c| c.level),
-        MixTarget::Send(id) => cfg.channels.iter().find(|c| c.id == id).and_then(|c| c.mic_send),
-    }
+    cfg.level(t)
 }
 
 fn muted_of(cfg: &MixerConfig, t: MixTarget) -> Option<bool> {
@@ -755,8 +804,15 @@ fn audio_thread(rx: Receiver<AudioCmd>, running_flag: Arc<AtomicBool>) {
             match cmd {
                 AudioCmd::Mixer(c) => audio.handle(c),
                 // While powering off, keep what plays until the fade is over.
-                AudioCmd::Capture(_) | AudioCmd::Monitored(_) if audio.closing.is_some() => {}
+                AudioCmd::Capture(_) | AudioCmd::Monitored(_) | AudioCmd::Mics(_) if audio.closing.is_some() => {}
                 AudioCmd::Capture(wanted) => audio.set_captures(wanted),
+                AudioCmd::Mics(wanted) => audio.set_mics(wanted),
+                AudioCmd::DefaultOutputChanged => {
+                    if audio.running() && audio.closing.is_none() {
+                        log::info!("mixer: default output changed; following it");
+                        audio.reopen();
+                    }
+                }
                 AudioCmd::Monitored(list) => {
                     for (ch, on) in list {
                         audio.engine.set_monitored(ch, on);
@@ -792,6 +848,10 @@ struct Control {
     sink: Option<IMMDevice>,
     /// What the audio thread was last told to capture (to log changes only).
     capturing: HashMap<u32, u32>,
+    /// Microphones the audio thread was last told to capture.
+    mics: HashSet<(u32, String)>,
+    /// The system's default output, as last seen (the monitor follows it).
+    default_output: Option<String>,
     library: Library,
     /// Switched off: rerouted programs go back when the power-off sound ends.
     restore_at: Option<Instant>,
@@ -808,7 +868,7 @@ impl Control {
                 dev
             });
             // Rerouting onto the device the mix plays on would feed it back into itself.
-            let monitor = find_device(&self.en, eRender, devices.monitor.as_deref()).as_ref().and_then(device_id);
+            let monitor = find_device(&self.en, eRender, None).as_ref().and_then(device_id);
             if self.sink.as_ref().and_then(device_id).is_some_and(|s| Some(s) == monitor) {
                 log::error!("mixer: silent output and headphones are the same device; programs are not rerouted");
                 self.sink = None;
@@ -900,8 +960,29 @@ impl Control {
                 router.recover(&paths, &|pid| can_route && reroute.contains(&pid));
             }
         }
-        let monitored = self.cfg.channels.iter().map(|c| (c.id, can_route && c.reroute)).collect();
+        // Microphones play nowhere else: a channel of only microphones is
+        // always heard at its fader (that's "hear yourself").
+        let monitored =
+            self.cfg.channels.iter().map(|c| (c.id, (can_route && c.reroute) || c.mics_only())).collect();
         let _ = self.audio.send(AudioCmd::Monitored(monitored));
+
+        let mics: HashSet<(u32, String)> = if self.cfg.enabled && self.audio_running.load(Ordering::Relaxed) {
+            self.cfg.channels.iter().flat_map(|c| c.mics().map(move |m| (c.id, m.to_string()))).collect()
+        } else {
+            HashSet::new()
+        };
+        if mics != self.mics {
+            self.mics = mics.clone();
+            let _ = self.audio.send(AudioCmd::Mics(mics));
+        }
+
+        let default_output = find_device(&self.en, eRender, None).as_ref().and_then(device_id);
+        if default_output != self.default_output {
+            if self.default_output.is_some() {
+                let _ = self.audio.send(AudioCmd::DefaultOutputChanged);
+            }
+            self.default_output = default_output;
+        }
     }
 
     fn shutdown(&mut self) {
@@ -944,6 +1025,8 @@ pub fn run(rx: Receiver<Cmd>) {
         devices: MixerDevices::default(),
         sink: None,
         capturing: HashMap::new(),
+        mics: HashSet::new(),
+        default_output: None,
         library: Library::default(),
         restore_at: None,
     };
@@ -965,6 +1048,15 @@ pub fn run(rx: Receiver<Cmd>) {
                 control.configure(cfg, devices);
                 // Let the audio thread open its devices before matching programs.
                 next_scan = Instant::now() + Duration::from_millis(200);
+            }
+            Ok(Cmd::SoundPrefs(on, volume, set)) => {
+                // The new set's sounds reach the audio thread first, so its
+                // preview plays from that set.
+                let switched = control.library.select(&set);
+                if control.library.refresh() || switched {
+                    let _ = control.audio.send(AudioCmd::Sounds(control.library.sounds()));
+                }
+                let _ = control.audio.send(AudioCmd::Mixer(Cmd::SoundPrefs(on, volume, set)));
             }
             Ok(cmd) => {
                 let _ = control.audio.send(AudioCmd::Mixer(cmd));
@@ -1029,7 +1121,7 @@ mod tests {
     /// process plays (its own process loopback) at two voice fader positions.
     #[test]
     #[ignore]
-    fn voice_reaches_the_slidr_mic_and_follows_its_fader() {
+    fn microphone_channel_reaches_the_slidr_mic_and_follows_its_fader() {
         let env = |k: &str| std::env::var(k).ok();
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -1043,8 +1135,21 @@ mod tests {
             mic_out: env("SLIDR_TEST_MIC_OUT"),
         };
         assert!(devices.monitor.is_some() && devices.mic_out.is_some(), "set SLIDR_TEST_MONITOR / SLIDR_TEST_MIC_OUT");
-        io.configure(MixerConfig { enabled: true, ..Default::default() }, devices);
-        assert!(io.monitor.is_some() && io.mic_out.is_some() && io.voice.is_some());
+        let mic = env("SLIDR_TEST_MIC").unwrap_or_default();
+        let channel = crate::model::MixChannel {
+            id: 1,
+            name: "Microphone".into(),
+            programs: vec![format!("{}{mic}", crate::model::MIC_PREFIX)],
+            level: 0.0,
+            muted: false,
+            fx: Default::default(),
+            reroute: false,
+            mic_send: Some(1.0),
+            collapsed: false,
+        };
+        io.configure(MixerConfig { enabled: true, channels: vec![channel], ..Default::default() }, devices);
+        io.set_mics([(1, mic)].into_iter().collect());
+        assert!(io.monitor.is_some() && io.mic_out.is_some() && io.mics.values().all(Option::is_some));
         let tap = Capture::spawn(Source::Process(unsafe { GetCurrentProcessId() }));
 
         let energy = |b: &[f32]| b.iter().map(|s| (*s as f64).powi(2)).sum::<f64>();
@@ -1073,14 +1178,14 @@ mod tests {
         };
         measure(&mut io, 1);
         let (full, in_full, bus_full) = measure(&mut io, 2);
-        io.handle(Cmd::SetLevel(MixTarget::Voice, 0.25));
+        io.handle(Cmd::SetLevel(MixTarget::Send(1), 0.25));
         measure(&mut io, 1);
         let (_, in_q, bus_q) = measure(&mut io, 2);
-        io.handle(Cmd::SetMute(MixTarget::Voice, true));
+        io.handle(Cmd::SetMute(MixTarget::Channel(1), true));
         measure(&mut io, 1);
         let (muted, _, _) = measure(&mut io, 2);
         println!(
-            "played {full:.1} dBFS; bus minus input at 100 %: {:.1} dB, at 25 %: {:.1} dB; muted played {muted:.1} dBFS",
+            "microphone {in_full:.1} dBFS, played {full:.1} dBFS; bus minus input at 100 %: {:.1} dB, at 25 %: {:.1} dB; muted played {muted:.1} dBFS",
             bus_full - in_full,
             bus_q - in_q
         );

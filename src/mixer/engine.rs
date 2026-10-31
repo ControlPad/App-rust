@@ -1,4 +1,4 @@
-//! The mix itself: strips, levels, EQ and the two buses. No I/O — the platform
+//! The mix itself: strips, levels, EQ and the two buses. No I/O â€” the platform
 //! layer feeds one block per channel (and the voice) and plays the results.
 
 use std::collections::HashMap;
@@ -187,12 +187,13 @@ mod tests {
             fx: Effects::default(),
             reroute: true,
             mic_send,
+            collapsed: false,
         }
     }
 
     fn engine(channels: Vec<MixChannel>, voice: VoiceStrip) -> Engine {
         let mut e = Engine::default();
-        e.configure(&MixerConfig { enabled: true, channels, voice, eq_presets: vec![] }, &Fades::default());
+        e.configure(&MixerConfig { enabled: true, channels, voice, ..Default::default() }, &Fades::default());
         e
     }
 
@@ -254,7 +255,7 @@ mod tests {
             enabled: true,
             channels: vec![channel(2, Some(1.0))],
             voice: VoiceStrip::default(),
-            eq_presets: vec![],
+            ..Default::default()
         }, &Fades::default());
         assert_eq!(e.muted(MixTarget::Channel(1)), None);
         assert_eq!(run(&mut e, &[1, 2], false), (0.0, 0.25));

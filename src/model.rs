@@ -530,6 +530,18 @@ pub struct Settings {
     /// Their volume, 0..1.
     #[serde(default = "default_sound_volume")]
     pub mixer_sound_volume: f32,
+    /// Which set they come from (`crate::mixer::SOUND_SETS`).
+    #[serde(default = "default_sound_set")]
+    pub mixer_sound_set: String,
+    /// EQ curves saved by the user, offered on every profile's strips.
+    #[serde(default)]
+    pub eq_presets: Vec<EqPreset>,
+
+    /// Show the Sliders / Buttons lists as a grid of cards.
+    #[serde(default)]
+    pub grid_sliders: bool,
+    #[serde(default)]
+    pub grid_buttons: bool,
 
     /// Sidebar tabs in display order, by name (see `crate::sidebar`).
     #[serde(default)]
@@ -541,6 +553,10 @@ pub struct Settings {
 
 fn default_sound_volume() -> f32 {
     0.8
+}
+
+fn default_sound_set() -> String {
+    crate::mixer::DEFAULT_SOUND_SET.into()
 }
 
 impl Default for Settings {
@@ -559,6 +575,10 @@ impl Default for Settings {
             fx_presets: Vec::new(),
             mixer_sounds: true,
             mixer_sound_volume: default_sound_volume(),
+            mixer_sound_set: default_sound_set(),
+            eq_presets: Vec::new(),
+            grid_sliders: false,
+            grid_buttons: false,
             nav_order: Vec::new(),
             nav_hidden: Vec::new(),
         }
@@ -675,6 +695,49 @@ pub fn next_id<T, F: Fn(&T) -> u32>(existing: &[T], id_of: F) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_strip_becomes_a_microphone_channel_once() {
+        let mut p: Preset = serde_json::from_str(r#"{"id":1,"name":"P"}"#).unwrap();
+        p.mixer.channels.push(MixChannel {
+            id: 4,
+            name: "Music".into(),
+            programs: vec!["spotify".into()],
+            level: 1.0,
+            muted: false,
+            fx: Effects::default(),
+            reroute: true,
+            mic_send: None,
+            collapsed: false,
+        });
+        p.mixer.voice.level = 0.25;
+        p.slider_categories.push(SliderCategory {
+            id: 1,
+            name: "Mic".into(),
+            streams: vec![AudioStream { mixer: Some(MixTarget::Voice), ..Default::default() }],
+            collapsed: false,
+        });
+        assert!(p.move_voice_to_channel(Some("Mikrofon (RX)")));
+        let mic = &p.mixer.channels[0];
+        assert_eq!((mic.id, mic.mics().collect::<Vec<_>>()), (5, vec!["Mikrofon (RX)"]));
+        assert_eq!((mic.level, mic.mic_send), (0.0, Some(0.25)), "not heard, sent as before");
+        assert!(mic.mics_only() && !p.mixer.channels[1].mics_only());
+        assert_eq!(p.slider_categories[0].streams[0].mixer, Some(MixTarget::Send(5)));
+        assert!(!p.move_voice_to_channel(None), "only once");
+        assert_eq!(p.mixer.channels.len(), 2);
+    }
+
+    #[test]
+    fn preset_files_say_what_they_hold() {
+        let eq = PresetFile::Eq(MixerConfig::default_eq_presets().remove(0));
+        let json = serde_json::to_string(&eq).unwrap();
+        assert!(json.contains("\"slidr_preset\":\"eq\""));
+        assert_eq!(serde_json::from_str::<PresetFile>(&json).unwrap(), eq);
+        let fx = PresetFile::Effects(FxPreset::built_in().remove(0));
+        let back: PresetFile = serde_json::from_str(&serde_json::to_string(&fx).unwrap()).unwrap();
+        assert_eq!(back, fx);
+        assert!(serde_json::from_str::<PresetFile>("{\"name\":\"x\"}").is_err());
+    }
 
     #[test]
     fn next_id_grows() {
@@ -800,6 +863,15 @@ impl MixerConfig {
         }
     }
 
+    /// A strip's saved fader position.
+    pub fn level(&self, t: MixTarget) -> Option<f32> {
+        match t {
+            MixTarget::Voice => Some(self.voice.level),
+            MixTarget::Channel(id) => self.channels.iter().find(|c| c.id == id).map(|c| c.level),
+            MixTarget::Send(id) => self.channels.iter().find(|c| c.id == id).and_then(|c| c.mic_send),
+        }
+    }
+
     /// Built-in EQ starting points, offered by the EQ editor.
     pub fn default_eq_presets() -> Vec<EqPreset> {
         use EqBandKind::*;
@@ -836,10 +908,75 @@ pub struct MixerConfig {
     pub enabled: bool,
     #[serde(default)]
     pub channels: Vec<MixChannel>,
+    /// The old fixed microphone strip; see [`Preset::move_voice_to_channel`].
     #[serde(default)]
     pub voice: VoiceStrip,
+    /// Set once the voice strip became a channel.
+    #[serde(default)]
+    pub voice_moved: bool,
     #[serde(default)]
     pub eq_presets: Vec<EqPreset>,
+}
+
+/// A channel source that is a microphone, not a program: `@mic:<device>`,
+/// an empty device meaning the system default.
+pub const MIC_PREFIX: &str = "@mic:";
+
+impl MixChannel {
+    /// The microphones among the sources ("" = system default).
+    pub fn mics(&self) -> impl Iterator<Item = &str> {
+        self.programs.iter().filter_map(|p| p.strip_prefix(MIC_PREFIX))
+    }
+
+    /// Only microphones, no programs: nothing plays these anywhere else, so
+    /// the channel's fader is simply how loud you hear them.
+    pub fn mics_only(&self) -> bool {
+        !self.programs.is_empty() && self.programs.iter().all(|p| p.starts_with(MIC_PREFIX))
+    }
+}
+
+impl Preset {
+    /// Older layouts had a fixed voice strip fed by the microphone chosen on
+    /// the page. The microphone is now a source in a channel like any
+    /// program: turn the strip into a "Microphone" channel (once) and point
+    /// board controls that drove it at that channel. `true` if it changed.
+    pub fn move_voice_to_channel(&mut self, mic: Option<&str>) -> bool {
+        let m = &mut self.mixer;
+        if m.voice_moved {
+            return false;
+        }
+        m.voice_moved = true;
+        let v = std::mem::take(&mut m.voice);
+        let id = m.channels.iter().map(|c| c.id).max().unwrap_or(0) + 1;
+        m.channels.insert(0, MixChannel {
+            id,
+            name: "Microphone".into(),
+            programs: vec![format!("{MIC_PREFIX}{}", mic.unwrap_or(""))],
+            // The strip's level was what went into the Slidr Mic; you heard
+            // yourself only with "hear yourself" on.
+            level: if v.to_monitor { v.level } else { 0.0 },
+            muted: v.muted,
+            fx: v.fx,
+            reroute: false,
+            mic_send: Some(v.level),
+            collapsed: false,
+        });
+        for c in &mut self.slider_categories {
+            for s in &mut c.streams {
+                if s.mixer == Some(MixTarget::Voice) {
+                    s.mixer = Some(MixTarget::Send(id));
+                }
+            }
+        }
+        for c in &mut self.button_categories {
+            for a in &mut c.actions {
+                if a.mixer == Some(MixTarget::Voice) {
+                    a.mixer = Some(MixTarget::Channel(id));
+                }
+            }
+        }
+        true
+    }
 }
 
 /// A group of programs mixed as one.
@@ -864,6 +1001,9 @@ pub struct MixChannel {
     /// Share of this channel in the Slidr Mic, [0, 1]; `None` = not sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mic_send: Option<f32>,
+    /// Folded on the Mixer page (only the header and level show).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collapsed: bool,
 }
 
 /// The real microphone's strip.
@@ -1145,6 +1285,14 @@ impl FxPreset {
             ]),
         ]
     }
+}
+
+/// A user preset as exported to / imported from a file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "slidr_preset", rename_all = "snake_case")]
+pub enum PresetFile {
+    Eq(EqPreset),
+    Effects(FxPreset),
 }
 
 /// A starting point for a strip's EQ.

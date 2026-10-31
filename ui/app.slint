@@ -28,6 +28,9 @@ export struct CategorySummary { id: int, name: string, count: int, collapsed: bo
 export struct AssignPick { id: int, name: string }
 // A sidebar tab in Settings: `page` is its page index, `fixed` = can't be hidden.
 export struct NavRow { page: int, label: string, visible: bool, fixed: bool }
+// One of the user's own presets in Settings: an EQ curve (`eq`) or an effect
+// chain, at `index` in its list.
+export struct UserPresetRow { eq: bool, index: int, name: string, detail: string }
 // A row in the wizard's picker. `name` is what the user reads; `value` is what
 // gets stored (a process name, an executable path, or an "@group:<id>" reference
 // for a curated program category — `is-group` marks the latter).
@@ -638,7 +641,7 @@ component HomePage inherits VerticalBox {
     spacing: 16px;
     alignment: start;
 
-    HorizontalBox {
+    HorizontalBox { padding: 0;
         Text { text: "Home"; font-size: 26px; font-weight: 700;
             font-family: "Inter"; vertical-alignment: center; }
         Rectangle { horizontal-stretch: 1; }
@@ -813,6 +816,10 @@ component CategoriesPage inherits VerticalBox {
     in-out property <string> draft-name: "";
     in-out property <int> renaming-id: -1;
     in-out property <string> rename-draft: "";
+    // Cards side by side in columns (filled left to right, row by row).
+    in property <bool> grid;
+    property <length> content-w: sv.visible-width - 18px;
+    property <int> cols: root.grid ? Math.max(1, Math.floor((root.content-w + 12px) / 372px)) : 1;
 
     // ── drag state ──────────────────────────────────────────────────────────
     // Global pointer position (window coords) while a drag is active.
@@ -852,11 +859,13 @@ component CategoriesPage inherits VerticalBox {
         }
     }
 
-    ScrollView {
+    sv := ScrollView {
             mouse-drag-pan-enabled: false;
         vertical-stretch: 1;
         VerticalBox {
             padding: 0; spacing: 8px; alignment: start;
+            // Leave room for the scrollbar, as the other pages do.
+            width: root.content-w;
             if root.categories.length == 0: Card {
                 VerticalLayout { padding: 24px; spacing: 6px; alignment: center;
                     Text { text: "No categories yet";
@@ -868,8 +877,13 @@ component CategoriesPage inherits VerticalBox {
                         horizontal-alignment: center; }
                 }
             }
+            HorizontalLayout { spacing: 12px;
+            for _[col] in root.cols: VerticalLayout {
+            width: (root.content-w - (root.cols - 1) * 12px) / root.cols;
+            alignment: start;
             for cat[ci] in root.categories: VerticalLayout {
-                spacing: 8px;
+            if Math.mod(ci, root.cols) == col: VerticalLayout {
+                spacing: 8px; padding-bottom: 8px;
                 // Drop indicator above this card (category reorder).
                 DropMark { active: root.cat-drag && root.drop-cat-pos == ci; }
                 card := Card {
@@ -936,7 +950,7 @@ component CategoriesPage inherits VerticalBox {
                                 clicked => { root.toggle-collapse(cat.id); }
                             }
                             if root.renaming-id != cat.id: Text { text: cat.name;
-                                font-weight: 700; font-size: 14px;
+                                font-weight: 700; font-size: 14px; overflow: elide; min-width: 0;
                                 font-family: "Inter"; vertical-alignment: center;
                                 horizontal-stretch: 1; }
                             if root.renaming-id == cat.id: LineEdit {
@@ -1033,11 +1047,13 @@ component CategoriesPage inherits VerticalBox {
                                         VerticalLayout { alignment: center;
                                             KindIcon { kind: line.icon-kind; size: 20px; } }
                                         VerticalLayout {
-                                            horizontal-stretch: 1; spacing: 0px;
+                                            horizontal-stretch: 1; spacing: 0px; min-width: 0;
                                             alignment: center;
-                                            Text { text: line.primary; font-weight: 500;
+                                            // Elided, so a long device list can't push
+                                            // the buttons out of a narrow (grid) card.
+                                            Text { text: line.primary; font-weight: 500; overflow: elide;
                                                 font-size: 12px; font-family: "Inter"; }
-                                            Text { text: line.secondary; font-size: 10px;
+                                            Text { text: line.secondary; font-size: 10px; overflow: elide;
                                                 font-family: "Inter";
                                                 color: Palette.foreground.with-alpha(0.55); }
                                         }
@@ -1070,6 +1086,9 @@ component CategoriesPage inherits VerticalBox {
                 if ci == root.categories.length - 1: DropMark {
                     active: root.cat-drag && root.drop-cat-pos == root.categories.length;
                 }
+            }
+            }
+            }
             }
         }
     }
@@ -1107,8 +1126,25 @@ component SettingsPage inherits VerticalBox {
     in property <[NavRow]> nav-rows;
     in-out property <bool> sounds-on;
     in-out property <float> sound-volume;
+    in property <[string]> sound-sets;
+    in-out property <int> sound-set-index;
+    in-out property <bool> grid-sliders;
+    in-out property <bool> grid-buttons;
+    in property <[UserPresetRow]> user-presets;
+    in property <[string]> spare-names;
+    in property <[string]> cable-names;
+    in-out property <int> sink-idx;
+    in-out property <int> cable-idx;
+    callback mixer-devices-changed();
     callback nav-move(int, int);
     callback nav-visible(int, bool);
+    callback preset-rename(bool, int, string);
+    callback preset-export(bool, int);
+    callback preset-delete(bool, int);
+    callback preset-import();
+    // Row being renamed (position in `user-presets`), -1 for none.
+    property <int> renaming: -1;
+    property <string> rename-draft;
 
     callback theme-changed(int);
     callback check-for-updates();
@@ -1128,7 +1164,7 @@ component SettingsPage inherits VerticalBox {
     in property <bool> profile-write-blocked;
     callback reopen-version-warning();
 
-    HorizontalBox {
+    HorizontalBox { padding: 0;
         Text { text: "Settings"; font-size: 26px; font-weight: 700; font-family: "Inter";
             vertical-alignment: center; }
         Rectangle { horizontal-stretch: 1; }
@@ -1138,7 +1174,7 @@ component SettingsPage inherits VerticalBox {
             mouse-drag-pan-enabled: false;
         vertical-stretch: 1;
         VerticalBox {
-            spacing: 12px; alignment: start;
+            padding: 0; spacing: 12px; alignment: start;
             // Pin the content to the viewport width so this page scrolls only
             // vertically. Left to itself the layout takes its preferred width,
             // and one long description then drags every card off to the right.
@@ -1179,6 +1215,19 @@ component SettingsPage inherits VerticalBox {
                             }
                         }
                     }
+                    SettingRow {
+                        label: "Sliders tab";
+                        description: "A grid of cards uses the width of a wide window";
+                        Select { field-width: root.control-w; model: ["List", "Grid"];
+                            current-index: root.grid-sliders ? 1 : 0;
+                            selected(i) => { root.grid-sliders = i == 1; root.dirty(); } }
+                    }
+                    SettingRow {
+                        label: "Buttons tab";
+                        Select { field-width: root.control-w; model: ["List", "Grid"];
+                            current-index: root.grid-buttons ? 1 : 0;
+                            selected(i) => { root.grid-buttons = i == 1; root.dirty(); } }
+                    }
                 }
             }
 
@@ -1207,12 +1256,50 @@ component SettingsPage inherits VerticalBox {
 
             Card {
                 VerticalBox { padding: 18px; spacing: 6px;
+                    Text { text: "Mixer devices"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
+                    Text { text: "Slidr plays the mix on your Windows default output and follows it when that changes. Add your microphone to a mixer channel to send it into the Slidr Mic.";
+                        wrap: word-wrap; font-family: "Inter"; font-size: 11px;
+                        color: Palette.foreground.with-alpha(0.55); }
+                    Rectangle { height: 6px; }
+                    SettingRow {
+                        label: "Slidr Mic";
+                        description: root.cable-names.length > 2
+                            ? "Virtual cable your voice and mix go into. Choose it as the microphone in your voice chat app."
+                            : "Your virtual cable. Choose it as the microphone in your voice chat app.";
+                        Select { field-width: root.control-w; model: root.cable-names;
+                            enabled: root.cable-names.length > 2;
+                            current-index <=> root.cable-idx;
+                            selected => { root.mixer-devices-changed(); } }
+                    }
+                    SettingRow {
+                        label: "Silent output";
+                        description: "An output nobody listens to. Channel programs are moved there so you only hear Slidr's mix.";
+                        Select { field-width: root.control-w; model: root.spare-names;
+                            current-index <=> root.sink-idx;
+                            selected => { root.mixer-devices-changed(); } }
+                    }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
                     Text { text: "Mixer sounds"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
                     Rectangle { height: 6px; }
                     SettingRow {
                         label: "Switch sounds";
-                        description: "Short sounds on your output when you mute, switch an effect or turn the mixer on or off. Never sent to the Slidr Mic.";
-                        Toggle { checked <=> root.sounds-on; toggled => { root.dirty(); } }
+                        description: "Short sounds on your output when you mute, switch effects or turn the mixer on or off. Never sent to the Slidr Mic.";
+                        HorizontalLayout { width: root.control-w; alignment: end;
+                            VerticalLayout { alignment: center;
+                                Toggle { checked <=> root.sounds-on; toggled => { root.dirty(); } } } }
+                    }
+                    SettingRow {
+                        label: "Sound set";
+                        Select {
+                            field-width: root.control-w;
+                            model: root.sound-sets;
+                            current-index <=> root.sound-set-index;
+                            selected(i) => { root.dirty(); }
+                        }
                     }
                     SettingRow {
                         label: "Volume";
@@ -1224,6 +1311,57 @@ component SettingsPage inherits VerticalBox {
                             Text { text: Math.round(root.sound-volume) + " %"; min-width: 40px;
                                 horizontal-alignment: right; font-family: "Inter"; vertical-alignment: center; }
                         }
+                    }
+                }
+            }
+
+            Card {
+                VerticalBox { padding: 18px; spacing: 6px;
+                    HorizontalLayout { spacing: 8px;
+                        VerticalLayout { horizontal-stretch: 1; spacing: 2px;
+                            Text { text: "My presets"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
+                            Text { text: "EQ curves and effect chains you saved in the mixer.";
+                                font-family: "Inter"; font-size: 11px; wrap: word-wrap;
+                                color: Palette.foreground.with-alpha(0.55); }
+                        }
+                        VerticalLayout { alignment: center;
+                            IconButton { label: "Import…"; icon: @image-url("../assets/icons/plus.svg");
+                                clicked => { root.preset-import(); } } }
+                    }
+                    Rectangle { height: 6px; }
+                    if root.user-presets.length == 0: Text {
+                        text: "None yet. Save one with \"Save as preset\" in the EQ or effects editor.";
+                        font-family: "Inter"; font-size: 12px; wrap: word-wrap;
+                        color: Palette.foreground.with-alpha(0.55); }
+                    for p[i] in root.user-presets: HorizontalLayout {
+                        spacing: 8px; min-height: 40px;
+                        if root.renaming != i: VerticalLayout { horizontal-stretch: 1; alignment: center; spacing: 1px;
+                            Text { text: p.name; font-family: "Inter"; font-size: 13px; font-weight: 500;
+                                overflow: elide; }
+                            Text { text: p.detail; font-family: "Inter"; font-size: 11px; overflow: elide;
+                                color: Palette.foreground.with-alpha(0.55); }
+                        }
+                        if root.renaming == i: VerticalLayout { horizontal-stretch: 1; alignment: center;
+                            LineEdit { height: 32px; text <=> root.rename-draft;
+                                accepted => { root.preset-rename(p.eq, p.index, root.rename-draft); root.renaming = -1; } } }
+                        VerticalLayout { alignment: center;
+                            SquareIconButton {
+                                icon: root.renaming == i ? @image-url("../assets/icons/check.svg")
+                                                         : @image-url("../assets/icons/edit.svg");
+                                clicked => {
+                                    if (root.renaming == i) {
+                                        root.preset-rename(p.eq, p.index, root.rename-draft);
+                                        root.renaming = -1;
+                                    } else {
+                                        root.renaming = i; root.rename-draft = p.name;
+                                    }
+                                } } }
+                        VerticalLayout { alignment: center;
+                            IconButton { label: "Export…"; clicked => { root.preset-export(p.eq, p.index); } } }
+                        VerticalLayout { alignment: center;
+                            SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
+                                tint: #d32f2f.with-alpha(0.8);
+                                clicked => { root.renaming = -1; root.preset-delete(p.eq, p.index); } } }
                     }
                 }
             }
@@ -2378,17 +2516,23 @@ component LedConfigPopup inherits Rectangle {
 export struct MixChannelUI {
     id: int, name: string, programs: string, level: float, muted: bool,
     fx-count: int, fx-on: bool, reroute: bool, send-on: bool, send: float,
+    collapsed: bool,
+    // Only microphones in it: "Replace original" means nothing there.
+    mics-only: bool,
 }
 
-// Fader + percent readout, the row control of the mixer.
+// Fader + percent readout, the row control of the mixer. The readout shows
+// the fader itself (dragging takes it off `value`), and a new `value` — the
+// board moved it — puts the fader there again.
 component LevelRow inherits HorizontalLayout {
     in property <float> value;
     callback changed(float);
     spacing: 10px;
-    AccentSlider { minimum: 0; maximum: 100; value: root.value;
+    changed value => { fader.value = root.value; }
+    fader := AccentSlider { minimum: 0; maximum: 100; value: root.value;
         horizontal-stretch: 1;
         changed(v) => { root.changed(v); } }
-    Text { text: Math.round(root.value) + " %"; min-width: 42px;
+    Text { text: Math.round(fader.value) + " %"; min-width: 42px;
         horizontal-alignment: right; vertical-alignment: center;
         font-family: "Inter"; font-size: 12px; }
 }
@@ -2401,8 +2545,11 @@ component LabeledToggle inherits VerticalLayout {
     spacing: 4px;
     Text { text: root.label; font-family: "Inter"; font-size: 11px;
         color: Palette.foreground.with-alpha(0.6); }
-    HorizontalLayout { alignment: start;
-        Toggle { checked <=> root.checked; toggled => { root.toggled(self.checked); } } }
+    // As tall as a button and centred, so a row of these lines up with a
+    // switch that has an "Edit" button beside it.
+    HorizontalLayout { alignment: start; min-height: 36px;
+        VerticalLayout { alignment: center;
+            Toggle { checked <=> root.checked; toggled => { root.toggled(self.checked); } } } }
 }
 
 // Small caption + control, stacked.
@@ -2417,24 +2564,11 @@ component Labeled inherits VerticalLayout {
 component MixerPage inherits VerticalBox {
     in-out property <bool> enabled;
     in property <[MixChannelUI]> channels;
-    in-out property <float> voice-level;
-    in-out property <bool> voice-muted;
-    in-out property <bool> voice-monitor;
-    in property <int> voice-fx-count;
-    in-out property <bool> voice-fx-on;
-    in property <[string]> monitor-names;
-    in property <[string]> mic-names;
-    in property <[string]> spare-names;
-    in property <[string]> cable-names;
-    in-out property <int> monitor-idx;
-    in-out property <int> mic-idx;
-    in-out property <int> sink-idx;
-    in-out property <int> cable-idx;
     in property <string> hint;
     in property <bool> hint-download;
     callback open-download();
 
-    // Any page-level value changed (enabled, devices, voice strip).
+    // The on/off switch changed.
     callback changed();
     // One field of one channel: `field` names it, the value comes in `num` or `text`.
     callback channel-set(int, string, float, string);
@@ -2443,12 +2577,20 @@ component MixerPage inherits VerticalBox {
     callback choose-programs(int);
     // Open the effects editor for "voice" or "channel:<id>".
     callback edit-fx(string);
+    // Channel id, insertion slot in the list (before it moves).
+    callback move-channel(int, int);
 
     spacing: 14px;
     property <length> control-w: 260px;
-    property <bool> show-advanced: false;
+    property <length> content-w: sv.visible-width - 18px;
+    // Channel drag (reorder).
+    property <length> ptr-x;
+    property <length> ptr-y;
+    property <bool> ch-drag: false;
+    property <int> drag-id: -1;
+    property <int> drop-pos: -1;
 
-    HorizontalBox {
+    HorizontalBox { padding: 0;
         Text { text: "Mixer"; font-size: 26px; font-weight: 700; font-family: "Inter";
             vertical-alignment: center; }
         Rectangle { horizontal-stretch: 1; }
@@ -2457,12 +2599,12 @@ component MixerPage inherits VerticalBox {
         Toggle { checked <=> root.enabled; toggled => { root.changed(); } }
     }
 
-    ScrollView {
+    sv := ScrollView {
         mouse-drag-pan-enabled: false;
         vertical-stretch: 1;
         VerticalBox {
-            spacing: 12px; alignment: start;
-            width: parent.width - 18px;
+            padding: 0; spacing: 12px; alignment: start;
+            width: root.content-w;
 
             if root.hint != "": Card {
                 border-color: Theme.accent-bg;
@@ -2474,108 +2616,75 @@ component MixerPage inherits VerticalBox {
                 }
             }
 
-            Card {
-                VerticalBox { padding: 18px; spacing: 6px;
-                    Text { text: "Devices"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
-                    Rectangle { height: 6px; }
-                    SettingRow {
-                        label: "Output";
-                        description: "Where you hear the mix";
-                        Select { field-width: root.control-w; model: root.monitor-names;
-                            current-index <=> root.monitor-idx;
-                            selected => { root.changed(); } }
-                    }
-                    SettingRow {
-                        label: "Microphone";
-                        description: "Your real microphone";
-                        Select { field-width: root.control-w; model: root.mic-names;
-                            current-index <=> root.mic-idx;
-                            selected => { root.changed(); } }
-                    }
-                    adv-ta := TouchArea {
-                        height: 30px; mouse-cursor: pointer;
-                        clicked => { root.show-advanced = !root.show-advanced; }
-                        HorizontalLayout { spacing: 6px; alignment: start;
-                            Image { source: root.show-advanced ? @image-url("../assets/icons/chevron-down.svg")
-                                                              : @image-url("../assets/icons/chevron-right.svg");
-                                colorize: Palette.foreground.with-alpha(0.7); width: 16px; height: 16px;
-                                y: (parent.height - self.height) / 2; }
-                            Text { text: "Advanced"; font-family: "Inter"; font-size: 12px; font-weight: 600;
-                                vertical-alignment: center;
-                                color: adv-ta.has-hover ? Palette.foreground : Palette.foreground.with-alpha(0.7); }
-                        }
-                    }
-                    if root.show-advanced: SettingRow {
-                        label: "Slidr Mic";
-                        description: root.cable-names.length > 2
-                            ? "Virtual cable your voice and mix go into. Choose it as the microphone in your voice chat app."
-                            : "Your virtual cable. Choose it as the microphone in your voice chat app.";
-                        Select { field-width: root.control-w; model: root.cable-names;
-                            enabled: root.cable-names.length > 2;
-                            current-index <=> root.cable-idx;
-                            selected => { root.changed(); } }
-                    }
-                    if root.show-advanced: SettingRow {
-                        label: "Silent output";
-                        description: "An output nobody listens to. Channel programs are moved there so you only hear Slidr's mix.";
-                        Select { field-width: root.control-w; model: root.spare-names;
-                            current-index <=> root.sink-idx;
-                            selected => { root.changed(); } }
-                    }
-                }
-            }
-
-            Card {
+            for ch[ci] in root.channels: VerticalLayout {
+                spacing: 6px; padding-bottom: 6px;
+                // Drop indicator above this card (channel reorder).
+                DropMark { active: root.ch-drag && root.drop-pos == ci; }
+                card := Card {
+                    // Which insertion slot the drag pointer means over this card.
+                    // Ternary-guarded: `absolute-position` is only read mid-drag
+                    // (see the note in CategoriesPage).
+                    property <int> slot:
+                        root.ch-drag
+                        ? ((root.ptr-x >= card.absolute-position.x
+                            && root.ptr-x < card.absolute-position.x + card.width
+                            && root.ptr-y >= card.absolute-position.y
+                            && root.ptr-y < card.absolute-position.y + card.height)
+                          ? (root.ptr-y < card.absolute-position.y + card.height / 2 ? ci : ci + 1)
+                          : -999)
+                        : -999;
+                    changed slot => { if (card.slot != -999) { root.drop-pos = card.slot; } }
+                    opacity: (root.ch-drag && root.drag-id == ch.id) ? 0.4 : 1.0;
                 VerticalBox { padding: 18px; spacing: 10px;
-                    HorizontalLayout { spacing: 10px;
-                        Icon { source: @image-url("../assets/icons/microphone-2.svg"); size: 18px; }
-                        Text { text: "Voice"; font-weight: 700; font-family: "Inter"; font-size: 14px;
-                            vertical-alignment: center; horizontal-stretch: 1; }
-                    }
-                    Labeled { label: "Level in the Slidr Mic";
-                        LevelRow { value: root.voice-level;
-                            changed(v) => { root.voice-level = v; root.changed(); } }
-                    }
-                    HorizontalLayout { spacing: 24px; alignment: start;
-                        Labeled { label: "Effects & EQ";
-                            HorizontalLayout { spacing: 8px;
-                                VerticalLayout { alignment: center;
-                                    Toggle { checked <=> root.voice-fx-on; toggled => { root.changed(); } } }
-                                IconButton { label: root.voice-fx-count > 0 ? "Edit (" + root.voice-fx-count + " on)" : "Edit";
-                                    clicked => { root.edit-fx("voice"); } }
+                    HorizontalLayout { spacing: 8px;
+                        // Drag handle — reorder channels.
+                        grip := TouchArea {
+                            width: 22px; mouse-cursor: grab;
+                            pointer-event(ev) => {
+                                if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.down) {
+                                    root.ch-drag = true; root.drag-id = ch.id; root.drop-pos = ci;
+                                    root.ptr-x = grip.absolute-position.x + grip.mouse-x;
+                                    root.ptr-y = grip.absolute-position.y + grip.mouse-y;
+                                } else if (ev.button == PointerEventButton.left && ev.kind == PointerEventKind.up) {
+                                    if (root.ch-drag && root.drop-pos != -1) {
+                                        root.move-channel(root.drag-id, root.drop-pos);
+                                    }
+                                    root.ch-drag = false; root.drop-pos = -1;
+                                }
                             }
+                            moved => {
+                                root.ptr-x = grip.absolute-position.x + grip.mouse-x;
+                                root.ptr-y = grip.absolute-position.y + grip.mouse-y;
+                            }
+                            Image { source: @image-url("../assets/icons/grid-dots.svg");
+                                width: 16px; height: 16px;
+                                colorize: Palette.foreground.with-alpha(0.45);
+                                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; }
                         }
-                        LabeledToggle { label: "Muted"; checked <=> root.voice-muted;
-                            toggled => { root.changed(); } }
-                        LabeledToggle { label: "Hear yourself"; checked <=> root.voice-monitor;
-                            toggled => { root.changed(); } }
-                    }
-                }
-            }
-
-            for ch in root.channels: Card {
-                VerticalBox { padding: 18px; spacing: 10px;
-                    HorizontalLayout { spacing: 10px;
-                        Icon { source: @image-url("../assets/icons/volume.svg"); size: 18px;
-                            y: (parent.height - self.height) / 2; }
-                        LineEdit { width: 180px; height: 34px; text: ch.name;
+                        VerticalLayout { alignment: center;
+                            SquareIconButton {
+                                icon: ch.collapsed ? @image-url("../assets/icons/chevron-right.svg")
+                                                   : @image-url("../assets/icons/chevron-down.svg");
+                                clicked => { root.channel-set(ch.id, "collapsed", ch.collapsed ? 0 : 1, ""); } } }
+                        LineEdit { min-width: 120px; preferred-width: 180px; height: 34px; text: ch.name;
                             placeholder-text: "Channel name";
                             edited(t) => { root.channel-set(ch.id, "name", 0, t); } }
-                        Text { text: ch.programs != "" ? ch.programs : "No programs yet";
-                            horizontal-stretch: 1; vertical-alignment: center; overflow: elide;
+                        Text { text: ch.programs != "" ? ch.programs : "Nothing added yet";
+                            horizontal-stretch: 1; min-width: 0; vertical-alignment: center; overflow: elide;
                             font-family: "Inter"; font-size: 13px;
                             color: ch.programs != "" ? Palette.foreground : Palette.foreground.with-alpha(0.5); }
-                        IconButton { icon: @image-url("../assets/icons/app-window.svg"); label: "Programs";
+                        IconButton { icon: @image-url("../assets/icons/app-window.svg"); label: "Sources";
                             clicked => { root.choose-programs(ch.id); } }
-                        SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
-                            y: (parent.height - self.height) / 2;
-                            clicked => { root.delete-channel(ch.id); } }
+                        VerticalLayout { alignment: center;
+                            SquareIconButton { icon: @image-url("../assets/icons/trash.svg");
+                                clicked => { root.delete-channel(ch.id); } } }
                     }
-                    Labeled { label: "Level";
+                    Labeled { label: ch.mics-only ? "Level you hear yourself at" : "Level";
                         LevelRow { value: ch.level;
                             changed(v) => { root.channel-set(ch.id, "level", v, ""); } }
                     }
-                    HorizontalLayout { spacing: 24px; alignment: start;
+                    if !ch.collapsed: VerticalLayout { spacing: 10px;
+                    HorizontalLayout { spacing: 20px; alignment: start;
                         Labeled { label: "Effects & EQ";
                             HorizontalLayout { spacing: 8px;
                                 VerticalLayout { alignment: center;
@@ -2587,7 +2696,7 @@ component MixerPage inherits VerticalBox {
                         }
                         LabeledToggle { label: "Muted"; checked: ch.muted;
                             toggled(on) => { root.channel-set(ch.id, "muted", on ? 1 : 0, ""); } }
-                        LabeledToggle { label: "Replace original"; checked: ch.reroute;
+                        if !ch.mics-only: LabeledToggle { label: "Replace original"; checked: ch.reroute;
                             toggled(on) => { root.channel-set(ch.id, "reroute", on ? 1 : 0, ""); } }
                         send := LabeledToggle { label: "Into Slidr Mic"; checked: ch.send-on;
                             toggled(on) => { root.channel-set(ch.id, "send-on", on ? 1 : 0, ""); } }
@@ -2597,6 +2706,12 @@ component MixerPage inherits VerticalBox {
                         LevelRow { value: ch.send;
                             changed(v) => { root.channel-set(ch.id, "send", v, ""); } }
                     }
+                    }
+                }
+                }
+                // Trailing drop indicator after the last card (move to the end).
+                if ci == root.channels.length - 1: DropMark {
+                    active: root.ch-drag && root.drop-pos == root.channels.length;
                 }
             }
 
@@ -2613,6 +2728,9 @@ component ProgramPickerPopup inherits Rectangle {
     in property <string> title;
     in property <[PickerEntry]> options;
     in-out property <string> filter;
+    // 0 = programs, 1 = microphones.
+    in-out property <int> tab;
+    callback tab-changed(int);
     callback toggle(string);
     callback filter-changed(string);
     callback close();
@@ -2629,7 +2747,13 @@ component ProgramPickerPopup inherits Rectangle {
         TouchArea {}
         VerticalBox {
             padding: 22px; spacing: 12px;
-            Text { text: root.title; font-size: 20px; font-weight: 700; font-family: "Inter"; }
+            HorizontalLayout { spacing: 10px;
+                Text { text: root.title; font-size: 20px; font-weight: 700; font-family: "Inter";
+                    horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                Select { field-width: 150px; model: ["Programs", "Microphones"];
+                    current-index <=> root.tab;
+                    selected(i) => { root.tab-changed(i); } }
+            }
             LineEdit { height: 36px; placeholder-text: "Search…"; text <=> root.filter;
                 edited(t) => { root.filter-changed(t); } }
             ScrollView {
@@ -2690,6 +2814,8 @@ component EqEditorPopup inherits Rectangle {
     callback add();
     callback delete(int);
     callback load-preset(int);
+    callback save-preset(string);
+    in-out property <string> preset-name;
     callback close();
 
     background: #00000099;
@@ -2698,7 +2824,7 @@ component EqEditorPopup inherits Rectangle {
     Rectangle {
         x: parent.width / 2 - self.width / 2;
         y: parent.height / 2 - self.height / 2;
-        width: min(parent.width - 48px, 820px); height: min(parent.height - 48px, 660px);
+        width: min(parent.width - 48px, 820px); height: min(parent.height - 48px, 700px);
         background: Palette.background;
         border-radius: 14px; border-width: 1px; border-color: Palette.border;
         TouchArea {}
@@ -2796,6 +2922,12 @@ component EqEditorPopup inherits Rectangle {
                 Select { field-width: 200px; model: root.preset-names; current-index: 0;
                     selected(i) => { if (i > 0) { root.load-preset(i - 1); } self.current-index = 0; } }
                 Rectangle { horizontal-stretch: 1; }
+            }
+            HorizontalLayout { spacing: 10px;
+                LineEdit { height: 36px; horizontal-stretch: 1; placeholder-text: "Name for this curve…";
+                    text <=> root.preset-name; }
+                IconButton { label: "Save as preset"; enabled: root.preset-name != "";
+                    clicked => { root.save-preset(root.preset-name); root.preset-name = ""; } }
                 IconButton { label: "Done"; primary: true; clicked => { root.close(); } }
             }
         }
@@ -3007,15 +3139,12 @@ export component AppWindow inherits Window {
     callback nav-visible(int, bool);
     in-out property <bool> sounds-on: true;
     in-out property <float> sound-volume: 80;
+    in property <[string]> sound-sets;
+    in-out property <int> sound-set-index;
 
     // ── Mixer page ──
     in-out property <bool> mixer-enabled;
     in property <[MixChannelUI]> mixer-channels;
-    in-out property <float> mixer-voice-level;
-    in-out property <bool> mixer-voice-muted;
-    in-out property <bool> mixer-voice-monitor;
-    in property <int> mixer-voice-fx-count;
-    in-out property <bool> mixer-voice-fx-on;
     in-out property <bool> mixer-fx-open: false;
     in property <string> mixer-fx-title;
     in property <[FxSlotUI]> mixer-fx-slots;
@@ -3045,15 +3174,21 @@ export component AppWindow inherits Window {
     callback mixer-eq-add();
     callback mixer-eq-delete(int);
     callback mixer-eq-load-preset(int);
+    callback mixer-eq-save-preset(string);
+    in-out property <string> mixer-eq-preset-name;
     callback mixer-eq-closed();
-    in property <[string]> mixer-monitor-names;
-    in property <[string]> mixer-mic-names;
+    callback mixer-move-channel(int, int);
+    in-out property <bool> grid-sliders;
+    in-out property <bool> grid-buttons;
+    in property <[UserPresetRow]> user-presets;
+    callback user-preset-rename(bool, int, string);
+    callback user-preset-export(bool, int);
+    callback user-preset-delete(bool, int);
+    callback user-preset-import();
     in property <[string]> mixer-spare-names;
     in property <[string]> mixer-cable-names;
     in property <bool> mixer-hint-download;
     callback mixer-open-download();
-    in-out property <int> mixer-monitor-idx;
-    in-out property <int> mixer-mic-idx;
     in-out property <int> mixer-sink-idx;
     in-out property <int> mixer-cable-idx;
     in property <string> mixer-hint;
@@ -3069,6 +3204,8 @@ export component AppWindow inherits Window {
     callback mixer-toggle-program(string);
     callback mixer-picker-filter-changed(string);
     callback mixer-picker-closed();
+    in-out property <int> mixer-picker-tab-index;
+    callback mixer-picker-tab(int);
 
     in-out property <bool> assign-popup-open: false;
     in-out property <int> assign-target-kind: 0;
@@ -3411,7 +3548,7 @@ export component AppWindow inherits Window {
                     request-assign(k, i) => { root.open-assign(k, i); }
                 }
                 if root.current-page == 1: CategoriesPage {
-                    target-kind: 0; categories: root.slider-categories;
+                    target-kind: 0; categories: root.slider-categories; grid: root.grid-sliders;
                     add-category(n) => { root.add-category(0, n); }
                     rename(id, n) => { root.rename-category(0, id, n); }
                     delete(id) => { root.delete-category(0, id); }
@@ -3423,7 +3560,7 @@ export component AppWindow inherits Window {
                     move-line(fc, fi, tc, ti) => { root.move-line(0, fc, fi, tc, ti); }
                 }
                 if root.current-page == 2: CategoriesPage {
-                    target-kind: 1; categories: root.button-categories;
+                    target-kind: 1; categories: root.button-categories; grid: root.grid-buttons;
                     add-category(n) => { root.add-category(1, n); }
                     rename(id, n) => { root.rename-category(1, id, n); }
                     delete(id) => { root.delete-category(1, id); }
@@ -3437,25 +3574,13 @@ export component AppWindow inherits Window {
                 if root.current-page == 4: MixerPage {
                     enabled <=> root.mixer-enabled;
                     channels: root.mixer-channels;
-                    voice-level <=> root.mixer-voice-level;
-                    voice-muted <=> root.mixer-voice-muted;
-                    voice-monitor <=> root.mixer-voice-monitor;
-                    voice-fx-count: root.mixer-voice-fx-count;
-                    voice-fx-on <=> root.mixer-voice-fx-on;
                     edit-fx(t) => { root.mixer-edit-fx(t); }
-                    monitor-names: root.mixer-monitor-names;
-                    mic-names: root.mixer-mic-names;
-                    spare-names: root.mixer-spare-names;
-                    cable-names: root.mixer-cable-names;
                     hint-download: root.mixer-hint-download;
                     open-download => { root.mixer-open-download(); }
-                    monitor-idx <=> root.mixer-monitor-idx;
-                    mic-idx <=> root.mixer-mic-idx;
-                    sink-idx <=> root.mixer-sink-idx;
-                    cable-idx <=> root.mixer-cable-idx;
                     hint: root.mixer-hint;
                     changed => { root.mixer-changed(); }
                     channel-set(id, f, n, t) => { root.mixer-channel-set(id, f, n, t); }
+                    move-channel(id, to) => { root.mixer-move-channel(id, to); }
                     add-channel => { root.mixer-add-channel(); }
                     delete-channel(id) => { root.mixer-delete-channel(id); }
                     choose-programs(id) => { root.mixer-choose-programs(id); }
@@ -3492,6 +3617,20 @@ export component AppWindow inherits Window {
                     nav-visible(p, v) => { root.nav-visible(p, v); }
                     sounds-on <=> root.sounds-on;
                     sound-volume <=> root.sound-volume;
+                    sound-sets: root.sound-sets;
+                    sound-set-index <=> root.sound-set-index;
+                    grid-sliders <=> root.grid-sliders;
+                    grid-buttons <=> root.grid-buttons;
+                    user-presets: root.user-presets;
+                    spare-names: root.mixer-spare-names;
+                    cable-names: root.mixer-cable-names;
+                    sink-idx <=> root.mixer-sink-idx;
+                    cable-idx <=> root.mixer-cable-idx;
+                    mixer-devices-changed => { root.mixer-changed(); }
+                    preset-rename(e, i, n) => { root.user-preset-rename(e, i, n); }
+                    preset-export(e, i) => { root.user-preset-export(e, i); }
+                    preset-delete(e, i) => { root.user-preset-delete(e, i); }
+                    preset-import => { root.user-preset-import(); }
                     check-for-updates => { root.check-for-updates(); }
                     open-releases => { root.open-releases(); }
                     theme-changed(i) => { root.theme-changed(i); }
@@ -3692,12 +3831,16 @@ export component AppWindow inherits Window {
         add => { root.mixer-eq-add(); }
         delete(i) => { root.mixer-eq-delete(i); }
         load-preset(i) => { root.mixer-eq-load-preset(i); }
+        preset-name <=> root.mixer-eq-preset-name;
+        save-preset(n) => { root.mixer-eq-save-preset(n); }
         close => { root.mixer-eq-open = false; root.mixer-eq-closed(); }
     }
     if root.mixer-picker-open: ProgramPickerPopup {
         title: root.mixer-picker-title;
         options: root.mixer-picker-options;
         filter <=> root.mixer-picker-filter;
+        tab <=> root.mixer-picker-tab-index;
+        tab-changed(t) => { root.mixer-picker-tab(t); }
         toggle(v) => { root.mixer-toggle-program(v); }
         filter-changed(t) => { root.mixer-picker-filter-changed(t); }
         close => { root.mixer-picker-open = false; root.mixer-picker-closed(); }

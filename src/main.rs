@@ -26,7 +26,10 @@ mod media;
 mod mixer;
 mod mixer_ui;
 mod model;
+mod presets_ui;
 mod protocol;
+#[cfg(target_os = "windows")]
+mod quit_signal;
 mod serial;
 mod sidebar;
 mod storage;
@@ -54,6 +57,15 @@ fn main() -> anyhow::Result<()> {
     }
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // `slidr --quit`: close a running Slidr properly (see `quit_signal`).
+    #[cfg(target_os = "windows")]
+    if std::env::args().any(|a| a == "--quit") {
+        if !quit_signal::signal() {
+            eprintln!("no running Slidr to quit");
+        }
+        return Ok(());
+    }
 
     // Preview / design-iteration mode: spawn a window pre-populated with mock state
     // so the UI can be screenshotted headlessly without an Arduino.
@@ -167,6 +179,9 @@ fn main() -> anyhow::Result<()> {
     glue::wire(&ui, shared.clone(), rx, BUILD_STAMP);
     mixer_ui::wire(&ui, shared.clone());
     sidebar::wire(&ui, shared.clone());
+    presets_ui::wire(&ui, shared.clone());
+    #[cfg(target_os = "windows")]
+    quit_signal::listen();
 
     if demo {
         use slint::{ModelRc, SharedString, VecModel};

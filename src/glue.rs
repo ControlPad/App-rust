@@ -133,7 +133,11 @@ impl Shared {
     /// Call wherever `push_leds` is called (profile load/switch, settings).
     pub fn push_mixer(&self) {
         crate::mixer::configure(self.preset.mixer.clone(), self.settings.mixer_devices.clone());
-        crate::mixer::sound_prefs(self.settings.mixer_sounds, self.settings.mixer_sound_volume);
+        crate::mixer::sound_prefs(
+            self.settings.mixer_sounds,
+            self.settings.mixer_sound_volume,
+            &self.settings.mixer_sound_set,
+        );
     }
 }
 
@@ -1213,6 +1217,11 @@ pub fn wire(
             ui.set_led_live_active(active);
         }
 
+        // Mixer faders follow the board while the page is open.
+        if ui.get_current_page() == 4 {
+            crate::mixer_ui::follow_levels(&ui, &s);
+        }
+
         // The Discord worker connects (or fails) seconds after the settings are
         // saved, and the media poller updates once a second — so refresh both
         // status lines while the user is looking at them, or they would sit on
@@ -1511,6 +1520,12 @@ fn push_settings_to_ui(ui: &AppWindow, global: &Settings, profile: &crate::model
     ui.set_update_check(global.update_check);
     ui.set_sounds_on(global.mixer_sounds);
     ui.set_sound_volume(global.mixer_sound_volume * 100.0);
+    let sets = crate::mixer::SOUND_SETS;
+    ui.set_sound_sets(ModelRc::new(VecModel::from(sets.iter().map(|s| SharedString::from(s.1)).collect::<Vec<_>>())));
+    ui.set_sound_set_index(sets.iter().position(|s| s.0 == global.mixer_sound_set).unwrap_or(0) as i32);
+    ui.set_grid_sliders(global.grid_sliders);
+    ui.set_grid_buttons(global.grid_buttons);
+    crate::presets_ui::push(ui, global);
     ui.set_discord_client_id(global.discord_client_id.clone().into());
     ui.set_discord_client_secret(global.discord_client_secret.clone().into());
     ui.set_discord_status(discord_hint(global).into());
@@ -1547,6 +1562,11 @@ fn pull_global_from_ui(ui: &AppWindow, g: &mut Settings) {
     g.discord_client_secret = ui.get_discord_client_secret().to_string();
     g.mixer_sounds = ui.get_sounds_on();
     g.mixer_sound_volume = (ui.get_sound_volume() / 100.0).clamp(0.0, 1.0);
+    if let Some(set) = crate::mixer::SOUND_SETS.get(ui.get_sound_set_index() as usize) {
+        g.mixer_sound_set = set.0.to_string();
+    }
+    g.grid_sliders = ui.get_grid_sliders();
+    g.grid_buttons = ui.get_grid_buttons();
 }
 
 fn pull_profile_from_ui(ui: &AppWindow, p: &mut crate::model::ProfileSettings) {
@@ -1648,7 +1668,8 @@ fn push_wizard_picker(ui: &AppWindow, shared: Arc<Mutex<Shared>>) {
         use crate::model::MixTarget;
         let s = shared.lock();
         let m = &s.preset.mixer;
-        let mut targets = vec![MixTarget::Voice];
+        // The microphone is a channel now (see `Preset::move_voice_to_channel`).
+        let mut targets = Vec::new();
         for c in &m.channels {
             targets.push(MixTarget::Channel(c.id));
             // A button mutes a whole channel; only a slider can drive the send.

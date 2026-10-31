@@ -126,25 +126,31 @@ impl WasapiBackend {
     ) {
         let _guard = self.lock.lock().unwrap();
         unsafe {
-            let Ok(dev) = self.default_device(0) else { return };
-            let Ok(mgr) = self.session_manager(&dev) else { return };
-            let Ok(enumerator): Result<IAudioSessionEnumerator, _> = mgr.GetSessionEnumerator()
-            else {
-                return;
-            };
-            let Ok(count) = enumerator.GetCount() else { return };
-            for i in 0..count {
-                let Ok(ctl): Result<IAudioSessionControl, _> = enumerator.GetSession(i) else {
+            // Every active output, not just the default: a program can play
+            // elsewhere (its own device choice, or moved to the mixer's
+            // silent output), and its volume still lives on that session.
+            let Ok(devices) = self.enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else { return };
+            for d in 0..devices.GetCount().unwrap_or(0) {
+                let Ok(dev) = devices.Item(d) else { continue };
+                let Ok(mgr) = self.session_manager(&dev) else { continue };
+                let Ok(enumerator): Result<IAudioSessionEnumerator, _> = mgr.GetSessionEnumerator()
+                else {
                     continue;
                 };
-                let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
-                let Ok(pid) = ctl2.GetProcessId() else { continue };
-                if pid == 0 {
-                    continue;
-                }
-                let Some(name) = process_name(pid) else { continue };
-                if program_matches(process, pid, &name) {
-                    visit(&ctl2, pid);
+                let Ok(count) = enumerator.GetCount() else { continue };
+                for i in 0..count {
+                    let Ok(ctl): Result<IAudioSessionControl, _> = enumerator.GetSession(i) else {
+                        continue;
+                    };
+                    let Ok(ctl2) = ctl.cast::<IAudioSessionControl2>() else { continue };
+                    let Ok(pid) = ctl2.GetProcessId() else { continue };
+                    if pid == 0 {
+                        continue;
+                    }
+                    let Some(name) = process_name(pid) else { continue };
+                    if program_matches(process, pid, &name) {
+                        visit(&ctl2, pid);
+                    }
                 }
             }
         }

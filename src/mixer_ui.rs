@@ -131,12 +131,15 @@ pub fn push(ui: &AppWindow, s: &mut Shared) {
     ui.set_mixer_enabled(m.enabled);
     push_channels(ui, m);
 
-    let no_cable = cables.is_empty();
+    // Linux makes its Slidr Mic itself (pulse_io): no cable to pick or install.
+    let windows = cfg!(target_os = "windows");
+    ui.set_mixer_has_devices(windows);
+    let no_cable = windows && cables.is_empty();
     ui.set_mixer_hint_download(no_cable);
     ui.set_mixer_hint(
         if no_cable {
             "No virtual cable found. Slidr needs one for the Slidr Mic: install VB-CABLE by VB-Audio (donationware, all participations are welcome), restart Windows, then choose \"CABLE Output\" as the microphone in your voice chat app."
-        } else if m.enabled && d.mic_out.is_none() {
+        } else if windows && m.enabled && d.mic_out.is_none() {
             "Choose the Slidr Mic under Settings → Mixer devices so other apps can hear your voice through Slidr."
         } else {
             ""

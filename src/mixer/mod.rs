@@ -9,6 +9,9 @@
 pub mod dsp;
 mod engine;
 mod fx;
+// Compiled everywhere so it is type-checked and tested on any host; only
+// Linux runs it.
+mod pulse_io;
 mod sfx;
 mod ring;
 #[cfg(target_os = "windows")]
@@ -84,7 +87,18 @@ fn spawn() -> Option<Sender<Cmd>> {
     Some(tx)
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+fn spawn() -> Option<Sender<Cmd>> {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    std::thread::Builder::new()
+        .name("mixer".into())
+        .spawn(move || pulse_io::run(rx))
+        .map_err(|e| log::error!("mixer: could not start thread: {e}"))
+        .ok()?;
+    Some(tx)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn spawn() -> Option<Sender<Cmd>> {
     None
 }

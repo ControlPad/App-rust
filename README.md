@@ -113,7 +113,9 @@ cargo run --release
 
 * **`pactl`** (Ubuntu/Debian/Fedora: `pulseaudio-utils`). The audio backend
   shells out to it; it also ships with `pipewire-pulse`. Without it Slidr
-  starts but every volume/mute action is a no-op.
+  starts but every volume/mute action is a no-op. The mixer also uses `parec`
+  and `pacat` from the same package; it needs no virtual-cable driver (it
+  creates its devices, including the "Slidr Mic", in the sound server).
 * **Serial port access.** Opening `/dev/ttyUSB*` / `/dev/ttyACM*` needs
   permission, or the connection banner shows "Access denied". Either install
   the bundled udev rule (preferred - applies on replug, no group, no re-login):

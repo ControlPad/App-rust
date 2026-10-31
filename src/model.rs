@@ -144,6 +144,12 @@ pub enum ActionKind {
     ApiCall,
     /// Toggle mute of a mixer strip (`ButtonAction::mixer`).
     MuteMixer,
+    /// Toggle a mixer channel's "Effects & EQ" switch (`ButtonAction::mixer`).
+    ToggleMixerFx,
+    /// Load the next of some effect presets into a mixer channel
+    /// (`ButtonAction::mixer`; `property` = newline-separated preset names,
+    /// empty = all of them).
+    SwitchMixerPreset,
 }
 
 impl ActionKind {
@@ -158,6 +164,8 @@ impl ActionKind {
             Self::CycleOutput => "Cycle output device",
             Self::ApiCall => "API call",
             Self::MuteMixer => "Mute mixer channel",
+            Self::ToggleMixerFx => "Toggle mixer effects",
+            Self::SwitchMixerPreset => "Switch mixer preset",
         }
     }
 }
@@ -180,7 +188,8 @@ pub struct ButtonAction {
     /// HTTP request config, used when `kind == ApiCall`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiCall>,
-    /// Mixer strip, used when `kind == MuteMixer`.
+    /// Mixer strip, used by the mixer kinds (`MuteMixer`, `ToggleMixerFx`,
+    /// `SwitchMixerPreset`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixer: Option<MixTarget>,
 }
@@ -728,6 +737,38 @@ mod tests {
     }
 
     #[test]
+    fn board_flips_a_channels_effects() {
+        let mut m = MixerConfig::default();
+        m.channels.push(MixChannel {
+            id: 2,
+            name: "Music".into(),
+            programs: vec![],
+            level: 1.0,
+            muted: false,
+            fx: Effects::default(),
+            reroute: true,
+            mic_send: None,
+            collapsed: false,
+        });
+        assert_eq!(m.toggle_fx(MixTarget::Channel(2)), Some(false), "effects start on");
+        assert_eq!(m.toggle_fx(MixTarget::Send(2)), Some(true), "a send means its channel");
+        assert_eq!(m.toggle_fx(MixTarget::Channel(9)), None, "deleted channel");
+
+        // Presets: the next one each press, wrapping; effects come on.
+        m.channels[0].fx.on = false;
+        let all = FxPreset::built_in();
+        let names = vec!["Movies & series".to_string(), "JBL-style".to_string(), "No such preset".to_string()];
+        let mut press = || m.switch_preset(MixTarget::Channel(2), &names, &all);
+        assert_eq!(press().as_deref(), Some("Movies & series"), "unknown chain → first");
+        assert_eq!(press().as_deref(), Some("JBL-style"));
+        assert_eq!(press().as_deref(), Some("Movies & series"), "wraps");
+        assert!(m.channels[0].fx.on);
+        // Empty = all presets: the one after "Movies & series" in the full list.
+        assert_eq!(m.switch_preset(MixTarget::Channel(2), &[], &all).as_deref(), Some("JBL-style"), "empty = all");
+        assert_eq!(m.switch_preset(MixTarget::Channel(2), &["gone".into()], &all), None);
+    }
+
+    #[test]
     fn preset_files_say_what_they_hold() {
         let eq = PresetFile::Eq(MixerConfig::default_eq_presets().remove(0));
         let json = serde_json::to_string(&eq).unwrap();
@@ -860,6 +901,41 @@ impl MixerConfig {
             MixTarget::Voice => "Voice (microphone)".into(),
             MixTarget::Channel(id) => name(id),
             MixTarget::Send(id) => format!("{} → Slidr Mic", name(id)),
+        }
+    }
+
+    /// Flip a strip's "Effects & EQ" switch (a send means its channel).
+    /// The new state, or `None` for a channel that doesn't exist (anymore).
+    pub fn toggle_fx(&mut self, t: MixTarget) -> Option<bool> {
+        let fx = self.effects_mut(t)?;
+        fx.on = !fx.on;
+        Some(fx.on)
+    }
+
+    /// Load the next of `names` (from `presets`) into a strip's effects: the
+    /// one after the preset its chain matches now, else the first. An empty
+    /// `names` goes through all `presets`. Effects are switched on, so the
+    /// press is heard. The loaded preset's name, or `None` if there is none.
+    pub fn switch_preset(&mut self, t: MixTarget, names: &[String], presets: &[FxPreset]) -> Option<String> {
+        let chosen: Vec<&FxPreset> = if names.is_empty() {
+            presets.iter().collect()
+        } else {
+            names.iter().filter_map(|n| presets.iter().find(|p| &p.name == n)).collect()
+        };
+        let fx = self.effects_mut(t)?;
+        let now = chosen.iter().position(|p| p.chain == fx.chain);
+        let next = chosen.get(now.map_or(0, |i| (i + 1) % chosen.len()))?;
+        fx.chain = next.chain.clone();
+        fx.on = true;
+        Some(next.name.clone())
+    }
+
+    fn effects_mut(&mut self, t: MixTarget) -> Option<&mut Effects> {
+        match t {
+            MixTarget::Voice => Some(&mut self.voice.fx),
+            MixTarget::Channel(id) | MixTarget::Send(id) => {
+                self.channels.iter_mut().find(|c| c.id == id).map(|c| &mut c.fx)
+            }
         }
     }
 

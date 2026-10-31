@@ -1834,6 +1834,9 @@ component WizardPopup inherits Rectangle {
     // True while `property` holds a program-category reference rather than a
     // concrete program. Drives the category chip in the "Open application" form.
     in-out property <bool> picked-group: false;
+    // Mixer channels for "Switch mixer preset", and the chosen one.
+    in property <[string]> mixer-channels;
+    in-out property <int> mixer-channel;
 
     callback cancel();
     callback finish();
@@ -1847,7 +1850,8 @@ component WizardPopup inherits Rectangle {
 
     property <[string]> button-kinds: ["Mute process", "Mute main audio", "Mute microphone",
                                        "Open application", "Open website", "Simulate key",
-                                       "Cycle output device", "API call", "Mute mixer channel"];
+                                       "Cycle output device", "API call", "Mute mixer channel",
+                                       "Toggle mixer effects", "Switch mixer preset"];
     // Mixer entries go last so the indices above (the API call's included) stay put.
     property <[string]> slider-kinds: ["Process volume", "Microphone", "Output device", "API call",
                                        "Mixer channel"];
@@ -1873,7 +1877,10 @@ component WizardPopup inherits Rectangle {
     property <bool> needs-path-form: root.target-kind == 1
                                   && (root.kind == 3 || root.kind == 4)
                                   && !root.is-api;
-    property <bool> multi-select: root.target-kind == 1 && root.kind == 6;
+    // "Switch mixer preset" (button kind 10): a channel, then the presets to
+    // switch between (multi-select, like cycle output).
+    property <bool> is-preset-switch: root.target-kind == 1 && root.kind == 10;
+    property <bool> multi-select: root.target-kind == 1 && (root.kind == 6 || root.kind == 10);
 
     Rectangle {
         x: parent.width / 2 - self.width / 2;
@@ -1951,8 +1958,17 @@ component WizardPopup inherits Rectangle {
                     font-family: "Inter"; color: Palette.foreground.with-alpha(0.7);
                 }
 
+                if root.is-preset-switch: HorizontalLayout { spacing: 10px;
+                    Text { text: "Channel"; font-family: "Inter"; vertical-alignment: center; }
+                    Select { field-width: 240px; model: root.mixer-channels;
+                        current-index <=> root.mixer-channel;
+                        selected => { root.state-changed(); } }
+                }
+
                 if root.multi-select: Text {
-                    text: "Pick the devices to cycle through, in order. Leave empty to cycle all.";
+                    text: root.is-preset-switch
+                        ? "Pick the effect presets to switch between, in order. Each press loads the next one. Leave empty to go through all."
+                        : "Pick the devices to cycle through, in order. Leave empty to cycle all.";
                     font-family: "Inter"; font-size: 12px;
                     color: Palette.foreground.with-alpha(0.7); wrap: word-wrap;
                 }
@@ -2142,8 +2158,13 @@ component WizardPopup inherits Rectangle {
                         text: "Auth: Bearer token set"; font-family: "Inter"; }
                     if root.is-api && root.target-kind == 0: Text {
                         text: "Interval: " + root.throttle + " ms"; font-family: "Inter"; }
-                    if !root.is-api && root.needs-property: Text { text: "Target: " + root.property;
-                        font-family: "Inter"; }
+                    if root.is-preset-switch && root.mixer-channels.length > 0: Text {
+                        text: "Channel: " + root.mixer-channels[root.mixer-channel]; font-family: "Inter"; }
+                    if !root.is-api && root.needs-property: Text {
+                        text: root.is-preset-switch
+                            ? "Presets: " + (root.property == "" ? "all" : root.property)
+                            : "Target: " + root.property;
+                        font-family: "Inter"; wrap: word-wrap; }
                     if !root.is-api && root.display != "" && root.display != root.property: Text {
                         text: "Label: " + root.display; font-family: "Inter"; }
                 } }
@@ -2168,6 +2189,7 @@ component WizardPopup inherits Rectangle {
                     // need a chosen target.
                     enabled: root.step == 0
                              || (root.is-api ? root.api-valid
+                                  : root.is-preset-switch ? root.mixer-channels.length > 0
                                   : (!root.needs-property || root.multi-select
                                      || root.property != ""));
                     clicked => { root.step = root.step + 1; }
@@ -3267,6 +3289,8 @@ export component AppWindow inherits Window {
     in-out property <string> wizard-bearer: "";
     in-out property <int> wizard-throttle: 500;
     in property <[PickerEntry]> wizard-picker-source;
+    in property <[string]> wizard-mixer-channels;
+    in-out property <int> wizard-mixer-channel;
 
     in-out property <string> toast-text: "";
 
@@ -3764,6 +3788,8 @@ export component AppWindow inherits Window {
         filter <=> root.wizard-filter;
         picked-group <=> root.wizard-picked-group;
         picker-source: root.wizard-picker-source;
+        mixer-channels: root.wizard-mixer-channels;
+        mixer-channel <=> root.wizard-mixer-channel;
         live-processes: root.live-processes;
         live-mics: root.live-mics;
         live-outputs: root.live-outputs;

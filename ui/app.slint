@@ -1136,6 +1136,8 @@ component SettingsPage inherits VerticalBox {
     in-out property <int> sink-idx;
     in-out property <int> cable-idx;
     callback mixer-devices-changed();
+    // Windows only: Linux makes its Slidr Mic itself.
+    in property <bool> has-mixer-devices: true;
     callback nav-move(int, int);
     callback nav-visible(int, bool);
     callback preset-rename(bool, int, string);
@@ -1254,7 +1256,7 @@ component SettingsPage inherits VerticalBox {
                 }
             }
 
-            Card {
+            if root.has-mixer-devices: Card {
                 VerticalBox { padding: 18px; spacing: 6px;
                     Text { text: "Mixer devices"; font-weight: 700; font-family: "Inter"; font-size: 14px; }
                     Text { text: "Slidr plays the mix on your Windows default output and follows it when that changes. Add your microphone to a mixer channel to send it into the Slidr Mic.";
@@ -3205,6 +3207,7 @@ export component AppWindow inherits Window {
     callback mixer-picker-filter-changed(string);
     callback mixer-picker-closed();
     in-out property <int> mixer-picker-tab-index;
+    in property <bool> mixer-has-devices: true;
     callback mixer-picker-tab(int);
 
     in-out property <bool> assign-popup-open: false;
@@ -3627,6 +3630,7 @@ export component AppWindow inherits Window {
                     sink-idx <=> root.mixer-sink-idx;
                     cable-idx <=> root.mixer-cable-idx;
                     mixer-devices-changed => { root.mixer-changed(); }
+                    has-mixer-devices: root.mixer-has-devices;
                     preset-rename(e, i, n) => { root.user-preset-rename(e, i, n); }
                     preset-export(e, i) => { root.user-preset-export(e, i); }
                     preset-delete(e, i) => { root.user-preset-delete(e, i); }

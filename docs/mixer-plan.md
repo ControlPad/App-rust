@@ -111,10 +111,24 @@ Linux needs no driver (see below).
 
 ## Linux
 
-PipeWire/Pulse needs no driver and has no cable limit: `module-null-sink` as
-the sink, `move-sink-input` for rerouting, monitor sources for capture,
-`module-remap-source` / a null sink's monitor as the Slidr Mic. Can be developed
-alongside Windows or right after it; the engine and DSP are shared.
+`src/mixer/pulse_io.rs`. PipeWire/Pulse needs no driver and has no cable
+limit. Driven through `pactl`, `parec` and `pacat` (all in `pulseaudio-utils`,
+which Slidr already needs), so the binary links no audio library:
+
+- each channel is a null sink `slidr_mixer_ch_<id>`; its programs' streams are
+  moved there (`move-sink-input`) and its monitor is recorded into the channel.
+  With "Replace original" off, a `module-loopback` also plays the original;
+- the mix plays as one `pacat` stream on the default output and follows it;
+- the Slidr Mic is a null sink the mic bus plays into, plus a
+  `module-remap-source` of its monitor named "Slidr Mic";
+- the played streams run on the wall clock; their "Buffer Latency" (read in
+  the 1 s scan) drops or doubles a block to keep them ~40 ms ahead;
+- every module Slidr loads has `slidr_mixer` in its arguments. Unloading a
+  null sink moves its streams back to the default output, so switching off,
+  quitting and cleaning up after a crash (at start) are all "unload ours".
+
+The engine, DSP, effects and switch sounds are shared with Windows. The
+Settings "Mixer devices" card and the VB-CABLE hint are Windows-only.
 
 ## Phases
 

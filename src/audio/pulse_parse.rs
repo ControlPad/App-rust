@@ -18,6 +18,12 @@ pub struct Record {
     pub muted: bool,
     /// Sources only: true for the `.monitor` loopback of an output device.
     pub monitor: bool,
+    /// Sink inputs only: index of the sink the stream plays on.
+    pub sink: String,
+    /// Streams: `media.name` (what the stream calls itself).
+    pub media_name: String,
+    /// Streams: buffered audio ahead of the device ("Buffer Latency"), ms.
+    pub buffer_ms: Option<u32>,
 }
 
 impl Record {
@@ -86,6 +92,12 @@ pub fn parse_records(text: &str, header_prefix: &str) -> Vec<Record> {
             c.volume = parse_first_percent(v).map(|p| (p as f32 / 100.0).clamp(0.0, 1.0));
         } else if let Some(v) = line.strip_prefix("Monitor of Sink: ") {
             c.monitor = v.trim() != "n/a";
+        } else if let Some(v) = line.strip_prefix("Sink: ") {
+            c.sink = v.trim().to_string();
+        } else if let Some(v) = line.strip_prefix("Buffer Latency: ") {
+            c.buffer_ms = v.split_whitespace().next().and_then(|us| us.parse::<f64>().ok()).map(|us| (us / 1000.0) as u32);
+        } else if let Some(v) = property(line, "media.name") {
+            c.media_name = v;
         } else if let Some(v) = property(line, "application.process.binary") {
             c.process_binary = v;
         } else if let Some(v) = property(line, "application.name") {
@@ -98,6 +110,26 @@ pub fn parse_records(text: &str, header_prefix: &str) -> Vec<Record> {
         out.push(c);
     }
     out
+}
+
+/// `pactl list short <kind>` → (index, name) per line (tab-separated).
+pub fn parse_short(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|l| {
+            let mut cols = l.split('\t');
+            Some((cols.next()?.trim().to_string(), cols.next()?.trim().to_string()))
+        })
+        .filter(|(i, n)| !i.is_empty() && !n.is_empty())
+        .collect()
+}
+
+/// `pactl list short modules` → ids of modules whose arguments contain
+/// `marker` (how Slidr finds the devices it left behind after a crash).
+pub fn modules_with(text: &str, marker: &str) -> Vec<u32> {
+    text.lines()
+        .filter(|l| l.contains(marker))
+        .filter_map(|l| l.split('\t').next()?.trim().parse().ok())
+        .collect()
 }
 
 fn parse_first_percent(s: &str) -> Option<u32> {
@@ -128,6 +160,35 @@ fn property(line: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sink_inputs_say_where_they_play_and_how_far_ahead() {
+        let text = "\
+Sink Input #57
+\tDriver: protocol-native.c
+\tSink: 3
+\tBuffer Latency: 41333 usec
+\tSink Latency: 12000 usec
+\tProperties:
+\t\tmedia.name = \"Slidr mix\"
+\t\tapplication.name = \"Slidr\"
+\t\tapplication.process.binary = \"pacat\"
+";
+        let r = &parse_records(text, "Sink Input #")[0];
+        assert_eq!((r.id.as_str(), r.sink.as_str(), r.media_name.as_str()), ("57", "3", "Slidr mix"));
+        assert_eq!(r.buffer_ms, Some(41));
+    }
+
+    #[test]
+    fn short_lists_and_leftover_modules() {
+        let sinks = "0\talsa_output.pci.analog-stereo\tPipeWire\ts32le 2ch 48000Hz\tSUSPENDED\n\
+                     12\tslidr_mixer_ch_1\tmodule-null-sink.c\tfloat32le 2ch 48000Hz\tRUNNING\n";
+        assert_eq!(parse_short(sinks)[1], ("12".to_string(), "slidr_mixer_ch_1".to_string()));
+        let modules = "22\tmodule-null-sink\tsink_name=slidr_mixer_ch_1 sink_properties=device.description='Slidr Music'\n\
+                       23\tmodule-loopback\tsource=alsa.monitor\n\
+                       536870913\tlibpipewire-module-null-sink\tsink_name=slidr_mixer_mic\n";
+        assert_eq!(modules_with(modules, "slidr_mixer"), vec![22, 536870913]);
+    }
 
     const SINKS: &str = "\
 Sink #0

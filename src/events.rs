@@ -39,6 +39,14 @@ pub enum Cmd {
         bearer: Option<String>,
     },
 
+    /// Flip a mixer channel's "Effects & EQ" switch. It is part of the
+    /// profile, so the UI thread handles it (saves, updates the page) and it
+    /// never reaches the actuator.
+    ToggleMixerFx(crate::model::MixTarget),
+    /// Load the next of these effect presets into a mixer channel (empty =
+    /// all presets). Handled on the UI thread like `ToggleMixerFx`.
+    SwitchMixerPreset(crate::model::MixTarget, Vec<String>),
+
     // ── Experimental LED control ──
     /// Replace the full per-LED configuration set.
     SetLeds(Box<[Option<crate::model::LedConfig>; crate::model::NUM_LEDS]>),
@@ -368,6 +376,21 @@ fn push_button_cmds(
             if just_pressed {
                 if let Some(m) = action.mixer {
                     out.push(Cmd::ToggleMute(Target::Mixer(m)));
+                }
+            }
+        }
+        ActionKind::ToggleMixerFx => {
+            if just_pressed {
+                if let Some(m) = action.mixer {
+                    out.push(Cmd::ToggleMixerFx(m));
+                }
+            }
+        }
+        ActionKind::SwitchMixerPreset => {
+            if just_pressed {
+                if let Some(m) = action.mixer {
+                    let names = action.property.as_deref().unwrap_or("").lines().filter(|l| !l.is_empty());
+                    out.push(Cmd::SwitchMixerPreset(m, names.map(str::to_string).collect()));
                 }
             }
         }

@@ -168,6 +168,8 @@ fn apply(
             crate::mixer::set_level(m, value);
         }
         Cmd::ToggleMute(Target::Mixer(m)) => crate::mixer::toggle_mute(m),
+        // Handled on the UI thread (it edits the profile); never sent here.
+        Cmd::ToggleMixerFx(_) | Cmd::SwitchMixerPreset(..) => {}
         Cmd::SetVolume { target, value, unmute } => {
             if unmute {
                 audio.set_mute(mute_target(&target), false);

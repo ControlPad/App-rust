@@ -430,6 +430,7 @@ pub fn wire(
                 s.pending_wizard = Some((kind, cat_id as u32));
                 s.editing_idx = None;
             }
+            ui.set_wizard_mixer_channel(0);
             ui.set_wizard_target_kind(kind);
             ui.set_wizard_category_id(cat_id);
             ui.set_wizard_step(0);
@@ -451,6 +452,8 @@ pub fn wire(
             let Some(ui) = weak.upgrade() else { return };
             let idx = idx as usize;
             let cat_id = cat_id as u32;
+            // "Switch mixer preset": position of its channel in the wizard's list.
+            let mut channel_idx = 0;
             // Resolve existing entry → wizard kind/property/display (+ optional API).
             let (wkind, prop, disp, api) = {
                 let s = shared.lock();
@@ -468,6 +471,10 @@ pub fn wire(
                     let Some(a) = c.actions.get(idx) else { return };
                     let k = action_kind_index(a.kind);
                     let prop = match a.mixer {
+                        Some(crate::model::MixTarget::Channel(id)) if a.kind == ActionKind::SwitchMixerPreset => {
+                            channel_idx = s.preset.mixer.channels.iter().position(|c| c.id == id).unwrap_or(0) as i32;
+                            a.property.clone().unwrap_or_default()
+                        }
                         Some(m) => m.to_value(),
                         None => a.property.clone().unwrap_or_default(),
                     };
@@ -484,6 +491,7 @@ pub fn wire(
                 }
             };
             shared.lock().editing_idx = Some(idx);
+            ui.set_wizard_mixer_channel(channel_idx);
             ui.set_wizard_target_kind(target_kind);
             ui.set_wizard_category_id(cat_id as i32);
             ui.set_wizard_kind(wkind);
@@ -558,7 +566,13 @@ pub fn wire(
         let weak = ui.as_weak();
         let shared = shared.clone();
         ui.on_wizard_finish(move |result| {
+            let ui_channel = weak.upgrade().map_or(0, |ui| ui.get_wizard_mixer_channel());
             let mut s = shared.lock();
+            // "Switch mixer preset": the channel picked in the wizard (id, name).
+            let picked_channel = usize::try_from(ui_channel)
+                .ok()
+                .and_then(|i| s.preset.mixer.channels.get(i))
+                .map(|c| (c.id, c.name.clone()));
             let editing = s.editing_idx.take();
             let cat_id = result.category_id as u32;
             if result.target_kind == 0 {
@@ -604,6 +618,14 @@ pub fn wire(
                         .or_else(|| name.parse::<u32>().ok())
                         .unwrap_or(0);
                     (Some(vk.to_string()), Some(name))
+                } else if kind == ActionKind::SwitchMixerPreset {
+                    // Property: the preset names (empty = all). The label
+                    // names the channel and the presets, shown in the list.
+                    let list = result.property.to_string();
+                    let names: Vec<&str> = list.lines().filter(|l| !l.is_empty()).collect();
+                    let channel = picked_channel.as_ref().map(|c| c.1.clone()).unwrap_or_default();
+                    let presets = if names.is_empty() { "all presets".to_string() } else { names.join(" → ") };
+                    ((!names.is_empty()).then(|| names.join("\n")), Some(format!("{channel}: {presets}")))
                 } else if kind == ActionKind::CycleOutput {
                     // Property is the newline-separated device list (empty = all).
                     // The human-readable label is derived at render time
@@ -617,10 +639,18 @@ pub fn wire(
                     (prop, disp)
                 };
                 // A mixer action keeps its strip in `mixer`, not in the string property.
-                let mixer = (kind == ActionKind::MuteMixer)
-                    .then(|| crate::model::MixTarget::from_value(&result.property))
-                    .flatten();
-                let prop = if mixer.is_some() { None } else { prop };
+                let mixer = match kind {
+                    ActionKind::MuteMixer | ActionKind::ToggleMixerFx => {
+                        crate::model::MixTarget::from_value(&result.property)
+                    }
+                    ActionKind::SwitchMixerPreset => {
+                        picked_channel.as_ref().map(|c| crate::model::MixTarget::Channel(c.0))
+                    }
+                    _ => None,
+                };
+                // Mute / toggle keep their strip in `mixer` only; the preset
+                // switch also keeps its preset list in `property`.
+                let prop = if mixer.is_some() && kind != ActionKind::SwitchMixerPreset { None } else { prop };
                 let action = ButtonAction { kind, property: prop, display: disp, api: None, mixer };
                 match editing {
                     Some(i) if i < c.actions.len() => c.actions[i] = action,
@@ -1192,7 +1222,26 @@ pub fn wire(
                     let preset = s.preset.clone();
                     let (dirty, cmds) = s.engine.ingest(&frame, &preset);
                     let mut led_toggled = false;
+                    let mut mixer_changed = false;
                     for cmd in cmds {
+                        // The effects switch is part of the profile: flip and
+                        // save it here; the mixer then switches with its sound.
+                        if let crate::events::Cmd::ToggleMixerFx(t) = &cmd {
+                            mixer_changed |= s.preset.mixer.toggle_fx(*t).is_some();
+                            continue;
+                        }
+                        if let crate::events::Cmd::SwitchMixerPreset(t, names) = &cmd {
+                            let presets: Vec<crate::model::FxPreset> = crate::model::FxPreset::built_in()
+                                .into_iter()
+                                .chain(s.settings.fx_presets.iter().cloned())
+                                .collect();
+                            if let Some(name) = s.preset.mixer.switch_preset(*t, names, &presets) {
+                                let label = s.preset.mixer.label(*t);
+                                toast(&ui, &format!("{label}: {name}"));
+                                mixer_changed = true;
+                            }
+                            continue;
+                        }
                         // Persist a manual-LED toggle into the preset so it
                         // survives a restart (the actuator owns the live state).
                         if let crate::events::Cmd::LedManualToggle(led) = &cmd {
@@ -1203,8 +1252,14 @@ pub fn wire(
                         }
                         let _ = s.cmd_tx.send(cmd);
                     }
-                    if led_toggled {
+                    if led_toggled || mixer_changed {
                         s.save_preset();
+                    }
+                    if mixer_changed {
+                        s.push_mixer();
+                        if ui.get_current_page() == 4 {
+                            crate::mixer_ui::refresh_channels(&ui, &s);
+                        }
                     }
                     if dirty { changed = true; }
                 }
@@ -1483,7 +1538,7 @@ fn action_icon_kind(k: ActionKind) -> i32 {
     match k {
         MuteProcess => 0, MuteMic => 1, MuteMainAudio => 5,
         OpenProcess => 0, OpenWebsite => 3, KeyPress => 4, CycleOutput => 2, ApiCall => 3,
-        MuteMixer => 5,
+        MuteMixer => 5, ToggleMixerFx => 5, SwitchMixerPreset => 5,
     }
 }
 
@@ -1635,7 +1690,7 @@ fn action_kind_index(k: ActionKind) -> i32 {
     match k {
         MuteProcess => 0, MuteMainAudio => 1, MuteMic => 2,
         OpenProcess => 3, OpenWebsite => 4, KeyPress => 5, CycleOutput => 6, ApiCall => 7,
-        MuteMixer => 8,
+        MuteMixer => 8, ToggleMixerFx => 9, SwitchMixerPreset => 10,
     }
 }
 
@@ -1643,7 +1698,7 @@ fn button_kind_from_index(i: i32) -> ActionKind {
     use ActionKind::*;
     match i {
         0 => MuteProcess, 1 => MuteMainAudio, 2 => MuteMic,
-        3 => OpenProcess, 4 => OpenWebsite, 6 => CycleOutput, 7 => ApiCall, 8 => MuteMixer,
+        3 => OpenProcess, 4 => OpenWebsite, 6 => CycleOutput, 7 => ApiCall, 8 => MuteMixer, 9 => ToggleMixerFx, 10 => SwitchMixerPreset,
         _ => KeyPress,
     }
 }
@@ -1663,8 +1718,36 @@ fn push_wizard_picker(ui: &AppWindow, shared: Arc<Mutex<Shared>>) {
     let kind = ui.get_wizard_kind();
     let filter = ui.get_wizard_filter().to_string().to_lowercase();
 
+    // Switch mixer preset: the channels to pick one from, and every effect
+    // preset (built-in, then the user's) as a multi-select list.
+    if (target_kind, kind) == (1, 10) {
+        let s = shared.lock();
+        let channels: Vec<SharedString> = s.preset.mixer.channels.iter().map(|c| c.name.as_str().into()).collect();
+        let chosen: Vec<String> = ui.get_wizard_property().lines().map(str::to_string).collect();
+        let rows: Vec<crate::PickerEntry> = crate::model::FxPreset::built_in()
+            .into_iter()
+            .chain(s.settings.fx_presets.iter().cloned())
+            .filter(|p| filter.is_empty() || p.name.to_lowercase().contains(filter.trim()))
+            .map(|p| crate::PickerEntry {
+                selected: chosen.contains(&p.name),
+                name: p.name.as_str().into(),
+                value: p.name.as_str().into(),
+                icon_kind: 5,
+                is_group: false,
+            })
+            .collect();
+        drop(s);
+        let n = channels.len() as i32;
+        ui.set_wizard_mixer_channels(ModelRc::new(VecModel::from(channels)));
+        if ui.get_wizard_mixer_channel() >= n {
+            ui.set_wizard_mixer_channel(0);
+        }
+        ui.set_wizard_picker_source(ModelRc::new(VecModel::from(rows)));
+        return;
+    }
+
     // Mixer strips: fixed list from the profile, labelled by channel name.
-    if (target_kind, kind) == (0, 4) || (target_kind, kind) == (1, 8) {
+    if (target_kind, kind) == (0, 4) || (target_kind, kind) == (1, 8) || (target_kind, kind) == (1, 9) {
         use crate::model::MixTarget;
         let s = shared.lock();
         let m = &s.preset.mixer;
